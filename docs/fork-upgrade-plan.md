@@ -339,3 +339,39 @@ a larger machine, not the 18 GB dev box.
 - **Parked slots' host `LinearAttnState`** is planned but not touched at
   open, so the open-time footprint check doesn't see it (the cap still
   holds; it is reserved, not committed).
+- **Prefill scratch outside the plan — fixed.** Every batched-prefill
+  buffer (`fags.*`, `mgs.*`, `lags.*`, `hdb.*`, `hts.token_ids`) was
+  sized for `BATCHED_CHUNK_SIZE = 8192` tokens whatever `n_ctx` or the
+  cap, and no account covered it: OLMoE-1B-7B pinned 2.6 GiB of it
+  (a3b 3.6 GiB), so a 3 GiB cap failed at open (plan 3.00 GiB,
+  footprint 3.89 GiB). Now `OpenConfig::prefill_chunk` (default 8192
+  uncapped, 512 under a cap, clamped to `n_ctx`) sizes it,
+  `step_internal` splits prompts by it, and `Account::PrefillScratch`
+  plans it exactly (`budget::prefill_scratch_bytes`, checked against a
+  real pool by `prefill_scratch_matches_pool`). Per variant:
+
+  | Variant | chunk 512 | chunk 2048 | chunk 8192 |
+  | ------- | --------- | ---------- | ---------- |
+  | OLMoE-1B-7B | 172,549,120 B (164.6 MiB) | 689,591,296 B (657.6 MiB) | 2,757,760,000 B (2630.0 MiB) |
+  | Qwen3.6-35B-A3B | 243,072,128 B (231.8 MiB) | 969,305,216 B (924.4 MiB) | 3,874,237,568 B (3694.8 MiB) |
+
+  Two smaller gaps found while measuring, also fixed: the expert slot
+  ring (`alloc_aligned`, heap-backed) was never touched at open, so
+  the open-time check missed it (`MetalBufferPool::touch_aligned`);
+  and `commit_plan` allocated the colored buffers while still holding
+  the old transients, so the first prefill peaked at scratch + colors
+  above the open footprint (it now releases them first).
+- **`runtime_overhead` measured.** A capped open logs `planned
+  exactly` (plan minus `runtime_overhead`) and the signed `unplanned`
+  remainder of the measured footprint; `MOEFLUX_POOL_DUMP=1` adds the
+  GPU pool by label (`MetalBufferPool::bytes_by_label`). OLMoE-1B-7B on
+  the M3 Pro (2026-10-25; cap 6 GiB, n_ctx 2048, hot tier 106 slots,
+  chunk 512): planned exactly 1,780,708,352 B; open footprint
+  1,762,907,136 B; after a 25-token prefill + 8 decode steps
+  1,829,328,000 B, peak 1,843,352,576 B. The slot ring is planned
+  2 MiB-rounded (~31 MB high), so the unitemized remainder is ≈ 90 MiB
+  at peak, ≈ 60 MiB held. `DEFAULT_RUNTIME_OVERHEAD` drops from the
+  1.5 GiB guess to 512 MiB (> 5× margin, for full 512-token chunks and
+  larger variants — re-measure a3b/a17b the same way). With it, OLMoE
+  at `mem_cap` 3 GiB, n_ctx 2048, auto hot tier plans 3.00 GiB (hot
+  tier 1.19 GiB, 361 slots) and opens at 2,666,715,968 B (2.48 GiB).

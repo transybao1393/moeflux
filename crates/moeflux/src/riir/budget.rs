@@ -28,10 +28,16 @@ use crate::riir::variants::{AttnKind, LayerKind, VARIANT, Variant};
 const GIB: u64 = 1 << 30;
 const TWO_MIB: u64 = 2 << 20;
 
-/// Default reservation for Metal/driver/shader overhead, thread
-/// stacks, the heap and per-op scratch buffers. Replace with a
-/// measured value per machine (Phase 0).
-pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB + GIB / 2;
+/// Default reservation for what the plan does not itemize: Metal
+/// device/driver state and pipelines, the small fixed pool buffers
+/// (per-token layer buffers, router/combine scratch, logits), thread
+/// stacks, the heap and per-eval host vectors. Measured on
+/// OLMoE-1B-7B (M3 Pro, 2026-10-25) at ≈ 90 MiB above the plan at the
+/// peak of a capped open + prefill + decode (≈ 60 MiB held after);
+/// 512 MiB is that plus a > 5× margin for longer prefill chunks and
+/// larger variants (`docs/fork-upgrade-plan.md` §10). Only used under
+/// a cap.
+pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB / 2;
 
 /// One named slice of the cap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +53,9 @@ pub enum Account {
     ExpertSlots,
     /// Prefill expert staging (pread mode only).
     PrefillStaging,
+    /// Batched-prefill scratch sized by the context's prefill chunk
+    /// ([`prefill_scratch_bytes`]).
+    PrefillScratch,
     /// Metal/driver/runtime overhead and scratch.
     RuntimeOverhead,
     /// RAM hot tier of experts (sized from what the cap leaves).
@@ -65,6 +74,7 @@ impl Account {
             Account::LinearState => "linear_state",
             Account::ExpertSlots => "expert_slots",
             Account::PrefillStaging => "prefill_staging",
+            Account::PrefillScratch => "prefill_scratch",
             Account::RuntimeOverhead => "runtime_overhead",
             Account::HotTier => "hot_tier",
             Account::HostBuffers => "host_buffers",
@@ -119,6 +129,65 @@ pub fn linear_state_bytes_in(v: Variant, range: &Range<usize>) -> u64 {
     2 * linear_layers * (conv + ssm) * f32b
 }
 
+/// Bytes the batched-prefill scratch structs request from the pool
+/// for a `chunk`-token prefill chunk: `LinearAttnGraphScratch`,
+/// `FullAttnGraphScratch`, `MoeGraphScratch` (minus its pread
+/// `expert_base`, which is [`Account::PrefillStaging`]),
+/// `HiddenDoubleBuffer` and `HeadTailScratch`. Mirrors their `new`
+/// allocation formulas term for term; `prefill_scratch_matches_pool`
+/// keeps the two in step. Zero for MLA variants, which prefill
+/// token by token and never build these.
+pub fn prefill_scratch_bytes(v: Variant, chunk: usize) -> u64 {
+    if v.attn_kind == AttnKind::Mla {
+        return 0;
+    }
+    let f32b = std::mem::size_of::<f32>();
+    let hidden = v.hidden_dim;
+    let q_dim = v.num_attn_heads * v.head_dim;
+    let kv_dim = v.num_kv_heads * v.head_dim;
+    let k = v.num_experts_per_tok;
+
+    // LinearAttnGraphScratch — no slots without linear-attn layers.
+    let lin_chunk = if v.has_linear_attn() { chunk } else { 0 };
+    let num_v = v.linear_num_v_heads;
+    let linear = lin_chunk
+        * (2 * hidden
+            + 2 * v.linear_conv_dim()
+            + 2 * v.linear_total_value()
+            + 4 * num_v
+            + num_v * Variant::LINEAR_VALUE_DIM
+            + v.num_experts);
+
+    // FullAttnGraphScratch transients + the inv_freq table.
+    let k_raw = if v.qk_norm == crate::riir::variants::QkNorm::Full { kv_dim } else { 0 };
+    let q_gate = if v.attn_output_gate { q_dim } else { 0 };
+    let full = chunk
+        * (2 * hidden + v.q_proj_dim() + k_raw + 2 * kv_dim + 2 * q_dim + q_gate + v.num_experts)
+        + v.rotary_dim() / 2;
+
+    // MoeGraphScratch, `expert_base` excluded.
+    let shared_down = if v.has_shared_expert() { hidden } else { 0 };
+    let max_k = MAX_K;
+    let moe = chunk
+        * (3 * v.shared_intermediate
+            + shared_down
+            + 3 * k * v.moe_intermediate
+            + k * hidden
+            + 3 * hidden
+            + 1
+            + 2 * max_k
+            + k * hidden
+            + 3 * k
+            + v.num_experts.max(1))
+        + v.num_experts.max(1);
+
+    // HiddenDoubleBuffer + HeadTailScratch.
+    let hdb = 2 * chunk * hidden;
+    let hts = chunk + v.vocab_size;
+
+    ((linear + full + moe + hdb + hts) * f32b) as u64
+}
+
 impl BudgetPlan {
     /// Plan for the active variant.
     ///
@@ -129,6 +198,7 @@ impl BudgetPlan {
         mode: ExpertIoMode,
         weights_bytes: u64,
         runtime_overhead: u64,
+        prefill_chunk: usize,
     ) -> Self {
         Self::for_range(
             n_ctx,
@@ -137,6 +207,7 @@ impl BudgetPlan {
             runtime_overhead,
             &(0..VARIANT.num_layers),
             1,
+            prefill_chunk,
         )
     }
 
@@ -144,7 +215,9 @@ impl BudgetPlan {
     /// `range` (plan phase 3) with a pool of `max_requests` sequence
     /// states (plan phase 4): KV and linear-attn state count only those
     /// layers, once per request slot; `weights_bytes` is what the
-    /// context loads for them.
+    /// context loads for them. `prefill_chunk` is
+    /// [`crate::riir::OpenConfig::resolved_prefill_chunk`]; the
+    /// prefill scratch is shared by every range and request.
     pub fn for_range(
         n_ctx: usize,
         mode: ExpertIoMode,
@@ -152,6 +225,7 @@ impl BudgetPlan {
         runtime_overhead: u64,
         range: &Range<usize>,
         max_requests: usize,
+        prefill_chunk: usize,
     ) -> Self {
         let reqs = max_requests.max(1) as u64;
         let v = VARIANT;
@@ -170,6 +244,7 @@ impl BudgetPlan {
                 (Account::LinearState, reqs * linear_state_bytes_in(v, range)),
                 (Account::ExpertSlots, slots),
                 (Account::PrefillStaging, staging),
+                (Account::PrefillScratch, prefill_scratch_bytes(v, prefill_chunk)),
                 (Account::RuntimeOverhead, runtime_overhead),
             ],
         }
@@ -277,23 +352,23 @@ mod tests {
 
     #[test]
     fn kv_scales_with_n_ctx() {
-        let a = BudgetPlan::for_config(1024, ExpertIoMode::Pread, 0, 0);
-        let b = BudgetPlan::for_config(2048, ExpertIoMode::Pread, 0, 0);
+        let a = BudgetPlan::for_config(1024, ExpertIoMode::Pread, 0, 0, 512);
+        let b = BudgetPlan::for_config(2048, ExpertIoMode::Pread, 0, 0, 512);
         assert_eq!(b.get(Account::Kv), 2 * a.get(Account::Kv));
         assert_eq!(a.get(Account::Kv), 1024 * kv_bytes_per_token(VARIANT));
     }
 
     #[test]
     fn staging_only_in_pread_mode() {
-        let p = BudgetPlan::for_config(1, ExpertIoMode::Pread, 0, 0);
-        let m = BudgetPlan::for_config(1, ExpertIoMode::Mmap, 0, 0);
+        let p = BudgetPlan::for_config(1, ExpertIoMode::Pread, 0, 0, 1);
+        let m = BudgetPlan::for_config(1, ExpertIoMode::Mmap, 0, 0, 1);
         assert!(p.get(Account::PrefillStaging) > 0);
         assert_eq!(m.get(Account::PrefillStaging), 0);
     }
 
     #[test]
     fn total_and_check() {
-        let p = BudgetPlan::for_config(8, ExpertIoMode::Pread, 1000, 2000);
+        let p = BudgetPlan::for_config(8, ExpertIoMode::Pread, 1000, 2000, 8);
         assert_eq!(p.total(), p.entries.iter().map(|e| e.1).sum::<u64>());
         assert!(p.check(p.total()).is_ok());
         let err = p.check(p.total() - 1).unwrap_err();
@@ -312,11 +387,11 @@ mod tests {
     #[test]
     fn range_accounts_partition_the_model() {
         let n = VARIANT.num_layers;
-        let full = BudgetPlan::for_config(512, ExpertIoMode::Pread, 0, 0);
+        let full = BudgetPlan::for_config(512, ExpertIoMode::Pread, 0, 0, 512);
         let cuts = [0, n / 2, n * 3 / 4, n];
         let (mut kv, mut lin) = (0, 0);
         for w in cuts.windows(2) {
-            let p = BudgetPlan::for_range(512, ExpertIoMode::Pread, 0, 0, &(w[0]..w[1]), 1);
+            let p = BudgetPlan::for_range(512, ExpertIoMode::Pread, 0, 0, &(w[0]..w[1]), 1, 512);
             kv += p.get(Account::Kv);
             lin += p.get(Account::LinearState);
         }
@@ -328,12 +403,45 @@ mod tests {
     #[test]
     fn request_pool_scales_state_accounts() {
         let r = 0..VARIANT.num_layers;
-        let one = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 1);
-        let four = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 4);
+        let one = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 1, 256);
+        let four = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 4, 256);
         assert_eq!(four.get(Account::Kv), 4 * one.get(Account::Kv));
         assert_eq!(four.get(Account::LinearState), 4 * one.get(Account::LinearState));
-        for a in [Account::Weights, Account::ExpertSlots, Account::PrefillStaging] {
+        for a in [Account::Weights, Account::ExpertSlots, Account::PrefillStaging, Account::PrefillScratch] {
             assert_eq!(four.get(a), one.get(a), "{}", a.name());
+        }
+    }
+
+    /// The plan's `prefill_scratch` is exactly what the scratch
+    /// structs request from a real Metal pool, at several chunks.
+    #[test]
+    fn prefill_scratch_matches_pool() {
+        use crate::riir::attn::full_attn_forward::FullAttnGraphScratch;
+        use crate::riir::attn::linear_attn_forward::{
+            HeadTailScratch, HiddenDoubleBuffer, LinearAttnGraphScratch, MoeGraphScratch,
+        };
+        use crate::riir::backend::MetalBufferPool;
+
+        let v = VARIANT;
+        if v.attn_kind == AttnKind::Mla {
+            assert_eq!(prefill_scratch_bytes(v, 512), 0);
+            return;
+        }
+        let device = metal::Device::system_default().expect("Metal device");
+        for chunk in [1, 37, 512] {
+            let mut pool = MetalBufferPool::new(device.clone());
+            let _lin = LinearAttnGraphScratch::new(&mut pool, chunk);
+            let _full = FullAttnGraphScratch::new(&mut pool, chunk);
+            // Mmap mode: no `expert_base` (that is `prefill_staging`).
+            let _moe = MoeGraphScratch::new(&mut pool, v.num_experts_per_tok, ExpertIoMode::Mmap, chunk);
+            let _hdb = HiddenDoubleBuffer::new(&mut pool, chunk);
+            let _hts = HeadTailScratch::new(&mut pool, chunk);
+            let want = prefill_scratch_bytes(v, chunk);
+            assert_eq!(pool.requested_bytes(), want, "chunk {chunk}");
+            // Physical buffers only add page rounding (and the 1-byte
+            // floor for empty slots).
+            let phys = pool.total_bytes();
+            assert!(phys >= want && phys - want <= TWO_MIB, "chunk {chunk}: phys {phys} want {want}");
         }
     }
 

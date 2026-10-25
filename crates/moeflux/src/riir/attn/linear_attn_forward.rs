@@ -264,7 +264,7 @@ pub type LinearAttnBuffers = LayerForwardBuffers;
 
 /// Run-lifetime scratch BufIds for the batched linear-attn `graph1`
 /// (S10b-2 / prefill-arc Phase 3). Allocated once, sized at
-/// `BATCHED_CHUNK_SIZE` token width; every step and every layer reuses
+/// the context's prefill-chunk token width; every step and every layer reuses
 /// these ids. A smaller chunk (or a decode step at `n_tokens = 1`)
 /// processes only a prefix — the `*NTokens` Ops stride by the real
 /// `n_tokens`.
@@ -297,14 +297,14 @@ pub struct LinearAttnGraphScratch {
 }
 
 impl LinearAttnGraphScratch {
-    /// Allocate the `graph1` transients at max chunk width, all
-    /// `persistent = false` (the first producer call `commit_plan`s +
-    /// pins them).
-    pub fn new(pool: &mut MetalBufferPool) -> Self {
+    /// Allocate the `graph1` transients for `chunk`-token prefill
+    /// chunks, all `persistent = false` (the first producer call
+    /// `commit_plan`s + pins them).
+    pub fn new(pool: &mut MetalBufferPool, chunk: usize) -> Self {
         let v = VARIANT;
         // All-full-attention variants (OLMoE) never run graph1 here;
         // keep the slots but don't pay for chunk-wide transients.
-        let chunk = if v.has_linear_attn() { crate::riir::BATCHED_CHUNK_SIZE } else { 0 };
+        let chunk = if v.has_linear_attn() { chunk } else { 0 };
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
         let conv = v.linear_conv_dim();
@@ -368,11 +368,11 @@ pub struct HiddenDoubleBuffer {
 }
 
 impl HiddenDoubleBuffer {
-    /// Allocate the alternating hidden pair at max chunk width, both
-    /// `persistent = true` (never aliased — they bridge layers).
-    pub fn new(pool: &mut MetalBufferPool) -> Self {
+    /// Allocate the alternating hidden pair for `chunk`-token prefill
+    /// chunks, both `persistent = true` (never aliased — they bridge
+    /// layers).
+    pub fn new(pool: &mut MetalBufferPool, chunk: usize) -> Self {
         let v = VARIANT;
-        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let bytes = chunk * v.hidden_dim * std::mem::size_of::<f32>();
         Self {
             hidden_a: pool
@@ -389,7 +389,7 @@ impl HiddenDoubleBuffer {
 /// owned at run scope, both BufIds `persistent = true`, allocated
 /// once by [`Self::new`] (prefill-arc Phase 4).
 ///
-/// - `token_ids` — `[BATCHED_CHUNK_SIZE]` i32. The head uploads this
+/// - `token_ids` — `[chunk]` i32. The head uploads this
 ///   step's token ids here for `Op::EmbedGatherNTokens`.
 /// - `logits` — `[vocab_size]` f32. The tail's lm-head matvec writes
 ///   the final logits here, downloaded to the caller's slice.
@@ -399,10 +399,10 @@ pub struct HeadTailScratch {
 }
 
 impl HeadTailScratch {
-    /// Allocate the token-id input and logits-output buffers.
-    pub fn new(pool: &mut MetalBufferPool) -> Self {
+    /// Allocate the token-id input (`chunk` ids) and logits-output
+    /// buffers.
+    pub fn new(pool: &mut MetalBufferPool, chunk: usize) -> Self {
         let v = VARIANT;
-        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let token_ids: BufId<TokenIdsBuf> = pool
             .alloc(chunk * std::mem::size_of::<i32>(), "hts.token_ids", true)
             .expect("HeadTailScratch::new token_ids alloc");
@@ -445,7 +445,7 @@ pub struct MoeGraphScratch {
     pub shared_up: BufId<SharedFfnUpBuf>,
     pub shared_act: BufId<SharedFfnActBuf>,
     pub shared_down: BufId<SharedFfnDownBuf>,
-    // Bucket-flat scratch. Sized for `BATCHED_CHUNK_SIZE * k_active`
+    // Bucket-flat scratch. Sized for `chunk * k_active`
     // assignments.
     pub bucket_input: BufId<BucketInputBuf>,
     pub bucket_gate: BufId<BucketGateBuf>,
@@ -494,7 +494,7 @@ pub struct MoeGraphScratch {
 }
 
 impl MoeGraphScratch {
-    /// Allocate the MoE-block scratch at max chunk width. The shared-
+    /// Allocate the MoE-block scratch for `chunk`-token prefill chunks. The shared-
     /// FFN intermediates are `persistent = false` (the first MoE block
     /// call `commit_plan`s + pins them); the boundary buffers +
     /// host-uploaded inputs are `persistent = true`. `k_active` sizes
@@ -506,9 +506,9 @@ impl MoeGraphScratch {
         pool: &mut MetalBufferPool,
         k_active: usize,
         mode: crate::riir::io::expert_io_mode::ExpertIoMode,
+        chunk: usize,
     ) -> Self {
         let v = VARIANT;
-        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
         let shared_inter = v.shared_intermediate;

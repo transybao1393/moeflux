@@ -117,11 +117,13 @@ pub enum CheckpointError {
 /// Phase 1b / Phase 4 alongside the kernels that actually consume
 /// them. Calling an unported method panics with a `todo!()` pinned
 /// to the phase that will implement it.
-/// Chunked-prefill default for the batched-GQA orchestrator. Hardware-
-/// tuned for 96 GB unified RAM + SSD profile per the Phase D plan;
-/// Phase F sweep will validate / refine the value. Production callers
-/// don't override; tests that need to exercise multi-chunk boundary
-/// math at small N use [`set_batched_chunk_size_for_test`].
+/// Uncapped default prefill chunk for the batched-GQA orchestrator
+/// ([`OpenConfig::prefill_chunk`]; under a cap the default is
+/// [`config::CAPPED_PREFILL_CHUNK`]). Hardware-tuned for 96 GB
+/// unified RAM + SSD profile per the Phase D plan; Phase F sweep will
+/// validate / refine the value. Tests that need to exercise
+/// multi-chunk boundary math at small N use
+/// [`set_batched_chunk_size_for_test`].
 pub const BATCHED_CHUNK_SIZE: usize = 8192;
 
 std::thread_local! {
@@ -141,7 +143,7 @@ pub fn set_batched_chunk_size_for_test(n: Option<usize>) {
 fn batched_chunk_size() -> usize {
     BATCHED_CHUNK_OVERRIDE
         .with(|c| c.get())
-        .unwrap_or(BATCHED_CHUNK_SIZE)
+        .unwrap_or(usize::MAX)
 }
 
 /// Session-5 Phase 3: `eval_token` routing backend, read once from
@@ -413,6 +415,16 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     n_ctx: usize,
     /// Hard memory cap ([`OpenConfig::mem_cap`]); `None` = uncapped.
     mem_cap: Option<u64>,
+    /// Tokens per batched-prefill chunk
+    /// ([`OpenConfig::resolved_prefill_chunk`]). Sizes every prefill
+    /// scratch buffer; `step_internal` splits prompts by it.
+    prefill_chunk: usize,
+    /// Under a cap: the plan total less `runtime_overhead`, i.e. every
+    /// byte the plan accounts for exactly. The open-time log reports
+    /// the measured footprint above it as `unplanned`.
+    planned_exact: Option<u64>,
+    /// [`OpenConfig::runtime_overhead`], for the open-time log.
+    runtime_overhead: u64,
     /// Request pool (plan phase 4): which request owns each slot and
     /// which slot's state is live in `layer_states` /
     /// `linear_buffers.{conv,delta}_state` / `prefetch`.
@@ -539,6 +551,7 @@ impl RsCtx<MetalBackend> {
             .validate()
             .map_err(|detail| RsError::InvalidConfig { detail })?;
         let n_ctx = config.n_ctx;
+        let prefill_chunk = config.resolved_prefill_chunk();
         let layer_range = config.resolved_layer_range();
         let expert_size = VARIANT.expert_size_4bit() as u64;
         // Experts this context holds: the layer range's only.
@@ -564,6 +577,7 @@ impl RsCtx<MetalBackend> {
                 detail: "a hot tier needs Pread expert IO; mmap mode was selected".into(),
             });
         }
+        let mut planned_exact = None;
         if let Some(cap) = config.mem_cap {
             let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
                 .map_err(|_| RsError::InitFailed)?;
@@ -574,6 +588,7 @@ impl RsCtx<MetalBackend> {
                 config.runtime_overhead,
                 &layer_range,
                 config.max_requests,
+                prefill_chunk,
             );
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
@@ -588,6 +603,7 @@ impl RsCtx<MetalBackend> {
             hot_tier_bytes = hot_tier_bytes / expert_size * expert_size;
             plan.set(budget::Account::HotTier, hot_tier_bytes);
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
+            planned_exact = Some(plan.total() - plan.get(budget::Account::RuntimeOverhead));
             eprintln!(
                 "[budget] cap {} — plan {} ({})",
                 budget::fmt_gib(cap),
@@ -698,6 +714,9 @@ impl RsCtx<MetalBackend> {
             expert_io_mode,
             n_ctx,
             mem_cap: config.mem_cap,
+            prefill_chunk,
+            planned_exact,
+            runtime_overhead: config.runtime_overhead,
             requests: requests::RequestTable::new(config.max_requests),
             parked,
         };
@@ -815,6 +834,9 @@ impl RsCtx<MetalBackend> {
         }
         if let Some(backend) = self.backend.as_ref() {
             let pool = backend.pool();
+            // The expert slot ring (`expert_slots`) is heap-backed and
+            // lazily committed; commit it now like everything else.
+            pool.touch_aligned();
             let parked = self.parked.iter().map(|s| &s.layer_states);
             for states in std::iter::once(&self.layer_states).chain(parked) {
                 for layer in states.iter() {
@@ -823,6 +845,31 @@ impl RsCtx<MetalBackend> {
                         LayerState::Mla(mla) => mla.touch(),
                         LayerState::LinearAttn(_) => {}
                     }
+                }
+            }
+        }
+        let fp = budget::footprint();
+        // What the plan does not itemize — Metal/driver state, pipeline
+        // objects, the non-chunk pool buffers, heap — is what
+        // `runtime_overhead` has to cover. Logged so it can be measured.
+        if let (Some(fp), Some(exact)) = (fp, self.planned_exact) {
+            eprintln!(
+                "[budget] open footprint {} (peak {}); planned exactly {}, \
+                 unplanned {:+.3} GiB (runtime_overhead {} covers it)",
+                budget::fmt_gib(fp.current),
+                budget::fmt_gib(fp.peak),
+                budget::fmt_gib(exact),
+                (fp.current as f64 - exact as f64) / (1u64 << 30) as f64,
+                budget::fmt_gib(self.runtime_overhead),
+            );
+        }
+        // `MOEFLUX_POOL_DUMP=1`: the GPU pool by allocation label.
+        if std::env::var_os("MOEFLUX_POOL_DUMP").is_some() {
+            if let Some(b) = self.backend.as_ref() {
+                let pool = b.pool();
+                eprintln!("[budget] pool total {}", budget::fmt_gib(pool.total_bytes()));
+                for (label, bytes, n) in pool.bytes_by_label() {
+                    eprintln!("[budget]   {:10.2} MiB x{n:<3} {label}", bytes as f64 / (1u64 << 20) as f64);
                 }
             }
         }
@@ -1791,33 +1838,36 @@ impl RsCtx<MetalBackend> {
         // (`full_attn_graph_scratch`, `moe_graph_scratch`,
         // `hidden_double_buffer`, `moe_buffers`) all end on a
         // persistent alloc, so the highest pool BufId stays persistent
-        // and `reset_transient` keeps the transients above it.
+        // and `reset_transient` keeps the transients above it. All are
+        // sized for `prefill_chunk` tokens (`Account::PrefillScratch`).
+        let chunk = self.prefill_chunk;
         if self.linear_attn_graph_scratch.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.linear_attn_graph_scratch =
-                Some(attn::linear_attn_forward::LinearAttnGraphScratch::new(pool));
+                Some(attn::linear_attn_forward::LinearAttnGraphScratch::new(pool, chunk));
         }
         if self.full_attn_graph_scratch.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.full_attn_graph_scratch =
-                Some(attn::full_attn_forward::FullAttnGraphScratch::new(pool));
+                Some(attn::full_attn_forward::FullAttnGraphScratch::new(pool, chunk));
         }
         if self.moe_graph_scratch.is_none() {
             let k_active = self.k_active;
             let mode = self.expert_io_mode;
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_graph_scratch = Some(attn::linear_attn_forward::MoeGraphScratch::new(
-                pool, k_active, mode,
+                pool, k_active, mode, chunk,
             ));
         }
         if self.hidden_double_buffer.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.hidden_double_buffer =
-                Some(attn::linear_attn_forward::HiddenDoubleBuffer::new(pool));
+                Some(attn::linear_attn_forward::HiddenDoubleBuffer::new(pool, chunk));
         }
         if self.head_tail_scratch.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.head_tail_scratch = Some(attn::linear_attn_forward::HeadTailScratch::new(pool));
+            self.head_tail_scratch =
+                Some(attn::linear_attn_forward::HeadTailScratch::new(pool, chunk));
         }
         if self.moe_buffers.is_none() {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
@@ -2078,16 +2128,18 @@ impl RsCtx<MetalBackend> {
             return Ok(());
         }
 
-        // Chunked iteration over the batched-GQA path. Phase D fixes
-        // CHUNK_SIZE = 8192 — the Phase F sweep will validate this
-        // hardware-tuned default. Only the last chunk's last token
+        // Chunked iteration over the batched-GQA path, `prefill_chunk`
+        // tokens at a time (8192 uncapped, 512 under a cap by default;
+        // `OpenConfig::prefill_chunk`). Only the last chunk's last token
         // emits logits. `start_pos` advances by `CHUNK_SIZE` per
         // chunk so the KV cache reflects the cumulative position.
         //
         // Tests can override CHUNK_SIZE via [`BATCHED_CHUNK_OVERRIDE`]
         // (thread-local) so multi-chunk boundary math is exercisable
         // at small N without paying long-prompt wall-clock.
-        let chunk_size = batched_chunk_size();
+        // The scratch holds `prefill_chunk` tokens; a test override can
+        // only go smaller.
+        let chunk_size = batched_chunk_size().min(self.prefill_chunk);
         let mut chunk_start = 0usize;
         let mut chunk_idx = 0usize;
         while chunk_start < n {

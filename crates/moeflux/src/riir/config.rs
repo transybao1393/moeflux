@@ -15,6 +15,27 @@ use crate::riir::variants::MAX_SEQ_LEN;
 /// Default IO worker-thread count — the historical hard-coded value.
 pub const DEFAULT_IO_THREADS: usize = 8;
 
+/// Default [`OpenConfig::prefill_chunk`] under a `mem_cap`. The
+/// batched-prefill scratch is linear in the chunk (≈ 0.32 MiB per
+/// token for OLMoE-1B-7B, ≈ 0.45 MiB for Qwen3.6-35B-A3B), so the
+/// uncapped [`crate::riir::BATCHED_CHUNK_SIZE`] (8192) pins 2.6 GiB
+/// (OLMoE) / 3.6 GiB (a3b). 512 keeps it at 165 / 232 MiB; longer
+/// prompts run as several chunks.
+pub const CAPPED_PREFILL_CHUNK: usize = 512;
+
+/// The prefill chunk a context with `n_ctx` positions uses when
+/// [`OpenConfig::prefill_chunk`] is `None`:
+/// [`crate::riir::BATCHED_CHUNK_SIZE`] uncapped,
+/// [`CAPPED_PREFILL_CHUNK`] under a cap, never more than `n_ctx`.
+pub fn default_prefill_chunk(n_ctx: usize, capped: bool) -> usize {
+    let chunk = if capped {
+        CAPPED_PREFILL_CHUNK
+    } else {
+        crate::riir::BATCHED_CHUNK_SIZE
+    };
+    chunk.min(n_ctx)
+}
+
 /// Open-time knobs for [`crate::riir::RsCtx::open_with`].
 ///
 /// Construct with [`OpenConfig::default`] and override fields:
@@ -58,8 +79,12 @@ pub struct OpenConfig {
     ///   the measured footprint is checked against the cap;
     /// - each `eval_*` call re-checks the footprint.
     pub mem_cap: Option<u64>,
-    /// Bytes reserved inside `mem_cap` for Metal/driver/runtime
-    /// overhead and scratch. Only used when `mem_cap` is set.
+    /// Bytes reserved inside `mem_cap` for what the budget plan does
+    /// not itemize (Metal/driver state, small fixed buffers, heap).
+    /// The prefill scratch is planned separately (`prefill_scratch`).
+    /// Default [`DEFAULT_RUNTIME_OVERHEAD`] (512 MiB, measured + margin;
+    /// a capped open logs the measured `unplanned` bytes). Only used
+    /// when `mem_cap` is set.
     pub runtime_overhead: u64,
     /// Size of the RAM hot tier for experts
     /// ([`crate::riir::io::hot_tier`]). `None`: under a cap, everything
@@ -109,6 +134,14 @@ pub struct OpenConfig {
     /// them; allocate (and touch) them before `open_with` so the
     /// at-open footprint check sees them. Only used with `mem_cap`.
     pub host_buffers: u64,
+    /// Tokens per batched-prefill chunk. Every prefill scratch buffer
+    /// (attention / MoE graph stacks, hidden double buffer, token ids)
+    /// is sized for one chunk; longer prompts run as several chunks.
+    /// `None`: [`default_prefill_chunk`] — 8192 uncapped (the
+    /// historical behavior), [`CAPPED_PREFILL_CHUNK`] under `mem_cap`.
+    /// Always clamped to `n_ctx`. Must be ≥ 1. Counted in the budget
+    /// plan as `prefill_scratch`.
+    pub prefill_chunk: Option<usize>,
 }
 
 impl Default for OpenConfig {
@@ -129,6 +162,7 @@ impl Default for OpenConfig {
             prefetch_guess: PrefetchGuess::PrevToken,
             prefetch_lookahead: false,
             host_buffers: 0,
+            prefill_chunk: None,
         }
     }
 }
@@ -147,6 +181,9 @@ impl OpenConfig {
         }
         if self.max_requests == 0 {
             return Err("max_requests must be ≥ 1".into());
+        }
+        if self.prefill_chunk == Some(0) {
+            return Err("prefill_chunk must be ≥ 1".into());
         }
         if self.io_queue_depth == Some(0) {
             return Err("io_queue_depth must be ≥ 1".into());
@@ -176,6 +213,15 @@ impl OpenConfig {
             crate::riir::range::validate(r)?;
         }
         Ok(())
+    }
+
+    /// The prefill chunk to use: [`Self::prefill_chunk`] or
+    /// [`default_prefill_chunk`], clamped to `n_ctx`.
+    pub fn resolved_prefill_chunk(&self) -> usize {
+        match self.prefill_chunk {
+            Some(c) => c.min(self.n_ctx),
+            None => default_prefill_chunk(self.n_ctx, self.mem_cap.is_some()),
+        }
     }
 
     /// The layer range to run: [`Self::layer_range`] or the whole model.
@@ -223,6 +269,20 @@ mod tests {
         assert!(ahead.validate().is_ok());
         let ahead_cross = OpenConfig { prefetch_guess: PrefetchGuess::CrossLayer, ..ahead };
         assert!(ahead_cross.validate().is_err());
+    }
+
+    #[test]
+    fn prefill_chunk_defaults_and_clamps() {
+        let c = OpenConfig { n_ctx: 2048, ..OpenConfig::default() };
+        assert_eq!(c.resolved_prefill_chunk(), 2048);
+        assert_eq!(OpenConfig::default().resolved_prefill_chunk(), crate::riir::BATCHED_CHUNK_SIZE);
+        let capped = OpenConfig { mem_cap: Some(3 << 30), ..c.clone() };
+        assert_eq!(capped.resolved_prefill_chunk(), CAPPED_PREFILL_CHUNK);
+        let tiny = OpenConfig { n_ctx: 100, ..capped.clone() };
+        assert_eq!(tiny.resolved_prefill_chunk(), 100);
+        let chosen = OpenConfig { prefill_chunk: Some(1024), ..capped };
+        assert_eq!(chosen.resolved_prefill_chunk(), 1024);
+        assert!(OpenConfig { prefill_chunk: Some(0), ..c }.validate().is_err());
     }
 
     #[test]

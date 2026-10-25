@@ -181,7 +181,8 @@ pub fn speed_from_latency(layers: usize, latency: std::time::Duration) -> f64 {
 /// manifest and the budget formulas a capped open uses: per-layer
 /// tensors plus KV / linear-attn state for `max_requests` sequences at
 /// `n_ctx`; fixed costs are the shared tensors, the expert slot ring
-/// and prefill staging (pread, as under a cap), `runtime_overhead` and
+/// and prefill staging (pread, as under a cap), the prefill scratch at
+/// the capped default chunk, `runtime_overhead` and
 /// `net_bytes`. The hot tier is not counted — it takes what is left.
 #[cfg(target_os = "macos")]
 pub fn costs_from_manifest(
@@ -224,7 +225,8 @@ pub fn costs_from_manifest(
         let r = i..i + 1;
         c.layer_bytes[i] += reqs * (kv_bytes_per_token_in(VARIANT, &r) * n_ctx as u64 + linear_state_bytes_in(VARIANT, &r));
     }
-    let base = BudgetPlan::for_range(n_ctx, moeflux::ExpertIoMode::Pread, 0, runtime_overhead, &(0..0), 1);
+    let chunk = moeflux::riir::config::default_prefill_chunk(n_ctx, true);
+    let base = BudgetPlan::for_range(n_ctx, moeflux::ExpertIoMode::Pread, 0, runtime_overhead, &(0..0), 1, chunk);
     c.fixed_bytes = shared + base.total() + net_bytes;
     Ok(c)
 }

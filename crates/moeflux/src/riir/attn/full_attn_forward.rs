@@ -74,7 +74,7 @@ use crate::riir::variants::{QkNorm, VARIANT};
 /// [`crate::riir::attn::linear_attn_forward::LinearAttnGraphScratch`]:
 /// holds only the full-attn-specific intra-`graph1` transients plus the
 /// precomputed RoPE frequency table. Every buffer allocated once at
-/// `BATCHED_CHUNK_SIZE` width; the `*NTokens` Ops stride by the real
+/// the context's prefill-chunk width; the `*NTokens` Ops stride by the real
 /// `n_tokens` and the max-chunk tail is simply unused.
 ///
 /// - **Intra-graph1 transients** (`normed` … `gate_logits`):
@@ -120,13 +120,12 @@ pub struct FullAttnGraphScratch {
 }
 
 impl FullAttnGraphScratch {
-    /// Allocate the `graph1` transients at max chunk width and upload
+    /// Allocate the `graph1` transients at the prefill-chunk width and upload
     /// the RoPE frequency table. The transients are `persistent =
     /// false` (the first producer call `commit_plan`s + pins them);
     /// `inv_freq` is `persistent = true`.
-    pub fn new(pool: &mut MetalBufferPool) -> Self {
+    pub fn new(pool: &mut MetalBufferPool, chunk: usize) -> Self {
         let v = VARIANT;
-        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
         let q_dim = v.num_attn_heads * v.head_dim;

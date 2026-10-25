@@ -124,8 +124,9 @@ fn request_pool_counted_against_the_cap() {
     let n_ctx = 4096;
     let w = std::fs::metadata(&fake.weights).unwrap().len();
     let r = 0..VARIANT.num_layers;
-    let one = BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, 0, &r, 1);
-    let eight = BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, 0, &r, 8);
+    let chunk = moeflux::riir::config::default_prefill_chunk(n_ctx, true);
+    let one = BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, 0, &r, 1, chunk);
+    let eight = BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, 0, &r, 8, chunk);
     assert_eq!(eight.get(Account::Kv), 8 * one.get(Account::Kv));
     let cap = (one.total() + eight.total()) / 2;
     let capped = |max_requests| OpenConfig {

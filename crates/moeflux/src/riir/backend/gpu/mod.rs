@@ -59,6 +59,56 @@ pub struct MetalBufferPool {
 }
 
 impl MetalBufferPool {
+    /// Write every [`Self::alloc_aligned`] buffer once. Their heap
+    /// backing is not zeroed at allocation (unlike [`BufferPool::alloc`]),
+    /// so its pages stay uncommitted — invisible to the footprint —
+    /// until first written. A capped open calls this so the measured
+    /// footprint includes them.
+    pub fn touch_aligned(&self) {
+        for anchor in &self.aligned_anchors {
+            let buf = anchor.buffer();
+            // SAFETY: `contents()` points at the anchor's owned heap
+            // backing of `length()` bytes, alive for the pool's
+            // lifetime; nothing reads it before a writer fills it.
+            unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, buf.length() as usize) };
+        }
+    }
+
+    /// Physical buffer bytes grouped by allocation label, largest
+    /// first: `(label, bytes, buffer count)`. A physical buffer shared
+    /// by several BufIds (after `commit_plan`) is counted once, under
+    /// the label of the first BufId mapped to it.
+    pub fn bytes_by_label(&self) -> Vec<(&'static str, u64, usize)> {
+        let mut owner: Vec<Option<&'static str>> = vec![None; self.buffers.len()];
+        for (id, &phys) in self.bufid_to_physical.iter().enumerate() {
+            owner[phys as usize].get_or_insert(self.labels[id]);
+        }
+        let mut by: Vec<(&'static str, u64, usize)> = Vec::new();
+        for (buf, label) in self.buffers.iter().zip(owner) {
+            let label = label.unwrap_or("?");
+            match by.iter_mut().find(|e| e.0 == label) {
+                Some(e) => {
+                    e.1 += buf.length();
+                    e.2 += 1;
+                }
+                None => by.push((label, buf.length(), 1)),
+            }
+        }
+        by.sort_by(|a, b| b.1.cmp(&a.1));
+        by
+    }
+
+    /// Sum of every `alloc` request's byte count (before the 1-byte
+    /// floor and Metal's page rounding).
+    pub fn requested_bytes(&self) -> u64 {
+        self.byte_sizes.iter().map(|&b| b as u64).sum()
+    }
+
+    /// Sum of every physical buffer's length.
+    pub fn total_bytes(&self) -> u64 {
+        self.buffers.iter().map(|b| b.length()).sum()
+    }
+
     pub fn new(device: Device) -> Self {
         Self {
             device,
@@ -400,6 +450,15 @@ impl BufferPool for MetalBufferPool {
                 np
             });
             new_bufid_to_physical[bufid_idx] = new_phys;
+        }
+
+        // Every physical buffer still in `self.buffers` now backs only
+        // colorable transients, whose contents never outlive a graph.
+        // Release them before allocating the colors so the pool never
+        // holds both sets — otherwise the first prefill peaks at
+        // scratch + colors, past what a capped open measured.
+        for buf in self.buffers.iter_mut() {
+            *buf = placeholder.clone();
         }
 
         // Phase 2: one Metal buffer per color, sized to max(byte_size).
