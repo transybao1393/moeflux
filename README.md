@@ -36,111 +36,34 @@ user-set memory cap, on one Mac or across a small cluster of Macs.
 
 ## Architecture
 
-### Single node (mode A)
-
 ```mermaid
-flowchart TB
-    subgraph API["Public API"]
-        OPEN["RsCtx::open / open_with(OpenConfig)<br/>mem_cap · n_ctx · io_threads · layer_range"]
-        EVAL["eval_prompt · eval_token<br/>embed · forward_range · head"]
-        STATE["state_save · state_load · drop_request"]
-    end
+flowchart LR
+    APP["<b>Application</b><br/>drama_llama · coordinator"]
+    ENGINE["<b>Engine</b><br/>attention · router · experts<br/>on Metal"]
+    CAP["<b>Memory cap</b><br/>everything reserved at open"]
+    STREAM["<b>Expert streaming</b><br/>hot tier · prefetch"]
+    SSD["<b>SSD</b><br/>all experts"]
 
-    subgraph SCOPE["ResourceScope — hard cap (e.g. 10 GB), reserved and touched at open"]
-        direction TB
-        LEDGER["Ledger<br/>refuses any allocation over the cap"]
-        WATCH["Watchdog<br/>samples phys_footprint"]
-        subgraph ACCOUNTS["Accounts"]
-            W["Non-expert weights"]
-            KV["Request pool<br/>KV (n_ctx) + DeltaNet state per ReqId"]
-            HOT["Hot tier<br/>fixed size, frequency eviction"]
-            SLOTS["Slot ring<br/>synced + 2 prefetch sets"]
-            STG["Prefill staging"]
-            OVH["Runtime overhead"]
-        end
-    end
-
-    subgraph ENGINE["Engine (riir/)"]
-        direction TB
-        ATTN["attn/<br/>GatedDeltaNet · full-attn GQA · MLA"]
-        ROUTER["moe_router_cpu<br/>+ RouterPolicy hook"]
-        MOE["moe/<br/>batched expert dispatch"]
-        SRC["ExpertSource<br/>hot hit · prefetch hit · miss"]
-        PREF["Prefetch<br/>cross-layer guesses"]
-    end
-
-    subgraph BACKEND["Backend trait"]
-        GPU["MetalBackend<br/>shaders.metal + moeflux-metal kernels"]
-        CPU["CpuBackend<br/>(oracle)"]
-    end
-
-    subgraph DISK["Storage — read with F_NOCACHE, no page cache"]
-        INT["Internal SSD<br/>warm tier (optional)"]
-        EXT["External SSD<br/>all experts"]
-    end
-
-    OPEN --> SCOPE
-    EVAL --> ENGINE
-    STATE --> KV
-    ATTN --> ROUTER --> MOE
-    MOE --> SRC
-    SRC -- hit --> HOT
-    SRC -- prefetched --> SLOTS
-    SRC -- miss --> DISK
-    PREF --> DISK
-    DISK --> SLOTS
-    SLOTS -. promote .-> HOT
-    ENGINE --> BACKEND
-    LEDGER -.-> ACCOUNTS
-    WATCH -.-> LEDGER
+    APP --> ENGINE
+    ENGINE --> STREAM
+    STREAM -- "miss" --> SSD
+    CAP -.- ENGINE
+    CAP -.- STREAM
 ```
 
-### Per-token data path (decode, per layer)
-
-```
-GPU  CMD1: attention + router logits ─────────┐
-I/O  prefetch guessed experts NOT in hot tier  │  (F_NOCACHE pread → prefetch slots)
-CPU  read logits → top-k (moe_router_cpu) ◄────┘
-     RouterPolicy (optional): full · low-bit · skip
-     for each pick:
-       hot tier hit   → bind hot buffer        (zero copy, zero I/O)
-       prefetch hit   → bind prefetch slot
-       miss           → parallel F_NOCACHE pread → synced slot
-GPU  batched expert matvec
-CPU  off critical path: update frequency counts; maybe promote
-     slot → hot tier, evicting the coldest (size never changes)
-```
-
-### Three-node pipeline (mode B)
+The same engine runs in both modes. In mode A it streams experts
+from the SSD inside the cap. In mode B each node runs a slice of the
+layers, its experts fit in the hot tier, and hidden states flow
+between nodes:
 
 ```mermaid
 flowchart LR
-    CLIENT["Client requests"] --> COORD
-
-    subgraph M4["Mac mini M4 · 10 GB cap"]
-        COORD["Coordinator + planner<br/>assigns layer ranges"]
-        S1["Stage: embed + layers 0–19"]
-        HEAD["head → logits → sample"]
-    end
-    subgraph M1a["Mac mini M1 · 10 GB cap"]
-        S2["Stage: layers 20–29"]
-    end
-    subgraph M1b["Mac mini M1 · 10 GB cap"]
-        S3["Stage: layers 30–39"]
-    end
-
-    COORD --> S1
-    S1 -- "moeflux-net frame<br/>req id · pos · f32 hidden" --> S2
-    S2 -- "f32 hidden" --> S3
-    S3 -- "f32 hidden" --> HEAD
-    HEAD -- "next token" --> COORD
+    N1["<b>Node 1</b><br/>embed + first layers"] --> N2["<b>Node 2</b><br/>middle layers"] --> N3["<b>Node 3</b><br/>last layers + head"]
+    N3 -- "next token" --> N1
 ```
 
-Each stage is the same engine as mode A with `layer_range` set and a
-hot tier large enough to hold every expert in its range, so it never
-misses. Each node keeps its own KV and DeltaNet state per request;
-the layer ranges shown are the example split from the plan — the
-planner chooses them from each node's budget and measured speed.
+Details — accounts, the per-token data path, phases — are in
+[`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md).
 
 ### Repository layout
 
