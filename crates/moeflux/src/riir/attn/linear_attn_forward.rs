@@ -2012,7 +2012,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             }
 
             // 1. Drain any in-flight prefetch and check whether it
-            //    targeted THIS layer.
+            //    targeted THIS layer. Everything from here to the end
+            //    of the miss reads is I/O wait on the critical path.
+            let io_t0 = std::time::Instant::now();
             let prefetch_status = prefetch.wait_for(layer_idx);
 
             // 2. Per-slot hit/miss decision. Set-based, not
@@ -2039,6 +2041,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             }
             let hot_count = hot_bind[..k].iter().filter(|b| b.is_some()).count() as u64;
             prefetch.record_outcome(hit_count, k as u64 - hit_count - hot_count);
+            expert_files.counters().record_decode_layer(layer_idx, hot_count, hit_count);
 
             // 3. Parallel sync-pread the misses into data_synced.
             //    Hoist disjoint-slice array outside the rayon closure
@@ -2061,10 +2064,17 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                         })
                 },
             )?;
+            expert_files.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
 
-            // 4. Record actuals as the prediction for the next
+            // 4. Score the previous-token guess (telemetry), then
+            //    record actuals as the prediction for the next
             //    token's same-layer prefetch. Done before dispatch
             //    so it's independent of dispatch success.
+            if let Some(prev) = prefetch.predict_for(layer_idx) {
+                use crate::riir::io::io_stats::{Guesser, guess_overlap};
+                let correct = guess_overlap(&prev[..k], &indices[..k]);
+                expert_files.counters().record_guess(Guesser::PrevToken, k as u64, correct);
+            }
             let mut actuals: [i32; MAX_K] = [0; MAX_K];
             actuals[..k].copy_from_slice(&indices[..k]);
             prefetch.record_actual(layer_idx, actuals);
@@ -2889,7 +2899,12 @@ where
             for &expert_id in buckets.expert_ids.iter() {
                 // Hot-tier hit → memcpy from RAM; miss → disk read,
                 // offered to the hot tier for admission.
-                expert_files.read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
+                expert_files.read_expert_as(
+                    crate::riir::io::io_stats::ReadKind::Prefill,
+                    layer_idx,
+                    expert_id as usize,
+                    &mut blob_scratch,
+                )?;
                 let off = expert_id as usize * expert_size;
                 pool.upload_at(base_id, off, &blob_scratch)?;
             }

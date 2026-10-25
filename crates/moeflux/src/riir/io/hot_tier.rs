@@ -360,6 +360,16 @@ impl HotTier {
         }
     }
 
+    /// Zero the hit/miss/admission/eviction counters (capacity and
+    /// residency are state, not counters, and stay).
+    pub fn reset_stats(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.stats = HotTierStats {
+            capacity: self.capacity,
+            ..HotTierStats::default()
+        };
+    }
+
     /// Popularity counters, `layer * num_experts + expert`.
     pub fn counts(&self) -> Vec<u32> {
         self.inner.lock().unwrap().counts.clone()

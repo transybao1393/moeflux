@@ -51,6 +51,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 use crate::riir::io::expert_io_mode::ExpertIoMode;
+use crate::riir::io::io_stats::ReadKind;
 use crate::riir::moe::expert_forward::MAX_K;
 
 /// Per-slot decision: which buffer the K-expert encoder reads from.
@@ -377,7 +378,7 @@ impl PrefetchState {
             pool.spawn(move || {
                 let dst = unsafe { dst_ptr.as_mut_slice() };
                 let efs = unsafe { efp.as_ref() };
-                let r = efs.read_expert_disk(target_layer, expert_idx, dst);
+                let r = efs.read_expert_disk_as(ReadKind::Prefetch, target_layer, expert_idx, dst);
                 let _ = tx.send(r);
             });
         }

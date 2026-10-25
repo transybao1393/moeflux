@@ -45,6 +45,7 @@ pub use attn::linear_attn::{
 pub use backend::gpu::gpu_norm::{GpuNormError, gpu_rms_norm_fused};
 pub use io::embedding::{EmbeddingError, bf16_to_f32, embed_lookup};
 pub use io::expert_io::{ExpertFiles, ExpertIoError};
+pub use io::io_stats::{ExpertIoStats, GuessStats, LayerIoStats, ReadStats};
 pub use io::gpu_lm_head::{GpuLmHead, GpuLmHeadError};
 pub use moe::deferred::{DeferredError, DeferredRing, DeferredState};
 pub use moe::expert_forward::{
@@ -733,7 +734,9 @@ impl RsCtx<MetalBackend> {
             self.io_pool.install(|| {
                 seed.par_iter().try_for_each_init(
                     || vec![0u8; expert_size],
-                    |buf, &(layer, expert)| experts.read_expert_disk(layer, expert, buf),
+                    |buf, &(layer, expert)| {
+                        experts.read_expert_disk_as(io::io_stats::ReadKind::Seed, layer, expert, buf)
+                    },
                 )
             })
             .map_err(|_| RsError::InitFailed)?;
@@ -748,9 +751,20 @@ impl RsCtx<MetalBackend> {
         Ok(())
     }
 
-    /// Expert-IO counters: disk reads/bytes and hot-tier stats.
+    /// Expert-IO telemetry (plan phases 0 and 6): disk reads and bytes
+    /// by kind (demand / prefetch / prefill / seed), per-layer hits,
+    /// decode and prefill timings with the share spent waiting on I/O,
+    /// prefetch guess accuracy, and hot-tier stats. CSV via
+    /// [`io::io_stats::ExpertIoStats::csv_row`].
     pub fn expert_io_stats(&self) -> io::expert_io::ExpertIoStats {
         self.experts.io_stats()
+    }
+
+    /// Zero the expert-IO telemetry ([`Self::expert_io_stats`]) and the
+    /// hot tier's counters, e.g. to scope numbers to one request.
+    /// Routing popularity is kept.
+    pub fn reset_expert_io_stats(&self) {
+        self.experts.reset_io_stats();
     }
 
     /// Routing popularity since open, `layer * num_experts + expert`.
@@ -2073,6 +2087,23 @@ impl RsCtx<MetalBackend> {
         output: StageOutput<'_>,
         chunk_idx: usize,
     ) -> Result<(), RsError> {
+        // Telemetry: wall time per batched chunk (plan phase 6).
+        let t0 = std::time::Instant::now();
+        let n = input.n_tokens().unwrap_or(0) as u64;
+        let r = self.step_internal_batched_gqa_inner(input, start_pos, output, chunk_idx);
+        if r.is_ok() {
+            self.experts.counters().record_prefill(n, t0.elapsed().as_nanos() as u64);
+        }
+        r
+    }
+
+    fn step_internal_batched_gqa_inner(
+        &mut self,
+        input: StageInput<'_>,
+        start_pos: i32,
+        output: StageOutput<'_>,
+        chunk_idx: usize,
+    ) -> Result<(), RsError> {
         use attn::full_attn_forward::batched_full_attn_layer_forward;
 
         let v = VARIANT;
@@ -2821,6 +2852,21 @@ impl RsCtx<MetalBackend> {
     /// directly. The slice-taking [`Self::step_internal`] currently
     /// wraps this in a loop.
     pub(crate) fn step_internal_per_token_oracle(
+        &mut self,
+        input: StageInput<'_>,
+        pos: i32,
+        output: StageOutput<'_>,
+    ) -> Result<(), RsError> {
+        // Telemetry: wall time per decode token (plan phase 6).
+        let t0 = std::time::Instant::now();
+        let r = self.step_internal_per_token_inner(input, pos, output);
+        if r.is_ok() {
+            self.experts.counters().record_decode(t0.elapsed().as_nanos() as u64);
+        }
+        r
+    }
+
+    fn step_internal_per_token_inner(
         &mut self,
         input: StageInput<'_>,
         pos: i32,

@@ -40,7 +40,7 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use memmap2::Mmap;
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
@@ -195,21 +195,13 @@ pub struct ExpertFiles {
     /// Routing popularity, `layer * num_experts + expert`, never
     /// decayed — the source for [`Self::routing_counts`] profiles.
     picks: Vec<AtomicU32>,
-    /// Disk reads served (count) and bytes read.
-    disk_reads: AtomicU64,
-    disk_bytes: AtomicU64,
+    /// Streaming telemetry (reads by kind, per layer, timings,
+    /// guess accuracy) — see [`super::io_stats`].
+    counters: IoCounters,
 }
 
-/// Expert-IO counters since open (or the last reset).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExpertIoStats {
-    /// Expert blobs read from disk.
-    pub disk_reads: u64,
-    /// Bytes read from disk.
-    pub disk_bytes: u64,
-    /// Hot-tier counters, when a hot tier is attached.
-    pub hot: Option<super::hot_tier::HotTierStats>,
-}
+pub use super::io_stats::ExpertIoStats;
+use super::io_stats::{IoCounters, ReadKind};
 
 impl ExpertFiles {
     /// Open `experts_dir/packed_experts/layer_NN.bin` for every layer
@@ -309,8 +301,7 @@ impl ExpertFiles {
             mmap_layers,
             hot: None,
             picks: (0..v.num_layers * v.num_experts).map(|_| AtomicU32::new(0)).collect(),
-            disk_reads: AtomicU64::new(0),
-            disk_bytes: AtomicU64::new(0),
+            counters: IoCounters::new(v.num_layers),
         })
     }
 
@@ -466,13 +457,28 @@ impl ExpertFiles {
         expert_idx: usize,
         out: &mut [u8],
     ) -> Result<(), ExpertIoError> {
+        self.read_expert_as(ReadKind::Demand, layer_idx, expert_idx, out)
+    }
+
+    /// [`Self::read_expert`] attributing a disk read (or, for
+    /// [`ReadKind::Prefill`], a hot-tier copy) to `kind`.
+    pub fn read_expert_as(
+        &self,
+        kind: ReadKind,
+        layer_idx: usize,
+        expert_idx: usize,
+        out: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
         self.read_expert_checks(layer_idx, expert_idx, out)?;
         if let Some(hot) = &self.hot {
             if hot.copy_out(layer_idx, expert_idx, out) {
+                if kind == ReadKind::Prefill {
+                    self.counters.record_prefill_hot(layer_idx, 1);
+                }
                 return Ok(());
             }
         }
-        self.read_expert_disk(layer_idx, expert_idx, out)
+        self.read_expert_disk_as(kind, layer_idx, expert_idx, out)
     }
 
     /// [`Self::read_expert`] without the hot-tier lookup: always reads
@@ -481,6 +487,18 @@ impl ExpertFiles {
     /// speculatively (prefetch). Same argument checks.
     pub fn read_expert_disk(
         &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        out: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        self.read_expert_disk_as(ReadKind::Demand, layer_idx, expert_idx, out)
+    }
+
+    /// [`Self::read_expert_disk`] attributing the read to `kind` in
+    /// the telemetry.
+    pub fn read_expert_disk_as(
+        &self,
+        kind: ReadKind,
         layer_idx: usize,
         expert_idx: usize,
         out: &mut [u8],
@@ -502,8 +520,7 @@ impl ExpertFiles {
                 actual: n,
             });
         }
-        self.disk_reads.fetch_add(1, Ordering::Relaxed);
-        self.disk_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        self.counters.record_read(kind, layer_idx, 1, n as u64, false);
         if let Some(hot) = &self.hot {
             hot.offer(layer_idx, expert_idx, out);
         }
@@ -569,12 +586,22 @@ impl ExpertFiles {
         self.picks.iter().map(|c| c.load(Ordering::Relaxed)).collect()
     }
 
-    /// Disk and hot-tier counters.
+    /// Disk, timing, guess and hot-tier counters.
     pub fn io_stats(&self) -> ExpertIoStats {
-        ExpertIoStats {
-            disk_reads: self.disk_reads.load(Ordering::Relaxed),
-            disk_bytes: self.disk_bytes.load(Ordering::Relaxed),
-            hot: self.hot.as_ref().map(|h| h.stats()),
+        self.counters.snapshot(self.hot.as_ref().map(|h| h.stats()))
+    }
+
+    /// The telemetry store, for the forward paths to record into.
+    pub fn counters(&self) -> &IoCounters {
+        &self.counters
+    }
+
+    /// Zero the telemetry and the hot tier's counters (routing
+    /// popularity is kept: it drives admission and profiles).
+    pub fn reset_io_stats(&self) {
+        self.counters.reset();
+        if let Some(hot) = &self.hot {
+            hot.reset_stats();
         }
     }
 
