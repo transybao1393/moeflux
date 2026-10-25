@@ -4,8 +4,10 @@
 *.swp
 *.swo
 
-# Claude Code per-user settings (shared memory notes stay tracked)
+# Claude Code per-user settings and agent worktrees (shared memory
+# notes stay tracked)
 .claude/settings.local.json
+.claude/worktrees/
 
 # Build artifacts
 *.o
