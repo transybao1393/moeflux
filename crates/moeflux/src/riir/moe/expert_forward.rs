@@ -67,6 +67,19 @@ fn combine_kernel_name() -> &'static str {
     match VARIANT.shared_expert_gate {
         SharedExpertGate::SigmoidGate => "moe_combine_residual",
         SharedExpertGate::Unscaled => "moe_combine_residual_unscaled",
+        SharedExpertGate::None => unreachable!("per-slot combine has no no-shared variant"),
+    }
+}
+
+/// Pipeline name for the flat K-expert combine of the per-token
+/// path. Variants without a shared expert (OLMoE) use the sibling
+/// that drops the `sigmoid(gate) * shared_out` term instead of
+/// relying on a zeroed `shared_out`.
+fn combine_flat_kernel_name() -> &'static str {
+    if VARIANT.has_shared_expert() {
+        "moe_combine_residual_flat"
+    } else {
+        "moe_combine_residual_flat_noshared"
     }
 }
 
@@ -789,7 +802,7 @@ pub(crate) fn gpu_batched_experts_encode(
         .pipeline("dequant_matvec_4bit_v3_experts")
         .ok()
         .cloned();
-    let combine_flat = metal.pipeline("moe_combine_residual_flat")?.clone();
+    let combine_flat = metal.pipeline(combine_flat_kernel_name())?.clone();
 
     let expert_size = v.expert_size_4bit();
     for slot in 0..k {
@@ -881,7 +894,7 @@ pub(crate) fn gpu_batched_experts_encode_mmap(
         .pipeline("dequant_matvec_4bit_v3_experts")
         .ok()
         .cloned();
-    let combine_flat = metal.pipeline("moe_combine_residual_flat")?.clone();
+    let combine_flat = metal.pipeline(combine_flat_kernel_name())?.clone();
 
     {
         let buf = buffer_pool.handle(bufs.combine_params_id());
@@ -2001,6 +2014,33 @@ pub fn encode_moe_combine_residual_n_tokens(
     enc.set_buffer(4, Some(hidden_out), 0);
     enc.set_bytes(5, 4, (&n_tokens as *const u32).cast());
     enc.set_bytes(6, 4, (&dim as *const u32).cast());
+    let num_tgs = (total + 255) / 256;
+    enc.dispatch_thread_groups(
+        MTLSize::new(num_tgs as NSUInteger, 1, 1),
+        MTLSize::new(256, 1, 1),
+    );
+    enc.end_encoding();
+}
+
+/// No-shared-expert sibling of [`encode_moe_combine_residual_n_tokens`]
+/// (OLMoE): `hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i]`.
+pub fn encode_moe_combine_residual_noshared_n_tokens(
+    cmdbuf: &CommandBufferRef,
+    pipeline: &ComputePipelineState,
+    h_mid: &Buffer,
+    moe_sum: &Buffer,
+    hidden_out: &Buffer,
+    n_tokens: u32,
+    dim: u32,
+) {
+    let total = n_tokens * dim;
+    let enc = cmdbuf.new_compute_command_encoder();
+    enc.set_compute_pipeline_state(pipeline);
+    enc.set_buffer(0, Some(h_mid), 0);
+    enc.set_buffer(1, Some(moe_sum), 0);
+    enc.set_buffer(2, Some(hidden_out), 0);
+    enc.set_bytes(3, 4, (&n_tokens as *const u32).cast());
+    enc.set_bytes(4, 4, (&dim as *const u32).cast());
     let num_tgs = (total + 255) / 256;
     enc.dispatch_thread_groups(
         MTLSize::new(num_tgs as NSUInteger, 1, 1),

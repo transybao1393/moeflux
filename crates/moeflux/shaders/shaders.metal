@@ -1143,6 +1143,28 @@ kernel void moe_combine_residual_flat(
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
 
+// No-shared-expert sibling of `moe_combine_residual_flat` (OLMoE):
+// `hidden_out = h_mid + Σ_k params[k] * expert_out[k]`. Same buffer
+// layout minus `shared_out`; `params[16]` is not read.
+kernel void moe_combine_residual_flat_noshared(
+    device const float* h_mid       [[buffer(0)]],
+    device float*       hidden_out  [[buffer(2)]],
+    device const float* expert_out  [[buffer(3)]],
+    device const float* params      [[buffer(4)]],
+    constant uint&      dim         [[buffer(5)]],
+    constant uint&      K           [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    float moe = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        moe += params[k] * expert_out[k * dim + tid];
+    }
+
+    hidden_out[tid] = h_mid[tid] + moe;
+}
+
 
 // ============================================================================
 // Kernel 2: SwiGLU activation
@@ -3105,6 +3127,26 @@ kernel void moe_combine_residual_n_tokens(
     uint t = tid / dim;
     float sg = 1.0f / (1.0f + exp(-shared_gate[t]));
     hidden_out[tid] = h_mid[tid] + moe_sum[tid] + sg * shared_out[tid];
+}
+
+// No-shared-expert sibling of `moe_combine_residual_n_tokens` (OLMoE):
+// `hidden_out[t, i] = h_mid[t, i] + moe_sum[t, i]`.
+//
+// Dispatch:
+//   threadgroups = (ceil(n_tokens * dim / 256), 1, 1)
+//   threads      = (256, 1, 1)
+
+kernel void moe_combine_residual_n_tokens_noshared(
+    device const float* h_mid        [[buffer(0)]],  // [n_tokens, dim]
+    device const float* moe_sum      [[buffer(1)]],  // [n_tokens, dim]
+    device float*       hidden_out   [[buffer(2)]],  // [n_tokens, dim]
+    constant uint&      n_tokens     [[buffer(3)]],
+    constant uint&      dim          [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tokens * dim;
+    if (tid >= total) return;
+    hidden_out[tid] = h_mid[tid] + moe_sum[tid];
 }
 
 

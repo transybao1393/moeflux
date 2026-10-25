@@ -51,7 +51,7 @@ use crate::riir::attn::linear_attn_forward::{
 };
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
 use crate::riir::attn::rope::apply_rotary_emb;
-use crate::riir::attn::sdpa::sdpa_cpu;
+use crate::riir::attn::sdpa::sdpa_cpu_with;
 use crate::riir::backend::buftype::{
     AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf,
     RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
@@ -66,7 +66,7 @@ use crate::riir::io::layer_weight_cache::LayerWeightCache;
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::expert_forward::MoeBuffers;
 use crate::riir::snapshot::state::KvCache;
-use crate::riir::variants::VARIANT;
+use crate::riir::variants::{QkNorm, VARIANT};
 
 /// Run-lifetime scratch for the batched full-attn `graph1`.
 ///
@@ -99,6 +99,10 @@ pub struct FullAttnGraphScratch {
     /// `From<AttnInputBuf> for BufId<MatvecIn>`.
     pub normed: BufId<AttnInputBuf>,
     pub q_proj_stack: BufId<QProjOutBuf>,
+    /// Raw K-projection output for [`QkNorm::Full`] (OLMoE), normed
+    /// into `k_proj_stack`; `None` for per-head norms, which run in
+    /// place on `k_proj_stack`.
+    pub k_raw_stack: Option<BufId<KProjOutBuf>>,
     pub k_proj_stack: BufId<KProjOutBuf>,
     pub v_proj_stack: BufId<VProjOutBuf>,
     pub q_stack: BufId<QBuf>,
@@ -136,8 +140,12 @@ impl FullAttnGraphScratch {
             .alloc(bytes_of(hidden), "fags.normed", false)
             .expect("FullAttnGraphScratch::new pool alloc");
         let q_proj_stack: BufId<QProjOutBuf> = pool
-            .alloc(bytes_of(q_dim * 2), "fags.q_proj_stack", false)
+            .alloc(bytes_of(v.q_proj_dim()), "fags.q_proj_stack", false)
             .expect("FullAttnGraphScratch::new pool alloc");
+        let k_raw_stack: Option<BufId<KProjOutBuf>> = (v.qk_norm == QkNorm::Full).then(|| {
+            pool.alloc(bytes_of(kv_dim), "fags.k_raw_stack", false)
+                .expect("FullAttnGraphScratch::new pool alloc")
+        });
         let k_proj_stack: BufId<KProjOutBuf> = pool
             .alloc(bytes_of(kv_dim), "fags.k_proj_stack", false)
             .expect("FullAttnGraphScratch::new pool alloc");
@@ -147,8 +155,10 @@ impl FullAttnGraphScratch {
         let q_stack: BufId<QBuf> = pool
             .alloc(bytes_of(q_dim), "fags.q_stack", false)
             .expect("FullAttnGraphScratch::new pool alloc");
+        // Unused (zero-sized) without the attention output gate.
+        let q_gate_elems = if v.attn_output_gate { q_dim } else { 0 };
         let q_gate_stack: BufId<QGateBuf> = pool
-            .alloc(bytes_of(q_dim), "fags.q_gate_stack", false)
+            .alloc(bytes_of(q_gate_elems), "fags.q_gate_stack", false)
             .expect("FullAttnGraphScratch::new pool alloc");
         let attn_out_stack: BufId<AttnOutBuf> = pool
             .alloc(bytes_of(q_dim), "fags.attn_out_stack", false)
@@ -182,6 +192,7 @@ impl FullAttnGraphScratch {
         Self {
             normed,
             q_proj_stack,
+            k_raw_stack,
             k_proj_stack,
             v_proj_stack,
             q_stack,
@@ -293,7 +304,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // populated `attn.q_norm_w` / `attn.k_norm_w` as required slots.
 
     let q_dim = v.num_attn_heads * v.head_dim; // total Q channels
-    let q_proj_dim = q_dim * 2; // q + per-head sigmoid gate
+    let q_proj_dim = v.q_proj_dim(); // q (+ per-head sigmoid gate)
     let kv_dim = v.num_kv_heads * v.head_dim;
 
     // Pre-fetch the matvec pipelines.
@@ -379,25 +390,37 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // q_proj_out layout per head: `[q_h (HEAD_DIM) | gate_h
     // (HEAD_DIM)]`, i.e. contiguous head-by-head as 2*HEAD_DIM stride.
     // Matches the C path at infer.m:4760–4764 (and 2428–2432 in the
-    // standalone full_attention_forward).
-    let mut q_host = vec![0.0f32; q_dim];
-    let mut q_gate_host = vec![0.0f32; q_dim];
-    for h in 0..v.num_attn_heads {
-        let src_off = h * (2 * v.head_dim);
-        let dst_off = h * v.head_dim;
-        q_host[dst_off..dst_off + v.head_dim]
-            .copy_from_slice(&q_proj_host[src_off..src_off + v.head_dim]);
-        q_gate_host[dst_off..dst_off + v.head_dim]
-            .copy_from_slice(&q_proj_host[src_off + v.head_dim..src_off + 2 * v.head_dim]);
-    }
+    // standalone full_attention_forward). Without the output gate
+    // (OLMoE) q_proj_out is the Q stack itself.
+    let (mut q_host, q_gate_host) = if v.attn_output_gate {
+        let mut q_host = vec![0.0f32; q_dim];
+        let mut q_gate_host = vec![0.0f32; q_dim];
+        for h in 0..v.num_attn_heads {
+            let src_off = h * (2 * v.head_dim);
+            let dst_off = h * v.head_dim;
+            q_host[dst_off..dst_off + v.head_dim]
+                .copy_from_slice(&q_proj_host[src_off..src_off + v.head_dim]);
+            q_gate_host[dst_off..dst_off + v.head_dim]
+                .copy_from_slice(&q_proj_host[src_off + v.head_dim..src_off + 2 * v.head_dim]);
+        }
+        (q_host, Some(q_gate_host))
+    } else {
+        (q_proj_host, None)
+    };
 
-    // ── Per-head Q rms_norm ──────────────────────────────────────
+    // ── Q / K rms_norm ───────────────────────────────────────────
+    // Per head (qwen3, `[head_dim]` weights) or over the whole
+    // projection (OLMoE, `[num_heads * head_dim]` weights) — the
+    // latter is the per-head norm with one head spanning it all.
+    let ((q_heads, q_norm_dim), (k_heads, k_norm_dim)) = match v.qk_norm {
+        QkNorm::PerHead => ((v.num_attn_heads, v.head_dim), (v.num_kv_heads, v.head_dim)),
+        QkNorm::Full => ((1, q_dim), (1, kv_dim)),
+    };
     let q_norm_name = format!("model.layers.{layer_idx}.self_attn.q_norm.weight");
-    rms_norm_per_head_cpu(wf, &q_norm_name, v.num_attn_heads, v.head_dim, &mut q_host)?;
+    rms_norm_per_head_cpu(wf, &q_norm_name, q_heads, q_norm_dim, &mut q_host)?;
 
-    // ── Per-head K rms_norm ──────────────────────────────────────
     let k_norm_name = format!("model.layers.{layer_idx}.self_attn.k_norm.weight");
-    rms_norm_per_head_cpu(wf, &k_norm_name, v.num_kv_heads, v.head_dim, &mut k_host)?;
+    rms_norm_per_head_cpu(wf, &k_norm_name, k_heads, k_norm_dim, &mut k_host)?;
 
     // ── RoPE on q + k ────────────────────────────────────────────
     apply_rotary_emb(pos, &mut q_host, &mut k_host)?;
@@ -462,9 +485,11 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         // CMD2 hasn't been built yet).
         unsafe {
             let q_dst = buffer_pool.handle(buffers.gpu_attn_q).contents() as *mut f32;
-            let g_dst = buffer_pool.handle(buffers.gpu_attn_gate).contents() as *mut f32;
             std::ptr::copy_nonoverlapping(q_host.as_ptr(), q_dst, q_dim);
-            std::ptr::copy_nonoverlapping(q_gate_host.as_ptr(), g_dst, q_dim);
+            if let Some(q_gate_host) = &q_gate_host {
+                let g_dst = buffer_pool.handle(buffers.gpu_attn_gate).contents() as *mut f32;
+                std::ptr::copy_nonoverlapping(q_gate_host.as_ptr(), g_dst, q_dim);
+            }
         }
         Some(GpuAttnEncodeArgs {
             k_cache: kv_state.k_id.expect("gpu_attn_ready ⇒ KV K allocated"),
@@ -484,10 +509,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
                 kv_state.v_slice(buffer_pool, kv_len as usize),
             )
         };
-        sdpa_cpu(
+        sdpa_cpu_with(
             kv_len,
             &q_host,
-            &q_gate_host,
+            q_gate_host.as_deref(),
             k_prefix,
             v_prefix,
             &mut attn_out,
@@ -685,7 +710,7 @@ where
     let hidden_dim = v.hidden_dim;
     let q_dim = v.num_attn_heads * v.head_dim;
     let kv_dim = v.num_kv_heads * v.head_dim;
-    let q_proj_dim = q_dim * 2;
+    let q_proj_dim = v.q_proj_dim();
     let num_attn_heads = v.num_attn_heads as u32;
     let num_kv_heads = v.num_kv_heads as u32;
     let head_dim = v.head_dim as u32;
@@ -785,7 +810,8 @@ where
             },
             input: scratch.normed.into(),
             input_off: 0,
-            output: scratch.k_proj_stack.into(),
+            // QkNorm::Full norms the raw projection into `k_proj_stack`.
+            output: scratch.k_raw_stack.unwrap_or(scratch.k_proj_stack).into(),
             output_off: 0,
             in_dim: hidden_dim as u32,
             out_dim: kv_dim as u32,
@@ -807,37 +833,67 @@ where
             out_dim: kv_dim as u32,
             n_tokens: n,
         });
-        g.push(Op::SplitQGate {
-            label: "full_attn.split_q_gate",
-            q_proj: scratch.q_proj_stack,
-            q_out: scratch.q_stack,
-            gate_out: scratch.q_gate_stack,
-            num_heads: num_attn_heads,
-            head_dim,
-            n_tokens: n,
-        });
-        g.push(Op::RmsNormPerHeadNTokens {
-            label: "full_attn.q_norm",
-            // Per-head norm is in-place on the Q stack; QBuf → RmsNormIn
-            // via the union's `From<QBuf>` impl.
-            x: scratch.q_stack.into(),
-            weight_off: attn.q_norm_w,
-            num_heads: num_attn_heads,
-            head_dim,
-            n_tokens: n,
-            eps,
-        });
-        g.push(Op::RmsNormPerHeadNTokens {
-            label: "full_attn.k_norm",
-            // In-place on the K-projection buffer; KProjOutBuf → RmsNormIn
-            // via the union impl.
-            x: scratch.k_proj_stack.into(),
-            weight_off: attn.k_norm_w,
-            num_heads: num_kv_heads,
-            head_dim,
-            n_tokens: n,
-            eps,
-        });
+        match v.qk_norm {
+            QkNorm::PerHead => {
+                g.push(Op::SplitQGate {
+                    label: "full_attn.split_q_gate",
+                    q_proj: scratch.q_proj_stack,
+                    q_out: scratch.q_stack,
+                    gate_out: scratch.q_gate_stack,
+                    num_heads: num_attn_heads,
+                    head_dim,
+                    n_tokens: n,
+                });
+                g.push(Op::RmsNormPerHeadNTokens {
+                    label: "full_attn.q_norm",
+                    // Per-head norm is in-place on the Q stack; QBuf → RmsNormIn
+                    // via the union's `From<QBuf>` impl.
+                    x: scratch.q_stack.into(),
+                    weight_off: attn.q_norm_w,
+                    num_heads: num_attn_heads,
+                    head_dim,
+                    n_tokens: n,
+                    eps,
+                });
+                g.push(Op::RmsNormPerHeadNTokens {
+                    label: "full_attn.k_norm",
+                    // In-place on the K-projection buffer; KProjOutBuf → RmsNormIn
+                    // via the union impl.
+                    x: scratch.k_proj_stack.into(),
+                    weight_off: attn.k_norm_w,
+                    num_heads: num_kv_heads,
+                    head_dim,
+                    n_tokens: n,
+                    eps,
+                });
+            }
+            QkNorm::Full => {
+                // OLMoE: one RMSNorm over the whole projection, before
+                // the head reshape. No output gate, so q_proj_out is
+                // the Q stack (variants.rs asserts the pairing).
+                g.push(Op::RmsNormBf16NTokens {
+                    label: "full_attn.q_norm",
+                    x: scratch.q_proj_stack.into(),
+                    weight_off: attn.q_norm_w,
+                    out: scratch.q_stack.into(),
+                    dim: q_dim as u32,
+                    n_tokens: n,
+                    eps,
+                });
+                g.push(Op::RmsNormBf16NTokens {
+                    label: "full_attn.k_norm",
+                    x: scratch
+                        .k_raw_stack
+                        .expect("k_raw_stack allocated for QkNorm::Full")
+                        .into(),
+                    weight_off: attn.k_norm_w,
+                    out: scratch.k_proj_stack.into(),
+                    dim: kv_dim as u32,
+                    n_tokens: n,
+                    eps,
+                });
+            }
+        }
         g.push(Op::RopeNTokens {
             label: "full_attn.q_rope",
             x: scratch.q_stack.into(),
@@ -883,13 +939,15 @@ where
             kv_len_total: kv_start as u32 + n,
             softmax_scale,
         });
-        g.push(Op::SigmoidGateNTokens {
-            label: "full_attn.sigmoid_gate",
-            x: scratch.attn_out_stack,
-            gate: scratch.q_gate_stack,
-            dim: q_dim as u32,
-            n_tokens: n,
-        });
+        if v.attn_output_gate {
+            g.push(Op::SigmoidGateNTokens {
+                label: "full_attn.sigmoid_gate",
+                x: scratch.attn_out_stack,
+                gate: scratch.q_gate_stack,
+                dim: q_dim as u32,
+                n_tokens: n,
+            });
+        }
         g.push(Op::MatvecNTokens {
             label: "full_attn.o_proj",
             weight: WeightRef {
@@ -944,22 +1002,24 @@ where
             out_dim: v.num_experts as u32,
             n_tokens: n,
         });
-        g.push(Op::MatvecNTokens {
-            label: "full_attn.shared_gate",
-            weight: WeightRef {
-                w_off: layer_cache.shared.seg_w,
-                s_off: layer_cache.shared.seg_s,
-                b_off: layer_cache.shared.seg_b,
-                bits: seg_bits,
-            },
-            input: moe.h_post.into(),
-            input_off: 0,
-            output: moe.shared_gate.into(),
-            output_off: 0,
-            in_dim: hidden_dim as u32,
-            out_dim: 1,
-            n_tokens: n,
-        });
+        if let Some(shared) = layer_cache.shared.as_ref() {
+            g.push(Op::MatvecNTokens {
+                label: "full_attn.shared_gate",
+                weight: WeightRef {
+                    w_off: shared.seg_w,
+                    s_off: shared.seg_s,
+                    b_off: shared.seg_b,
+                    bits: seg_bits,
+                },
+                input: moe.h_post.into(),
+                input_off: 0,
+                output: moe.shared_gate.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: 1,
+                n_tokens: n,
+            });
+        }
         g.push(Op::MoeSoftmaxTopK {
             label: "full_attn.router_softmax_topk",
             logits: scratch.gate_logits,
@@ -969,12 +1029,14 @@ where
             n_experts: v.num_experts as u32,
             k: k_active as u32,
         });
-        g.push(Op::MoeNormalizeWeights {
-            label: "full_attn.router_normalize",
-            weights: moe.routing_weights,
-            n_tokens: n,
-            k: k_active as u32,
-        });
+        if v.norm_topk_prob {
+            g.push(Op::MoeNormalizeWeights {
+                label: "full_attn.router_normalize",
+                weights: moe.routing_weights,
+                n_tokens: n,
+                k: k_active as u32,
+            });
+        }
         g
     };
 

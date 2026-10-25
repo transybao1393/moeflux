@@ -357,9 +357,9 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
             g.push(Op::MatvecNTokens {
                 label: "engine_diff.shared_gate",
                 weight: WeightRef {
-                    w_off: layer_cache.shared.seg_w,
-                    s_off: layer_cache.shared.seg_s,
-                    b_off: layer_cache.shared.seg_b,
+                    w_off: layer_cache.shared.as_ref().unwrap().seg_w,
+                    s_off: layer_cache.shared.as_ref().unwrap().seg_s,
+                    b_off: layer_cache.shared.as_ref().unwrap().seg_b,
                     bits: seg_bits,
                 },
                 input: scratch.h_post.into(),
@@ -527,9 +527,9 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
         g.push(Op::MatvecNTokens {
             label: "engine_diff.shared_gate_proj",
             weight: WeightRef {
-                w_off: layer_cache.shared.gate_w,
-                s_off: layer_cache.shared.gate_s,
-                b_off: layer_cache.shared.gate_b,
+                w_off: layer_cache.shared.as_ref().unwrap().gate_w,
+                s_off: layer_cache.shared.as_ref().unwrap().gate_s,
+                b_off: layer_cache.shared.as_ref().unwrap().gate_b,
                 bits: s_gate_bits,
             },
             input: scratch.h_post.into(),
@@ -543,9 +543,9 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
         g.push(Op::MatvecNTokens {
             label: "engine_diff.shared_up_proj",
             weight: WeightRef {
-                w_off: layer_cache.shared.up_w,
-                s_off: layer_cache.shared.up_s,
-                b_off: layer_cache.shared.up_b,
+                w_off: layer_cache.shared.as_ref().unwrap().up_w,
+                s_off: layer_cache.shared.as_ref().unwrap().up_s,
+                b_off: layer_cache.shared.as_ref().unwrap().up_b,
                 bits: s_up_bits,
             },
             input: scratch.h_post.into(),
@@ -566,9 +566,9 @@ fn run_one_layer_op_diff(layer_idx: usize, n_tokens: usize, seed: u64) {
         g.push(Op::MatvecNTokens {
             label: "engine_diff.shared_down_proj",
             weight: WeightRef {
-                w_off: layer_cache.shared.down_w,
-                s_off: layer_cache.shared.down_s,
-                b_off: layer_cache.shared.down_b,
+                w_off: layer_cache.shared.as_ref().unwrap().down_w,
+                s_off: layer_cache.shared.as_ref().unwrap().down_s,
+                b_off: layer_cache.shared.as_ref().unwrap().down_b,
                 bits: s_down_bits,
             },
             input: scratch.shared_act.into(),

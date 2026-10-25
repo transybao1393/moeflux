@@ -658,6 +658,17 @@ pub enum Op {
         dim: u32,
     },
 
+    /// MoE combine + residual for variants without a shared expert
+    /// (OLMoE): `hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i]`.
+    MoeCombineResidualNoSharedNTokens {
+        label: &'static str,
+        h_mid: BufId<ResidualBuf>,
+        moe_sum: BufId<MoeOutSumBuf>,
+        hidden_out: BufId<HiddenBuf>,
+        n_tokens: u32,
+        dim: u32,
+    },
+
     /// Linear-attn 1b: per-token conv1d step over n_tokens. The
     /// `conv_state` buffer is persistent per layer (carries the
     /// kernel-window of prior values forward across tokens).
@@ -777,6 +788,7 @@ impl Op {
             Op::MoeBatchedPermuteFuse { label, .. } => label,
             Op::MoeGatherIdFuse { label, .. } => label,
             Op::MoeCombineResidualNTokens { label, .. } => label,
+            Op::MoeCombineResidualNoSharedNTokens { label, .. } => label,
             Op::Conv1dStepNTokens { label, .. } => label,
             Op::ComputeDecayBetaNTokens { label, .. } => label,
             Op::GatedDeltaNetStepNTokens { label, .. } => label,
@@ -807,6 +819,7 @@ impl Op {
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
             Op::MoeGatherIdFuse { .. } => "MoeGatherIdFuse",
             Op::MoeCombineResidualNTokens { .. } => "MoeCombineResidualNTokens",
+            Op::MoeCombineResidualNoSharedNTokens { .. } => "MoeCombineResidualNoSharedNTokens",
             Op::Conv1dStepNTokens { .. } => "Conv1dStepNTokens",
             Op::ComputeDecayBetaNTokens { .. } => "ComputeDecayBetaNTokens",
             Op::GatedDeltaNetStepNTokens { .. } => "GatedDeltaNetStepNTokens",
@@ -888,6 +901,9 @@ impl Op {
                 shared_out.raw(),
                 shared_gate.raw(),
             ],
+            Op::MoeCombineResidualNoSharedNTokens { h_mid, moe_sum, .. } => {
+                vec![h_mid.raw(), moe_sum.raw()]
+            }
             Op::Conv1dStepNTokens {
                 qkv_in, conv_state, ..
             } => vec![qkv_in.raw(), conv_state.raw()],
@@ -975,6 +991,9 @@ impl Op {
                 out_sum.raw(),
             ],
             Op::MoeCombineResidualNTokens { hidden_out, .. } => {
+                vec![hidden_out.raw()]
+            }
+            Op::MoeCombineResidualNoSharedNTokens { hidden_out, .. } => {
                 vec![hidden_out.raw()]
             }
             Op::Conv1dStepNTokens {

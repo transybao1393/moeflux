@@ -68,6 +68,20 @@ pub fn sdpa_cpu(
     v_cache: &[f32],
     out: &mut [f32],
 ) -> Result<(), SdpaError> {
+    sdpa_cpu_with(kv_len, q, Some(q_gate), k_cache, v_cache, out)
+}
+
+/// [`sdpa_cpu`] with the output gate optional: `None` (variants
+/// without an attention output gate, e.g. OLMoE) returns the plain
+/// softmax-weighted values.
+pub fn sdpa_cpu_with(
+    kv_len: i32,
+    q: &[f32],
+    q_gate: Option<&[f32]>,
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+) -> Result<(), SdpaError> {
     if kv_len <= 0 {
         return Err(SdpaError::EmptyCache { kv_len });
     }
@@ -86,11 +100,13 @@ pub fn sdpa_cpu(
             expected: q_dim,
         });
     }
-    if q_gate.len() != q_dim {
-        return Err(SdpaError::QGateLen {
-            got: q_gate.len(),
-            expected: q_dim,
-        });
+    if let Some(q_gate) = q_gate {
+        if q_gate.len() != q_dim {
+            return Err(SdpaError::QGateLen {
+                got: q_gate.len(),
+                expected: q_dim,
+            });
+        }
     }
     if k_cache.len() != kv_total {
         return Err(SdpaError::KCacheLen {
@@ -162,10 +178,12 @@ pub fn sdpa_cpu(
         }
     }
 
-    for i in 0..q_dim {
-        // SAFETY: scalar libm `expf` — well-formed f32 input.
-        let g = 1.0f32 / (1.0f32 + unsafe { expf(-q_gate[i]) });
-        out[i] *= g;
+    if let Some(q_gate) = q_gate {
+        for i in 0..q_dim {
+            // SAFETY: scalar libm `expf` — well-formed f32 input.
+            let g = 1.0f32 / (1.0f32 + unsafe { expf(-q_gate[i]) });
+            out[i] *= g;
+        }
     }
 
     Ok(())

@@ -139,7 +139,9 @@ pub struct LayerWeightCache {
     pub post_attention_layernorm_w: u64,
     pub attn: LayerAttnW,
     pub gate: GateW,
-    pub shared: SharedExpertW,
+    /// `None` for variants without a shared expert (OLMoE) — their
+    /// manifests carry no `mlp.shared_expert*` tensors.
+    pub shared: Option<SharedExpertW>,
 }
 
 impl LayerWeightCache {
@@ -222,19 +224,23 @@ impl LayerWeightCache {
             // per-group dequant bias.
             bias: None,
         };
-        let shared = SharedExpertW {
-            seg_w: need(m("shared_expert_gate.weight"))?,
-            seg_s: need(m("shared_expert_gate.scales"))?,
-            seg_b: need(m("shared_expert_gate.biases"))?,
-            gate_w: need(m("shared_expert.gate_proj.weight"))?,
-            gate_s: need(m("shared_expert.gate_proj.scales"))?,
-            gate_b: need(m("shared_expert.gate_proj.biases"))?,
-            up_w: need(m("shared_expert.up_proj.weight"))?,
-            up_s: need(m("shared_expert.up_proj.scales"))?,
-            up_b: need(m("shared_expert.up_proj.biases"))?,
-            down_w: need(m("shared_expert.down_proj.weight"))?,
-            down_s: need(m("shared_expert.down_proj.scales"))?,
-            down_b: need(m("shared_expert.down_proj.biases"))?,
+        let shared = if VARIANT.has_shared_expert() {
+            Some(SharedExpertW {
+                seg_w: need(m("shared_expert_gate.weight"))?,
+                seg_s: need(m("shared_expert_gate.scales"))?,
+                seg_b: need(m("shared_expert_gate.biases"))?,
+                gate_w: need(m("shared_expert.gate_proj.weight"))?,
+                gate_s: need(m("shared_expert.gate_proj.scales"))?,
+                gate_b: need(m("shared_expert.gate_proj.biases"))?,
+                up_w: need(m("shared_expert.up_proj.weight"))?,
+                up_s: need(m("shared_expert.up_proj.scales"))?,
+                up_b: need(m("shared_expert.up_proj.biases"))?,
+                down_w: need(m("shared_expert.down_proj.weight"))?,
+                down_s: need(m("shared_expert.down_proj.scales"))?,
+                down_b: need(m("shared_expert.down_proj.biases"))?,
+            })
+        } else {
+            None
         };
 
         Ok(Self {

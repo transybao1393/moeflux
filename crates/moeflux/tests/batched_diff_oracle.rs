@@ -611,6 +611,12 @@ fn flash_diff_tokenwise(n_tokens: u32, start_pos: u32, seed: u64, fold: u32, vb:
     let q_dim = num_heads as usize * head_dim as usize;
     let kv_len = start_pos + n_tokens;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
+    if fold > 1 && (heads_per_kv % fold != 0 || head_dim != 256) {
+        // No folded instance for this variant's shape (e.g. OLMoE:
+        // heads_per_kv 1, head_dim 128).
+        eprintln!("flash fold={fold}: skipped (heads_per_kv={heads_per_kv}, head_dim={head_dim})");
+        return;
+    }
 
     let mut rng = XorShift64::new(seed);
     let q_data: Vec<f32> = (0..n_tokens as usize * q_dim)

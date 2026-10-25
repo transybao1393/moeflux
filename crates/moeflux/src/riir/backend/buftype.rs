@@ -640,11 +640,17 @@ impl_from!(HiddenBuf -> RmsNormIn);
 impl_from!(ConvOutBuf -> RmsNormIn);
 impl_from!(QBuf -> RmsNormIn);
 impl_from!(KProjOutBuf -> RmsNormIn);
+// Full-projection Q/K norm (`QkNorm::Full`, OLMoE): the norm reads the
+// raw `q_proj` output and writes the Q stack; K is normed from a raw
+// K-projection stack into the K stack the RoPE + KV append consume.
+impl_from!(QProjOutBuf -> RmsNormIn);
 
 // RmsNormOut union.
 impl_from!(AttnInputBuf -> RmsNormOut);
 impl_from!(MoeInputBuf -> RmsNormOut);
 impl_from!(TailNormedBuf -> RmsNormOut);
+impl_from!(QBuf -> RmsNormOut);
+impl_from!(KProjOutBuf -> RmsNormOut);
 
 #[cfg(test)]
 mod tests {

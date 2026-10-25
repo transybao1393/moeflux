@@ -144,15 +144,39 @@ pub fn normalize_weights(weights: &mut [f32]) {
 /// `NUM_EXPERTS` raw gate logits (mutated in place — softmax happens
 /// on this buffer). `indices` and `weights` are output parallel arrays
 /// of length `k`. Convenience wrapper composing the three primitives.
+///
+/// The normalize step follows the active variant's
+/// [`norm_topk_prob`](crate::riir::variants::Variant::norm_topk_prob):
+/// OLMoE keeps the raw softmax probabilities of the chosen experts.
 pub fn moe_router_cpu(
     scores: &mut [f32],
     k: usize,
     indices: &mut [i32],
     weights: &mut [f32],
 ) -> Result<(), MoeRouterError> {
+    moe_router_cpu_with(
+        scores,
+        k,
+        crate::riir::variants::VARIANT.norm_topk_prob,
+        indices,
+        weights,
+    )
+}
+
+/// [`moe_router_cpu`] with the top-K renormalization chosen by the
+/// caller instead of the active variant.
+pub fn moe_router_cpu_with(
+    scores: &mut [f32],
+    k: usize,
+    normalize: bool,
+    indices: &mut [i32],
+    weights: &mut [f32],
+) -> Result<(), MoeRouterError> {
     softmax(scores)?;
     topk(scores, k, indices, weights)?;
-    normalize_weights(weights);
+    if normalize {
+        normalize_weights(weights);
+    }
     Ok(())
 }
 
@@ -434,6 +458,38 @@ mod tests {
         assert_eq!(pairs[0].0, 3); // 0.9
         assert_eq!(pairs[1].0, 1); // 0.5
         assert_eq!(pairs[2].0, 2); // 0.3
+    }
+
+    /// `norm_topk_prob = false` (OLMoE): the chosen weights are the
+    /// softmax probabilities over *all* experts, untouched; `true`
+    /// renormalizes the same picks to sum to 1.
+    #[test]
+    fn router_without_renorm_keeps_softmax_probs() {
+        let logits = [0.5f32, -1.0, 2.0, 0.0, 1.5, -0.5];
+        let mut probs = logits;
+        softmax(&mut probs).unwrap();
+
+        let mut raw_scores = logits;
+        let mut raw_idx = [0i32; 2];
+        let mut raw_w = [0.0f32; 2];
+        moe_router_cpu_with(&mut raw_scores, 2, false, &mut raw_idx, &mut raw_w).unwrap();
+        let mut picked: Vec<i32> = raw_idx.to_vec();
+        picked.sort();
+        assert_eq!(picked, vec![2, 4]);
+        for s in 0..2 {
+            assert_eq!(raw_w[s], probs[raw_idx[s] as usize]);
+        }
+        assert!(raw_w.iter().sum::<f32>() < 1.0);
+
+        let mut norm_scores = logits;
+        let mut norm_idx = [0i32; 2];
+        let mut norm_w = [0.0f32; 2];
+        moe_router_cpu_with(&mut norm_scores, 2, true, &mut norm_idx, &mut norm_w).unwrap();
+        assert_eq!(norm_idx, raw_idx);
+        let sum = raw_w[0] + raw_w[1];
+        for s in 0..2 {
+            assert_eq!(norm_w[s], raw_w[s] * (1.0 / sum));
+        }
     }
 
     #[test]

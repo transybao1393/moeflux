@@ -432,6 +432,16 @@ fn cpu_combine(
         crate::riir::backend::cpu::cpu_ops::cpu_vec_madd(&mut moe_out, expert_k, expert_weights[k]);
     }
 
+    // No shared expert (OLMoE): `shared_out` is never written for
+    // these variants, so it takes no part in the sum — matches the
+    // GPU `moe_combine_residual_flat_noshared` kernel.
+    if !VARIANT.has_shared_expert() {
+        for i in 0..dim {
+            hidden_out[i] = h_mid[i] + moe_out[i];
+        }
+        return;
+    }
+
     // Apply sigmoid gate to shared expert output (in place into a
     // local `gated_shared` so we don't mutate the caller's
     // snapshot). Mirrors `infer.m:4117..4124`.

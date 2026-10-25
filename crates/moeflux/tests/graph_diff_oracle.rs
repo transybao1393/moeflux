@@ -399,16 +399,18 @@ fn graph_metal_matches_cpu_rope_n_tokens() {
 #[ignore = "long-running GPU test"]
 fn graph_metal_matches_cpu_sdpa_causal_tiled() {
     // Two GQA fan-outs: heads_per_kv=2 selects the folded gqa2 kernel,
-    // heads_per_kv=1 the unfolded one. head_dim is pinned at 256
-    // (`SdpaCall::encode` asserts it).
-    check_sdpa_causal_tiled(2);
-    check_sdpa_causal_tiled(1);
+    // heads_per_kv=1 the unfolded one. head_dim 256 has every kernel
+    // slot; 128 (OLMoE) only the unfolded vA instance, which the
+    // backend picks for any heads_per_kv at that head_dim.
+    check_sdpa_causal_tiled(2, 256);
+    check_sdpa_causal_tiled(1, 256);
+    check_sdpa_causal_tiled(1, 128);
+    check_sdpa_causal_tiled(2, 128);
 }
 
-fn check_sdpa_causal_tiled(heads_per_kv: u32) {
+fn check_sdpa_causal_tiled(heads_per_kv: u32, head_dim: u32) {
     let n_tokens: u32 = 8;
     let num_heads: u32 = 16;
-    let head_dim: u32 = 256;
     let num_kv_heads = num_heads / heads_per_kv;
     let kv_dim = num_kv_heads * head_dim;
     let q_dim = num_heads * head_dim;
@@ -416,7 +418,7 @@ fn check_sdpa_causal_tiled(heads_per_kv: u32) {
     let kv_total = (n_tokens * kv_dim) as usize;
     let softmax_scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    let mut rng = Rng::new(0x5D9A_0000 + heads_per_kv as u64);
+    let mut rng = Rng::new(0x5D9A_0000 + heads_per_kv as u64 + (head_dim % 256) as u64);
     let q_data: Vec<f32> = (0..q_total).map(|_| rng.next_f32_unit()).collect();
     let k_data: Vec<f32> = (0..kv_total).map(|_| rng.next_f32_unit()).collect();
     let v_data: Vec<f32> = (0..kv_total).map(|_| rng.next_f32_unit()).collect();
@@ -1370,6 +1372,88 @@ fn graph_metal_matches_cpu_moe_combine() {
         COSINE_FLOOR,
         max_abs
     );
+}
+
+// ============================================================================
+// Test: MoeCombineResidualNoSharedNTokens through both backends
+// ============================================================================
+//
+// hidden_out[t,i] = h_mid[t,i] + moe_sum[t,i] — the combine for
+// variants without a shared expert (OLMoE). Weight-free; the CPU arm
+// is exact, so the GPU must match it bit for bit.
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_moe_combine_noshared() {
+    let n_tokens: u32 = 8;
+    let dim: u32 = 64;
+    let total = (n_tokens * dim) as usize;
+    let mut rng = Rng::new(0x0E0E_C0FFEE);
+    let h_mid_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+    let moe_sum_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    let build_graph = |h_mid, moe_sum, hidden_out| {
+        let mut g = Graph::new();
+        g.push(Op::MoeCombineResidualNoSharedNTokens {
+            label: "test_combine_noshared",
+            h_mid,
+            moe_sum,
+            hidden_out,
+            n_tokens,
+            dim,
+        });
+        g
+    };
+
+    // CPU path
+    let mut cpu_wf = dummy_weight_file("moe_combine_noshared_cpu");
+    let mut cpu = CpuBackend::new(cpu_wf.take());
+    let cpu_h_mid = cpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
+    let cpu_moe_sum = cpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
+    let cpu_out = cpu
+        .pool_mut()
+        .alloc(total * 4, "hidden_out", false)
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_h_mid, bytes_of_f32(&h_mid_data))
+        .unwrap();
+    cpu.pool_mut()
+        .upload(cpu_moe_sum, bytes_of_f32(&moe_sum_data))
+        .unwrap();
+    cpu.execute(&build_graph(cpu_h_mid, cpu_moe_sum, cpu_out), "diff_oracle")
+        .unwrap();
+    let mut cpu_out_bytes = vec![0u8; total * 4];
+    cpu.pool().download(cpu_out, &mut cpu_out_bytes).unwrap();
+    let cpu_out_f32 = f32_of_bytes(&cpu_out_bytes);
+
+    // GPU path
+    let mut gpu_wf = dummy_weight_file("moe_combine_noshared_gpu");
+    let metal_ctx = MetalContext::new().expect("MetalContext::new");
+    let wf_buf = MtlWeightBuf::wrap(gpu_wf.wf.as_ref().unwrap(), metal_ctx.device());
+    let _ = gpu_wf.take();
+    let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+    let gpu_h_mid = gpu.pool_mut().alloc(total * 4, "h_mid", false).unwrap();
+    let gpu_moe_sum = gpu.pool_mut().alloc(total * 4, "moe_sum", false).unwrap();
+    let gpu_out = gpu
+        .pool_mut()
+        .alloc(total * 4, "hidden_out", false)
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_h_mid, bytes_of_f32(&h_mid_data))
+        .unwrap();
+    gpu.pool_mut()
+        .upload(gpu_moe_sum, bytes_of_f32(&moe_sum_data))
+        .unwrap();
+    gpu.execute(&build_graph(gpu_h_mid, gpu_moe_sum, gpu_out), "diff_oracle")
+        .unwrap();
+    let mut gpu_out_bytes = vec![0u8; total * 4];
+    gpu.pool().download(gpu_out, &mut gpu_out_bytes).unwrap();
+    let gpu_out_f32 = f32_of_bytes(&gpu_out_bytes);
+
+    for (i, (c, g)) in cpu_out_f32.iter().zip(gpu_out_f32.iter()).enumerate() {
+        assert_eq!(c.to_bits(), g.to_bits(), "elem {i}: cpu={c} gpu={g}");
+        assert_eq!(*c, h_mid_data[i] + moe_sum_data[i]);
+    }
 }
 
 // ============================================================================

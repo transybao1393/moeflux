@@ -102,10 +102,30 @@ pub enum RouterKind {
 ///
 /// `Unscaled` is the DeepSeek-V3 path: shared-expert output is added
 /// to the routed-experts sum unconditionally, no gate.
+///
+/// `None` is the OLMoE path: no shared expert at all. Its weights are
+/// not loaded, the shared FFN is never dispatched, and the combine is
+/// `h_mid + Σ_k weights[k] * expert_out[k]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedExpertGate {
     SigmoidGate,
     Unscaled,
+    None,
+}
+
+/// Shape of the GQA Q/K RMS norm.
+///
+/// `PerHead` is the qwen3 path: `q_norm` / `k_norm` are `[head_dim]`
+/// weights applied to each head independently, after the projection
+/// is split into heads.
+///
+/// `Full` is the OLMoE path: `q_norm` / `k_norm` are `[num_heads *
+/// head_dim]` weights applied over the whole projection output (one
+/// RMS per token per projection), before the split into heads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QkNorm {
+    PerHead,
+    Full,
 }
 
 /// All shape parameters for one model variant. `usize` everywhere
@@ -151,6 +171,23 @@ pub struct Variant {
     pub rope_kind: RopeKind,
     pub router_kind: RouterKind,
     pub shared_expert_gate: SharedExpertGate,
+
+    // --- GQA attention / routing details ---
+    /// qwen3_5_moe attention output gate: `q_proj` emits `2 * q_dim`
+    /// channels (per head `[q | gate]`) and the attention output is
+    /// multiplied by `sigmoid(gate)` before `o_proj`. `false` → `q_proj`
+    /// emits `q_dim` channels and the output goes to `o_proj` as is.
+    pub attn_output_gate: bool,
+    /// Q/K RMS-norm shape (GQA only).
+    pub qk_norm: QkNorm,
+    /// Channels per head the GQA RoPE rotates — `head_dim / 4` for the
+    /// qwen3_5_moe partial rotary, `head_dim` for full rotary. Unused
+    /// for MLA (see [`Variant::rotary_dim`]).
+    pub gqa_rotary_dim: usize,
+    /// Softmax router: renormalize the top-K probabilities to sum to 1
+    /// (`true`), or use the raw softmax probabilities of the chosen
+    /// experts (`false`, OLMoE's `norm_topk_prob = false`).
+    pub norm_topk_prob: bool,
 
     // --- MLA dimensions (zero for Gqa) ---
     /// Q-side LoRA bottleneck. Cogito-V2: 1536. (q_a_proj down,
@@ -232,14 +269,32 @@ impl Variant {
     }
 
     /// Number of channels the RoPE rotation acts on per Q/K head.
-    /// For GQA variants this is `head_dim / 4` (qwen3_5_moe partial
-    /// rotary). For MLA variants it's `qk_rope_head_dim` directly —
+    /// For GQA variants this is [`Variant::gqa_rotary_dim`]
+    /// (`head_dim / 4` for the qwen3_5_moe partial rotary, `head_dim`
+    /// for OLMoE). For MLA variants it's `qk_rope_head_dim` directly —
     /// RoPE is applied only to the rope half of the split Q/K.
     pub const fn rotary_dim(&self) -> usize {
         match self.attn_kind {
-            AttnKind::Gqa => self.head_dim / 4,
+            AttnKind::Gqa => self.gqa_rotary_dim,
             AttnKind::Mla => self.qk_rope_head_dim,
         }
+    }
+
+    /// Output channels of the GQA `q_proj`: `q_dim`, doubled when the
+    /// projection also carries the per-head output gate.
+    pub const fn q_proj_dim(&self) -> usize {
+        let q_dim = self.num_attn_heads * self.head_dim;
+        if self.attn_output_gate { 2 * q_dim } else { q_dim }
+    }
+
+    /// Whether MoE layers carry a shared expert (FFN + combine term).
+    pub const fn has_shared_expert(&self) -> bool {
+        !matches!(self.shared_expert_gate, SharedExpertGate::None)
+    }
+
+    /// Whether any layer is a linear-attention layer.
+    pub const fn has_linear_attn(&self) -> bool {
+        self.full_attn_interval > 1
     }
 
     /// Per-layer attn dispatch. The qwen3_5_moe family alternates
@@ -345,8 +400,13 @@ impl Variant {
 
 // --- Architecture-wide constants ---------------------------------
 
-/// RMS-norm epsilon. Same value llama.cpp + most modern decoders use.
+/// RMS-norm epsilon, for every norm (input / post-attention / final,
+/// Q/K, MLA latents). Per-variant: the Qwen3 and DeepSeek-V3 families
+/// use 1e-6; OLMoE uses 1e-5.
+#[cfg(not(feature = "model-olmoe-1b-7b"))]
 pub const RMS_NORM_EPS: f32 = 1e-6;
+#[cfg(feature = "model-olmoe-1b-7b")]
+pub const RMS_NORM_EPS: f32 = 1e-5;
 /// Quantization group size — 64 weights share one BF16 scale.
 pub const GROUP_SIZE: usize = 64;
 /// 4-bit weight quantization (fixed for the qwen3_5_moe and
@@ -355,10 +415,10 @@ pub const BITS: usize = 4;
 
 /// RoPE base frequency. Per-variant: Qwen3 family uses 1e7 (much
 /// higher than the 1e4 default); DeepSeek-V3 / Cogito-V2 uses 1e4
-/// (the YaRN scaling layers on top of this base).
+/// (the YaRN scaling layers on top of this base); OLMoE uses 1e4.
 #[cfg(any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b"))]
 pub const ROPE_THETA: f32 = 10_000_000.0;
-#[cfg(feature = "model-cogito-v2-671b")]
+#[cfg(any(feature = "model-cogito-v2-671b", feature = "model-olmoe-1b-7b"))]
 pub const ROPE_THETA: f32 = 10_000.0;
 
 // --- KV cache / runtime limits -----------------------------------
@@ -432,6 +492,10 @@ pub const VARIANT: Variant = Variant {
     rope_kind: RopeKind::Vanilla,
     router_kind: RouterKind::Softmax,
     shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
     q_lora_rank: 0,
     kv_lora_rank: 0,
     qk_nope_head_dim: 0,
@@ -474,6 +538,10 @@ pub const VARIANT: Variant = Variant {
     rope_kind: RopeKind::Vanilla,
     router_kind: RouterKind::Softmax,
     shared_expert_gate: SharedExpertGate::SigmoidGate,
+    attn_output_gate: true,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 64, // head_dim / 4 (partial_rotary_factor 0.25)
+    norm_topk_prob: true,
     q_lora_rank: 0,
     kv_lora_rank: 0,
     qk_nope_head_dim: 0,
@@ -535,6 +603,12 @@ pub const VARIANT: Variant = Variant {
     rope_kind: RopeKind::Yarn,
     router_kind: RouterKind::NoauxTc,
     shared_expert_gate: SharedExpertGate::Unscaled,
+    // GQA-only selectors — unused on the MLA path.
+    attn_output_gate: false,
+    qk_norm: QkNorm::PerHead,
+    gqa_rotary_dim: 0,
+    // noaux_tc always renormalizes (then scales).
+    norm_topk_prob: true,
     q_lora_rank: 1536,
     kv_lora_rank: 512,
     qk_nope_head_dim: 128,
@@ -553,15 +627,72 @@ pub const VARIANT: Variant = Variant {
     yarn_mscale_all_dim: 1.0,
 };
 
+/// OLMoE-1B-7B-0125-Instruct (`model_type: olmoe`), MLX 4-bit.
+/// Source: `allenai/OLMoE-1B-7B-0125-Instruct/config.json` +
+/// mlx-lm `olmoe.py`.
+///
+/// Every layer is plain MHA full attention (no linear-attn, no
+/// attention output gate) with Q/K RMS norms over the whole
+/// 2048-wide projection and full-head-dim RoPE. Every layer is MoE:
+/// softmax router over 64 experts, top-8 *without* renormalization
+/// (`norm_topk_prob = false`), no shared expert.
+#[cfg(feature = "model-olmoe-1b-7b")]
+pub const VARIANT: Variant = Variant {
+    name: "OLMoE-1B-7B-0125-Instruct-4bit",
+    hidden_dim: 2048,
+    num_layers: 16,
+    num_attn_heads: 16,
+    num_kv_heads: 16,
+    head_dim: 128,
+    vocab_size: 50304,
+    num_experts: 64,
+    num_experts_per_tok: 8,
+    moe_intermediate: 1024,
+    shared_intermediate: 0,
+    full_attn_interval: 1,
+    linear_num_v_heads: 0,
+    linear_num_k_heads: 0,
+    // eos = `<|endoftext|>` (50279); pad = 1. No think tokens.
+    eos_token_1: 50279,
+    eos_token_2: 50279,
+    think_start_token: -1,
+    think_end_token: -1,
+    attn_kind: AttnKind::Gqa,
+    rope_kind: RopeKind::Vanilla,
+    router_kind: RouterKind::Softmax,
+    shared_expert_gate: SharedExpertGate::None,
+    attn_output_gate: false,
+    qk_norm: QkNorm::Full,
+    gqa_rotary_dim: 128,
+    norm_topk_prob: false,
+    q_lora_rank: 0,
+    kv_lora_rank: 0,
+    qk_nope_head_dim: 0,
+    qk_rope_head_dim: 0,
+    v_head_dim: 0,
+    n_group: 0,
+    topk_group: 0,
+    routed_scaling_factor: 1.0,
+    first_k_dense_replace: 0,
+    dense_intermediate: 0,
+    yarn_factor: 1.0,
+    yarn_original_max_pos: 0,
+    yarn_beta_fast: 0.0,
+    yarn_beta_slow: 0.0,
+    yarn_mscale: 1.0,
+    yarn_mscale_all_dim: 1.0,
+};
+
 #[cfg(not(any(
     feature = "model-qwen3-5-a17b",
     feature = "model-qwen3-6-35b-a3b",
     feature = "model-cogito-v2-671b",
+    feature = "model-olmoe-1b-7b",
 )))]
 compile_error!(
     "moeflux: enable exactly one model variant feature \
-     (`model-qwen3-5-a17b`, `model-qwen3-6-35b-a3b`, or \
-     `model-cogito-v2-671b`)."
+     (`model-qwen3-5-a17b`, `model-qwen3-6-35b-a3b`, \
+     `model-cogito-v2-671b`, or `model-olmoe-1b-7b`)."
 );
 
 // --- Static sanity checks ----------------------------------------
@@ -592,7 +723,35 @@ const _: () = {
             (VARIANT.num_attn_heads * VARIANT.head_dim) % VARIANT.hidden_dim == 0,
             "num_attn_heads * head_dim must be a multiple of hidden_dim"
         );
+        assert!(
+            VARIANT.gqa_rotary_dim > 0
+                && VARIANT.gqa_rotary_dim % 2 == 0
+                && VARIANT.gqa_rotary_dim <= VARIANT.head_dim,
+            "gqa_rotary_dim must be even and in (0, head_dim]"
+        );
+        // The batched graph splits the gated q_proj per head (qwen3)
+        // or norms the ungated projection whole (OLMoE); the other
+        // two pairings have no graph lowering.
+        assert!(
+            VARIANT.attn_output_gate == matches!(VARIANT.qk_norm, QkNorm::PerHead),
+            "GQA needs attn_output_gate with QkNorm::PerHead, or neither with QkNorm::Full"
+        );
     }
+
+    // A variant without linear-attn layers must not carry linear-attn
+    // dims (they size buffers nobody reads); one with them needs both.
+    if VARIANT.has_linear_attn() {
+        assert!(
+            VARIANT.linear_num_k_heads > 0 && VARIANT.linear_num_v_heads > 0,
+            "linear-attn layers need linear_num_k_heads and linear_num_v_heads > 0"
+        );
+    }
+
+    // A shared expert needs a width; no shared expert means none.
+    assert!(
+        VARIANT.has_shared_expert() == (VARIANT.shared_intermediate > 0),
+        "shared_intermediate must be > 0 exactly when a shared expert exists"
+    );
 
     // MLA-only: latent dims must align with the MLX group_size for
     // 4-bit packing of the latent-down and latent-up projections.
@@ -660,8 +819,67 @@ mod tests {
         // GQA: heads must group cleanly.
         if matches!(v.attn_kind, AttnKind::Gqa) {
             assert_eq!(v.num_attn_heads % v.num_kv_heads, 0);
+        }
+        if v.has_linear_attn() {
             assert!(v.linear_conv_dim() > 0);
         }
+    }
+
+    /// The qwen3_5_moe attention shape: gated q_proj, per-head Q/K
+    /// norms, quarter-head RoPE, renormalized top-K, gated shared
+    /// expert.
+    #[cfg(any(feature = "model-qwen3-5-a17b", feature = "model-qwen3-6-35b-a3b"))]
+    #[test]
+    fn qwen_attention_and_routing_flags() {
+        let v = VARIANT;
+        assert!(v.attn_output_gate);
+        assert_eq!(v.q_proj_dim(), 2 * v.num_attn_heads * v.head_dim);
+        assert_eq!(v.qk_norm, QkNorm::PerHead);
+        assert_eq!(v.rotary_dim(), v.head_dim / 4);
+        assert!(v.norm_topk_prob);
+        assert!(v.has_shared_expert());
+        assert!(v.has_linear_attn());
+        assert_eq!(RMS_NORM_EPS, 1e-6);
+    }
+
+    /// OLMoE-1B-7B constants against its `config.json`, and the
+    /// derived 4-bit expert layout the converter packs to.
+    #[cfg(feature = "model-olmoe-1b-7b")]
+    #[test]
+    fn olmoe_constants_and_expert_layout() {
+        let v = VARIANT;
+        assert_eq!(
+            (v.hidden_dim, v.num_layers, v.num_attn_heads, v.num_kv_heads, v.head_dim),
+            (2048, 16, 16, 16, 128)
+        );
+        assert_eq!((v.vocab_size, v.num_experts, v.num_experts_per_tok), (50304, 64, 8));
+        assert_eq!(v.moe_intermediate, 1024);
+        assert_eq!(v.eos_token_1, 50279);
+        assert_eq!((v.think_start_token, v.think_end_token), (-1, -1));
+        // MHA, no output gate, full-projection Q/K norm, full RoPE.
+        assert!(!v.attn_output_gate);
+        assert_eq!(v.q_proj_dim(), 2048);
+        assert_eq!(v.qk_norm, QkNorm::Full);
+        assert_eq!(v.rotary_dim(), 128);
+        // Every layer full attention + MoE; no linear attn, no shared.
+        assert!(!v.has_linear_attn());
+        assert!((0..v.num_layers).all(|i| v.layer_kind(i) == LayerKind::FullAttn));
+        assert!((0..v.num_layers).all(|i| v.mlp_kind_at(i) == MlpKind::MoE));
+        assert!(!v.has_shared_expert());
+        assert!(!v.norm_topk_prob);
+        assert_eq!(v.router_kind, RouterKind::Softmax);
+        assert_eq!(RMS_NORM_EPS, 1e-5);
+        assert_eq!(ROPE_THETA, 10_000.0);
+        // Per expert [gate | up | down], each U32 weights + BF16
+        // scales + BF16 biases: gate/up [1024, 2048], down [2048, 1024].
+        assert_eq!(v.expert_weight_bytes_4bit(), 1024 * 2048 / 2);
+        assert_eq!(v.expert_scale_bytes(), 1024 * (2048 / 64) * 2);
+        // down's scales are [2048, 1024/64] bf16 — the same byte count.
+        assert_eq!(v.expert_scale_bytes(), 2048 * (1024 / 64) * 2);
+        assert_eq!(v.expert_size_4bit(), 3_538_944);
+        assert_eq!(v.down_w_off_4bit(), 2 * 1_179_648);
+        assert_eq!(v.down_s_off_4bit(), 2 * 1_179_648 + 1_048_576);
+        assert_eq!(v.down_b_off_4bit(), 2 * 1_179_648 + 1_048_576 + 65_536);
     }
 
     /// `layer_kind(i)` must agree with the legacy modulo predicate for

@@ -677,6 +677,23 @@ fn moe_combine_residual_n_tokens_cpu(
     }
 }
 
+/// No-shared-expert sibling of [`moe_combine_residual_n_tokens_cpu`]:
+/// `hidden_out = h_mid + moe_sum`.
+fn moe_combine_residual_noshared_n_tokens_cpu(
+    h_mid: &[f32],
+    moe_sum: &[f32],
+    hidden_out: &mut [f32],
+    n_tokens: usize,
+    dim: usize,
+) {
+    debug_assert_eq!(h_mid.len(), n_tokens * dim);
+    debug_assert_eq!(moe_sum.len(), n_tokens * dim);
+    debug_assert_eq!(hidden_out.len(), n_tokens * dim);
+    for idx in 0..n_tokens * dim {
+        hidden_out[idx] = h_mid[idx] + moe_sum[idx];
+    }
+}
+
 fn sdpa_causal_tiled_n_tokens_cpu(
     q: &[f32],
     k: &[f32],
@@ -1122,6 +1139,25 @@ impl Backend for CpuBackend {
                     *dim as usize,
                 );
             }
+            Op::MoeCombineResidualNoSharedNTokens {
+                h_mid,
+                moe_sum,
+                hidden_out,
+                n_tokens,
+                dim,
+                ..
+            } => {
+                let h_mid_buf = self.read_f32(*h_mid);
+                let moe_sum_buf = self.read_f32(*moe_sum);
+                let mut hidden_out_buf = self.write_f32(*hidden_out);
+                moe_combine_residual_noshared_n_tokens_cpu(
+                    &h_mid_buf,
+                    &moe_sum_buf,
+                    &mut hidden_out_buf,
+                    *n_tokens as usize,
+                    *dim as usize,
+                );
+            }
             Op::Conv1dStepNTokens {
                 qkv_in,
                 conv_state,
@@ -1466,6 +1502,15 @@ mod tests {
         let id1: BufId<HiddenBuf> = BufId::from_raw(1);
         assert_eq!(p.label(id0), "kv_a");
         assert_eq!(p.label(id1), "kv_b");
+    }
+
+    #[test]
+    fn noshared_combine_is_residual_plus_moe_sum() {
+        let h_mid = [1.0f32, -2.0, 0.5, 4.0, 0.0, -1.5];
+        let moe_sum = [0.25f32, 2.0, -0.5, 1.0, 3.0, 0.5];
+        let mut out = [f32::NAN; 6];
+        moe_combine_residual_noshared_n_tokens_cpu(&h_mid, &moe_sum, &mut out, 2, 3);
+        assert_eq!(out, [1.25, 0.0, 0.0, 5.0, 3.0, -1.0]);
     }
 
     #[test]

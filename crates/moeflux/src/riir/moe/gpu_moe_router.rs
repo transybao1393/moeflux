@@ -39,8 +39,8 @@ pipeline_bundle! {
     }
 }
 
-/// Encode the full GPU router pipeline (softmax + top-K + normalize) into
-/// `cmdbuf`. No commit_and_wait — the caller controls the cmdbuf boundary.
+/// Encode the full GPU router pipeline (softmax + top-K + normalize, the
+/// last per the variant's `norm_topk_prob`) into `cmdbuf`. No commit_and_wait — the caller controls the cmdbuf boundary.
 ///
 /// `logits` is the gate-matvec output stacked across `n_tokens` rows of
 /// `n_experts` f32 each (row-major). `indices_out` and `weights_out` are
@@ -82,7 +82,9 @@ pub fn encode_moe_router(
     }
 
     // Stage 2: per-token weight normalize (divide-by-sum, guarded).
-    {
+    // Skipped for `norm_topk_prob = false` variants (OLMoE), matching
+    // `moe_router_cpu`.
+    if crate::riir::variants::VARIANT.norm_topk_prob {
         let enc = cmdbuf.new_compute_command_encoder();
         enc.set_compute_pipeline_state(&pipes.normalize);
         enc.set_buffer(0, Some(weights_out), 0);

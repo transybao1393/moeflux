@@ -17,6 +17,7 @@ default = []
 model-qwen3-5-a17b      = ["moeflux/model-qwen3-5-a17b"]
 model-qwen3-6-35b-a3b   = ["moeflux/model-qwen3-6-35b-a3b"]
 model-cogito-v2-671b    = ["moeflux/model-cogito-v2-671b"]
+model-olmoe-1b-7b       = ["moeflux/model-olmoe-1b-7b"]
 
 [dependencies]
 moeflux     = { path = "../moeflux" }

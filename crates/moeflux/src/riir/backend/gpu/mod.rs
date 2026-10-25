@@ -174,11 +174,16 @@ impl MetalBufferPool {
     /// below eagerly touches every page: a null buffer would SIGSEGV
     /// here (the cause of the parallel-test crash — many model contexts
     /// over-committing RAM) instead of surfacing a recoverable error.
+    ///
+    /// A zero-byte request (a role the variant doesn't use, e.g. the
+    /// linear-attn scratch on a model without linear-attn layers) gets
+    /// a 1-byte buffer: Metal returns nil for `newBufferWithLength:0`.
     fn new_shared_zeroed(&self, bytes: usize, label: &'static str) -> Result<Buffer, GraphError> {
+        let bytes = bytes.max(1);
         let buf = self
             .device
             .new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
-        if bytes > 0 && buf.contents().is_null() {
+        if buf.contents().is_null() {
             return Err(GraphError::AllocFailed { label, bytes });
         }
         // Zero on alloc so encoders that assume a clean slot don't
@@ -470,6 +475,7 @@ pub struct MetalBackend {
     rms_norm_per_head_pso: ComputePipelineState,
     kv_cache_append_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
+    moe_combine_residual_noshared_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
     embed_gather_4bit_pso: ComputePipelineState,
     /// When set (env `MOEFLUX_PROFILE_PER_OP`), [`Backend::execute`]
@@ -523,6 +529,9 @@ impl MetalBackend {
         let rms_norm_per_head_pso = metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
         let kv_cache_append_pso = metal.pipeline("kv_cache_append_n_tokens")?.clone();
         let moe_combine_residual_n_pso = metal.pipeline("moe_combine_residual_n_tokens")?.clone();
+        let moe_combine_residual_noshared_n_pso = metal
+            .pipeline("moe_combine_residual_n_tokens_noshared")?
+            .clone();
         let moe_bucket_accumulate_pso = metal.pipeline("moe_bucket_accumulate")?.clone();
         let embed_gather_4bit_pso = metal.pipeline("embed_gather_4bit")?.clone();
 
@@ -546,6 +555,7 @@ impl MetalBackend {
             rms_norm_per_head_pso,
             kv_cache_append_pso,
             moe_combine_residual_n_pso,
+            moe_combine_residual_noshared_n_pso,
             moe_bucket_accumulate_pso,
             embed_gather_4bit_pso,
             profile_per_op: std::env::var_os("MOEFLUX_PROFILE_PER_OP").is_some(),
@@ -974,6 +984,24 @@ impl Backend for MetalBackend {
                     *dim,
                 );
             }
+            Op::MoeCombineResidualNoSharedNTokens {
+                h_mid,
+                moe_sum,
+                hidden_out,
+                n_tokens,
+                dim,
+                ..
+            } => {
+                crate::riir::moe::expert_forward::encode_moe_combine_residual_noshared_n_tokens(
+                    cmd,
+                    &self.moe_combine_residual_noshared_n_pso,
+                    self.pool.handle(*h_mid),
+                    self.pool.handle(*moe_sum),
+                    self.pool.handle(*hidden_out),
+                    *n_tokens,
+                    *dim,
+                );
+            }
             Op::EmbedGatherNTokens {
                 token_ids,
                 weight,
@@ -1049,7 +1077,8 @@ impl Backend for MetalBackend {
                 let vb = crate::riir::attn::linear_attn_forward::sdpa_vb_enabled();
                 let gqa = crate::riir::attn::linear_attn_forward::sdpa_gqa_enabled();
                 // GQA fold=2 for even heads_per_kv, gated by MOEFLUX_SDPA_GQA.
-                let fold = if gqa && *heads_per_kv % 2 == 0 { 2 } else { 1 };
+                // Only head_dim 256 has folded instances.
+                let fold = if gqa && *heads_per_kv % 2 == 0 && *head_dim == 256 { 2 } else { 1 };
                 self.metal.kernels().encode(
                     cmd,
                     &SdpaCall {

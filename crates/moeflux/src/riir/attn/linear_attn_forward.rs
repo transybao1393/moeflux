@@ -302,7 +302,9 @@ impl LinearAttnGraphScratch {
     /// pins them).
     pub fn new(pool: &mut MetalBufferPool) -> Self {
         let v = VARIANT;
-        let chunk = crate::riir::BATCHED_CHUNK_SIZE;
+        // All-full-attention variants (OLMoE) never run graph1 here;
+        // keep the slots but don't pay for chunk-wide transients.
+        let chunk = if v.has_linear_attn() { crate::riir::BATCHED_CHUNK_SIZE } else { 0 };
         let f32_sz = std::mem::size_of::<f32>();
         let hidden = v.hidden_dim;
         let conv = v.linear_conv_dim();
@@ -525,8 +527,11 @@ impl MoeGraphScratch {
         let shared_act: BufId<SharedFfnActBuf> = pool
             .alloc(chk(shared_inter), "mgs.shared_act", false)
             .expect("MoeGraphScratch::new pool alloc");
+        // No shared expert (OLMoE): graph2 never touches the shared
+        // FFN, so its `[chunk, hidden]` output slot stays empty too.
+        let shared_down_elems = if v.has_shared_expert() { hidden } else { 0 };
         let shared_down: BufId<SharedFfnDownBuf> = pool
-            .alloc(chk(hidden), "mgs.shared_down", false)
+            .alloc(chk(shared_down_elems), "mgs.shared_down", false)
             .expect("MoeGraphScratch::new pool alloc");
         let bucket_gate: BufId<BucketGateBuf> = pool
             .alloc(chk(k_active * moe_inter), "mgs.bucket_gate", false)
@@ -654,7 +659,7 @@ impl LayerForwardBuffers {
         let v = VARIANT;
         let f32_bytes = |n: usize| n * std::mem::size_of::<f32>();
         let q_dim_full = v.num_attn_heads * v.head_dim;
-        let q_proj_dim_full = q_dim_full * 2;
+        let q_proj_dim_full = v.q_proj_dim();
         let kv_dim_full = v.num_kv_heads * v.head_dim;
         // The former `batch_out[6]` "o_proj input" slot has to fit
         // either the linear-attn (`linear_total_value`) or full-attn
@@ -1506,18 +1511,9 @@ pub(in crate::riir) fn post_attention_pre_moe(
     let gate_w = layer_cache.gate.w;
     let gate_s = layer_cache.gate.s;
     let gate_b = layer_cache.gate.b;
-    let shared_up_w = layer_cache.shared.up_w;
-    let shared_up_s = layer_cache.shared.up_s;
-    let shared_up_b = layer_cache.shared.up_b;
-    let shared_gate_w = layer_cache.shared.gate_w;
-    let shared_gate_s = layer_cache.shared.gate_s;
-    let shared_gate_b = layer_cache.shared.gate_b;
-    let shared_down_w = layer_cache.shared.down_w;
-    let shared_down_s = layer_cache.shared.down_s;
-    let shared_down_b = layer_cache.shared.down_b;
-    let seg_w = layer_cache.shared.seg_w;
-    let seg_s = layer_cache.shared.seg_s;
-    let seg_b = layer_cache.shared.seg_b;
+    // `None` → no shared expert (OLMoE): the shared-gate scalar and
+    // shared FFN are skipped and the combine adds no shared term.
+    let shared = layer_cache.shared.as_ref();
 
     let mv = MatvecPipelines::fetch(metal)?;
     let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
@@ -1612,13 +1608,15 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 seq_stride,
                 heads_per_kv,
             );
-            encode_sigmoid_gate_into(
-                cmdbuf,
-                &attn_pipes.gate,
-                buffer_pool.handle(buffers.gpu_attn_out),
-                buffer_pool.handle(buffers.gpu_attn_gate),
-                num_heads * head_dim,
-            );
+            if VARIANT.attn_output_gate {
+                encode_sigmoid_gate_into(
+                    cmdbuf,
+                    &attn_pipes.gate,
+                    buffer_pool.handle(buffers.gpu_attn_out),
+                    buffer_pool.handle(buffers.gpu_attn_gate),
+                    num_heads * head_dim,
+                );
+            }
         }
 
         // o_proj + residual_add + post-attn rms_norm (was CMD2).
@@ -1681,78 +1679,80 @@ pub(in crate::riir) fn post_attention_pre_moe(
                 bits: gate_bits,
             },
         );
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: seg_w,
-                s_off: seg_s,
-                b_off: seg_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.shared_gate),
-                out_dim: 1,
-                in_dim: v.hidden_dim as u32,
-                bits: seg_bits,
-            },
-        );
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: shared_gate_w,
-                s_off: shared_gate_s,
-                b_off: shared_gate_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.shared_gate_out),
-                out_dim: v.shared_intermediate as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: s_gate_bits,
-            },
-        );
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: shared_up_w,
-                s_off: shared_up_s,
-                b_off: shared_up_b,
-                input: buffer_pool.handle(buffers.normed),
-                output: buffer_pool.handle(buffers.shared_up_out),
-                out_dim: v.shared_intermediate as u32,
-                in_dim: v.hidden_dim as u32,
-                bits: s_up_bits,
-            },
-        );
+        if let Some(sh) = shared {
+            encode_matvec(
+                cmdbuf,
+                &mv,
+                wf_buf,
+                &MatvecSpec {
+                    w_off: sh.seg_w,
+                    s_off: sh.seg_s,
+                    b_off: sh.seg_b,
+                    input: buffer_pool.handle(buffers.normed),
+                    output: buffer_pool.handle(buffers.shared_gate),
+                    out_dim: 1,
+                    in_dim: v.hidden_dim as u32,
+                    bits: seg_bits,
+                },
+            );
+            encode_matvec(
+                cmdbuf,
+                &mv,
+                wf_buf,
+                &MatvecSpec {
+                    w_off: sh.gate_w,
+                    s_off: sh.gate_s,
+                    b_off: sh.gate_b,
+                    input: buffer_pool.handle(buffers.normed),
+                    output: buffer_pool.handle(buffers.shared_gate_out),
+                    out_dim: v.shared_intermediate as u32,
+                    in_dim: v.hidden_dim as u32,
+                    bits: s_gate_bits,
+                },
+            );
+            encode_matvec(
+                cmdbuf,
+                &mv,
+                wf_buf,
+                &MatvecSpec {
+                    w_off: sh.up_w,
+                    s_off: sh.up_s,
+                    b_off: sh.up_b,
+                    input: buffer_pool.handle(buffers.normed),
+                    output: buffer_pool.handle(buffers.shared_up_out),
+                    out_dim: v.shared_intermediate as u32,
+                    in_dim: v.hidden_dim as u32,
+                    bits: s_up_bits,
+                },
+            );
 
-        // GPU swiglu — was the CPU loop between CMD3a and CMD3a-b.
-        encode_swiglu_buf(
-            cmdbuf,
-            &swiglu,
-            buffer_pool.handle(buffers.shared_gate_out),
-            buffer_pool.handle(buffers.shared_up_out),
-            buffer_pool.handle(buffers.shared_act),
-            v.shared_intermediate as u32,
-        );
+            // GPU swiglu — was the CPU loop between CMD3a and CMD3a-b.
+            encode_swiglu_buf(
+                cmdbuf,
+                &swiglu,
+                buffer_pool.handle(buffers.shared_gate_out),
+                buffer_pool.handle(buffers.shared_up_out),
+                buffer_pool.handle(buffers.shared_act),
+                v.shared_intermediate as u32,
+            );
 
-        // shared_down matvec (was CMD3a-b).
-        encode_matvec(
-            cmdbuf,
-            &mv,
-            wf_buf,
-            &MatvecSpec {
-                w_off: shared_down_w,
-                s_off: shared_down_s,
-                b_off: shared_down_b,
-                input: buffer_pool.handle(buffers.shared_act),
-                output: buffer_pool.handle(buffers.shared_out),
-                out_dim: v.hidden_dim as u32,
-                in_dim: v.shared_intermediate as u32,
-                bits: s_down_bits,
-            },
-        );
+            // shared_down matvec (was CMD3a-b).
+            encode_matvec(
+                cmdbuf,
+                &mv,
+                wf_buf,
+                &MatvecSpec {
+                    w_off: sh.down_w,
+                    s_off: sh.down_s,
+                    b_off: sh.down_b,
+                    input: buffer_pool.handle(buffers.shared_act),
+                    output: buffer_pool.handle(buffers.shared_out),
+                    out_dim: v.hidden_dim as u32,
+                    in_dim: v.shared_intermediate as u32,
+                    bits: s_down_bits,
+                },
+            );
+        }
 
         metal.commit_and_wait_labeled_with(cmdbuf, "post_attn_tail.cmd2_3", || {
             if let Some(f) = before_wait {
@@ -1772,10 +1772,13 @@ pub(in crate::riir) fn post_attention_pre_moe(
         &mut routing_weights,
     )?;
 
-    // Read shared-gate score scalar (pre-sigmoid).
-    let shared_gate_score = {
+    // Read shared-gate score scalar (pre-sigmoid). Unused (0) without
+    // a shared expert — the no-shared combine never reads it.
+    let shared_gate_score = if shared.is_some() {
         let s = read_buffer_to_vec(buffer_pool.handle(buffers.shared_gate), 1);
         s[0]
+    } else {
+        0.0
     };
 
     Ok(PostAttnIntermediates {
@@ -1833,18 +1836,25 @@ pub(in crate::riir) fn post_attention_post_o_proj_to_intermediates(
     let gate_w = layer_cache.gate.w;
     let gate_s = layer_cache.gate.s;
     let gate_b = layer_cache.gate.b;
-    let shared_up_w = layer_cache.shared.up_w;
-    let shared_up_s = layer_cache.shared.up_s;
-    let shared_up_b = layer_cache.shared.up_b;
-    let shared_gate_w = layer_cache.shared.gate_w;
-    let shared_gate_s = layer_cache.shared.gate_s;
-    let shared_gate_b = layer_cache.shared.gate_b;
-    let shared_down_w = layer_cache.shared.down_w;
-    let shared_down_s = layer_cache.shared.down_s;
-    let shared_down_b = layer_cache.shared.down_b;
-    let seg_w = layer_cache.shared.seg_w;
-    let seg_s = layer_cache.shared.seg_s;
-    let seg_b = layer_cache.shared.seg_b;
+    let shared = layer_cache
+        .shared
+        .as_ref()
+        .ok_or(LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "mlp.shared_expert (variant has no shared expert)",
+        })?;
+    let shared_up_w = shared.up_w;
+    let shared_up_s = shared.up_s;
+    let shared_up_b = shared.up_b;
+    let shared_gate_w = shared.gate_w;
+    let shared_gate_s = shared.gate_s;
+    let shared_gate_b = shared.gate_b;
+    let shared_down_w = shared.down_w;
+    let shared_down_s = shared.down_s;
+    let shared_down_b = shared.down_b;
+    let seg_w = shared.seg_w;
+    let seg_s = shared.seg_s;
+    let seg_b = shared.seg_b;
 
     let mv = MatvecPipelines::fetch(metal)?;
     let sum_sq = metal.pipeline("rms_norm_sum_sq")?.clone();
@@ -2535,6 +2545,16 @@ where
         &format!("model.layers.{layer_idx}.mlp.shared_expert_gate.weight"),
     );
 
+    // Linear-attn layers only exist on the qwen3_5_moe family, which
+    // always carries the gated shared expert.
+    let shared = layer_cache
+        .shared
+        .as_ref()
+        .ok_or(LayerForwardError::MissingTensor {
+            layer: layer_idx,
+            tensor: "mlp.shared_expert (variant has no shared expert)",
+        })?;
+
     let value_dim = Variant::LINEAR_VALUE_DIM as u32;
     let k_heads_per_v = (v.linear_num_v_heads / v.linear_num_k_heads) as u32;
     let key_offset_per_token = (v.linear_num_k_heads * Variant::LINEAR_KEY_DIM) as u32;
@@ -2764,9 +2784,9 @@ where
         g.push(Op::MatvecNTokens {
             label: "linear_attn.shared_gate",
             weight: WeightRef {
-                w_off: layer_cache.shared.seg_w,
-                s_off: layer_cache.shared.seg_s,
-                b_off: layer_cache.shared.seg_b,
+                w_off: shared.seg_w,
+                s_off: shared.seg_s,
+                b_off: shared.seg_b,
                 bits: seg_bits,
             },
             input: h_post_id.into(),
@@ -3059,64 +3079,69 @@ where
 
     // graph2: shared FFN (gate/up matvec → swiglu → down matvec),
     // zero the out_sum accumulator, MoE permute-fuse, combine into
-    // hidden_out.
+    // hidden_out. Without a shared expert (OLMoE) the shared FFN is
+    // not dispatched and the combine adds no shared term — the
+    // transient (colored) `shared_down` is never read.
+    let shared = layer_cache.shared.as_ref();
     let graph2 = {
         let mut g = Graph::new();
-        g.push(Op::MatvecNTokens {
-            label: "moe.shared_gate_proj",
-            weight: WeightRef {
-                w_off: layer_cache.shared.gate_w,
-                s_off: layer_cache.shared.gate_s,
-                b_off: layer_cache.shared.gate_b,
-                bits: s_gate_bits,
-            },
-            input: h_post_id.into(),
-            input_off: 0,
-            output: moe.shared_ffn_gate.into(),
-            output_off: 0,
-            in_dim: hidden_dim as u32,
-            out_dim: v.shared_intermediate as u32,
-            n_tokens: n_tokens as u32,
-        });
-        g.push(Op::MatvecNTokens {
-            label: "moe.shared_up_proj",
-            weight: WeightRef {
-                w_off: layer_cache.shared.up_w,
-                s_off: layer_cache.shared.up_s,
-                b_off: layer_cache.shared.up_b,
-                bits: s_up_bits,
-            },
-            input: h_post_id.into(),
-            input_off: 0,
-            output: moe.shared_up.into(),
-            output_off: 0,
-            in_dim: hidden_dim as u32,
-            out_dim: v.shared_intermediate as u32,
-            n_tokens: n_tokens as u32,
-        });
-        g.push(Op::SwigluFusedBatched {
-            label: "moe.shared_swiglu",
-            gate: moe.shared_ffn_gate,
-            up: moe.shared_up,
-            out: moe.shared_act,
-            total: (n_tokens * v.shared_intermediate) as u32,
-        });
-        g.push(Op::MatvecNTokens {
-            label: "moe.shared_down_proj",
-            weight: WeightRef {
-                w_off: layer_cache.shared.down_w,
-                s_off: layer_cache.shared.down_s,
-                b_off: layer_cache.shared.down_b,
-                bits: s_down_bits,
-            },
-            input: moe.shared_act.into(),
-            input_off: 0,
-            output: moe.shared_down.into(),
-            output_off: 0,
-            in_dim: v.shared_intermediate as u32,
-            out_dim: hidden_dim as u32,
-            n_tokens: n_tokens as u32,
-        });
+        if let Some(sh) = shared {
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_gate_proj",
+                weight: WeightRef {
+                    w_off: sh.gate_w,
+                    s_off: sh.gate_s,
+                    b_off: sh.gate_b,
+                    bits: s_gate_bits,
+                },
+                input: h_post_id.into(),
+                input_off: 0,
+                output: moe.shared_ffn_gate.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.shared_intermediate as u32,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_up_proj",
+                weight: WeightRef {
+                    w_off: sh.up_w,
+                    s_off: sh.up_s,
+                    b_off: sh.up_b,
+                    bits: s_up_bits,
+                },
+                input: h_post_id.into(),
+                input_off: 0,
+                output: moe.shared_up.into(),
+                output_off: 0,
+                in_dim: hidden_dim as u32,
+                out_dim: v.shared_intermediate as u32,
+                n_tokens: n_tokens as u32,
+            });
+            g.push(Op::SwigluFusedBatched {
+                label: "moe.shared_swiglu",
+                gate: moe.shared_ffn_gate,
+                up: moe.shared_up,
+                out: moe.shared_act,
+                total: (n_tokens * v.shared_intermediate) as u32,
+            });
+            g.push(Op::MatvecNTokens {
+                label: "moe.shared_down_proj",
+                weight: WeightRef {
+                    w_off: sh.down_w,
+                    s_off: sh.down_s,
+                    b_off: sh.down_b,
+                    bits: s_down_bits,
+                },
+                input: moe.shared_act.into(),
+                input_off: 0,
+                output: moe.shared_down.into(),
+                output_off: 0,
+                in_dim: v.shared_intermediate as u32,
+                out_dim: hidden_dim as u32,
+                n_tokens: n_tokens as u32,
+            });
+        }
         g.push(Op::ZeroBuffer {
             label: "moe.out_sum_zero",
             buf: moe.out_sum,
@@ -3170,16 +3195,27 @@ where
                 buckets,
             });
         }
-        g.push(Op::MoeCombineResidualNTokens {
-            label: "moe.combine",
-            h_mid: h_mid_id,
-            moe_sum: moe.out_sum,
-            shared_out: moe.shared_down,
-            shared_gate: shared_gate_id,
-            hidden_out: hidden_out_id,
-            n_tokens: n_tokens as u32,
-            dim: hidden_dim as u32,
-        });
+        if shared.is_some() {
+            g.push(Op::MoeCombineResidualNTokens {
+                label: "moe.combine",
+                h_mid: h_mid_id,
+                moe_sum: moe.out_sum,
+                shared_out: moe.shared_down,
+                shared_gate: shared_gate_id,
+                hidden_out: hidden_out_id,
+                n_tokens: n_tokens as u32,
+                dim: hidden_dim as u32,
+            });
+        } else {
+            g.push(Op::MoeCombineResidualNoSharedNTokens {
+                label: "moe.combine",
+                h_mid: h_mid_id,
+                moe_sum: moe.out_sum,
+                hidden_out: hidden_out_id,
+                n_tokens: n_tokens as u32,
+                dim: hidden_dim as u32,
+            });
+        }
         g
     };
     // S10b-2 Phase 4: color graph2's transients on the first call,

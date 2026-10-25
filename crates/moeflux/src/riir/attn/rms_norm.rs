@@ -135,22 +135,28 @@ pub fn rms_norm_per_head_cpu(
         });
     }
 
+    rms_norm_heads_bf16(bytes, head_dim, x_inout);
+    Ok(())
+}
+
+/// In-place RMSNorm of each `head_dim`-wide chunk of `x_inout` with
+/// one shared bf16 weight row (`w_bytes`, `head_dim * 2` bytes). A
+/// single chunk spanning the whole slice is the full-projection
+/// norm ([`crate::riir::variants::QkNorm::Full`]).
+fn rms_norm_heads_bf16(w_bytes: &[u8], head_dim: usize, x_inout: &mut [f32]) {
     let head_dim_f = head_dim as f32;
-    for h in 0..num_heads {
-        let xh = &mut x_inout[h * head_dim..(h + 1) * head_dim];
+    for xh in x_inout.chunks_exact_mut(head_dim) {
         let mut sum_sq: f32 = 0.0;
         for &xi in xh.iter() {
             sum_sq += xi * xi;
         }
         let inv_rms = 1.0f32 / (sum_sq / head_dim_f + RMS_NORM_EPS).sqrt();
         for i in 0..head_dim {
-            let w_bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+            let w_bits = u16::from_le_bytes([w_bytes[i * 2], w_bytes[i * 2 + 1]]);
             let weight = bf16_to_f32(w_bits);
             xh[i] = xh[i] * inv_rms * weight;
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -158,8 +164,53 @@ mod tests {
     use super::*;
 
     /// Compile-only sanity. Real bit-exact diff lives in the harness.
+    #[cfg(not(feature = "model-olmoe-1b-7b"))]
     #[test]
     fn rms_norm_eps_is_1e6() {
         assert!((RMS_NORM_EPS - 1e-6).abs() < 1e-12);
+    }
+
+    #[cfg(feature = "model-olmoe-1b-7b")]
+    #[test]
+    fn rms_norm_eps_is_1e5() {
+        assert!((RMS_NORM_EPS - 1e-5).abs() < 1e-12);
+    }
+
+    fn bf16_bytes(w: &[f32]) -> Vec<u8> {
+        w.iter()
+            .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+            .collect()
+    }
+
+    /// One chunk over the whole projection (QkNorm::Full) normalizes
+    /// by the RMS of all channels, unlike the per-head split.
+    #[test]
+    fn full_dim_norm_uses_one_rms_over_projection() {
+        let n = 8;
+        let x: Vec<f32> = (0..n).map(|i| (i as f32 - 3.0) * 0.5).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let wb = bf16_bytes(&w);
+
+        let mut full = x.clone();
+        rms_norm_heads_bf16(&wb, n, &mut full);
+        let ms = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+        let inv = 1.0 / (ms + RMS_NORM_EPS).sqrt();
+        for i in 0..n {
+            assert!((full[i] - x[i] * inv * w[i]).abs() < 1e-6, "i={i}");
+        }
+
+        // Per-head (2 heads of 4) re-uses the first 4 weights per head
+        // and its own RMS per head — differs from the full norm.
+        let mut per_head = x.clone();
+        rms_norm_heads_bf16(&wb[..8], 4, &mut per_head);
+        for h in 0..2 {
+            let xh = &x[h * 4..h * 4 + 4];
+            let ms = xh.iter().map(|v| v * v).sum::<f32>() / 4.0;
+            let inv = 1.0 / (ms + RMS_NORM_EPS).sqrt();
+            for i in 0..4 {
+                assert!((per_head[h * 4 + i] - xh[i] * inv * w[i]).abs() < 1e-6);
+            }
+        }
+        assert_ne!(full, per_head);
     }
 }

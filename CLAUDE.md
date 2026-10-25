@@ -26,6 +26,7 @@ one model-variant feature must be selected:
 cargo build --features model-qwen3-6-35b-a3b
 cargo build --features model-qwen3-5-a17b
 cargo build --features model-cogito-v2-671b
+cargo build --features model-olmoe-1b-7b
 
 # Check the host first: CPU, RAM, headroom, model files present
 scripts/check_test_host.sh
