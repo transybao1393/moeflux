@@ -1771,6 +1771,7 @@ pub(in crate::riir) fn post_attention_pre_moe(
         &mut routing_indices,
         &mut routing_weights,
     )?;
+    crate::riir::io::routing_trace::stash_probs(&scores);
 
     // Read shared-gate score scalar (pre-sigmoid). Unused (0) without
     // a shared expert — the no-shared combine never reads it.
@@ -2041,6 +2042,7 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     for &idx in indices.iter() {
         expert_files.record_pick(layer_idx, idx as usize, 1);
     }
+    crate::riir::io::routing_trace::record(layer_idx, indices);
 
     if gpu_combine {
         // Bindings layout: one `(&Buffer, byte_offset)` per active
