@@ -27,9 +27,16 @@ cargo build --features model-qwen3-6-35b-a3b
 cargo build --features model-qwen3-5-a17b
 cargo build --features model-cogito-v2-671b
 
+# Check the host first: CPU, RAM, headroom, model files present
+scripts/check_test_host.sh
+
 # Behavioral gate — the oracle suites load the a3b model
 cargo test --no-fail-fast --features model-qwen3-6-35b-a3b -- --include-ignored
 ```
+
+Run `scripts/check_test_host.sh` before any test phase. Exit 2 means
+only the unit/kernel tier can run here (no model files or too little
+memory) — run without `--include-ignored` and say so.
 
 `--no-fail-fast` so one model-mismatched test binary doesn't mask the
 rest. `checkpoint_restore.rs` is a3b-only and fails under a17b — that
