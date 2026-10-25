@@ -1,21 +1,26 @@
-# IDE
+# IDE / editors
 .vscode/
+.idea/
+*.swp
+*.swo
 
-# Build artifacts (Phase 6 relocated metal_infer/ into moeflux-sys)
-crates/moeflux-sys/metal_infer/infer
-crates/moeflux-sys/metal_infer/metal_infer
-crates/moeflux-sys/metal_infer/bench_pread
-crates/moeflux-sys/metal_infer/libmoeflux.a
-crates/moeflux-sys/metal_infer/smoke
+# Claude Code per-user settings (shared memory notes stay tracked)
+.claude/settings.local.json
+
+# Build artifacts
 *.o
 *.air
 *.metallib
 
-# Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
-crates/moeflux-sys/metal_infer/model_weights.bin
-crates/moeflux-sys/metal_infer/model_weights.json
-crates/moeflux-sys/metal_infer/vocab.bin
-crates/moeflux-sys/metal_infer/tokenizer.bin
+# Generated model files (recreate with scripts/ and repack_experts.py)
+model_weights.bin
+model_weights.json
+vocab.bin
+tokenizer.bin
+packed_experts/
+packed_experts_*/
+*.safetensors
+models/
 
 # Python
 __pycache__/
@@ -35,8 +40,12 @@ __pycache__/
 logs/
 *.log
 
-# Experiment data
-crates/moeflux-sys/metal_infer/routing_data.bin
+# Experiment and telemetry data (Phase 0 baselines, streaming counters,
+# routing profiles for hot-tier seeding)
+routing_data.bin
+telemetry/
+profiles/
+*.csv
 
 # Rust
 target/
