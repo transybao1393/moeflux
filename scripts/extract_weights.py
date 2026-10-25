@@ -159,7 +159,7 @@ def main():
     bin_path = output_dir / 'model_weights.bin'
     # Pull config from the model's HuggingFace config.json; each key
     # maps 1:1 to a field moeflux expects.
-    rope_params = text_config.get('rope_parameters', {})
+    rope_params = text_config.get('rope_parameters') or {}
     cfg_out = {
         "hidden_size":                     text_config['hidden_size'],
         "num_hidden_layers":               text_config['num_hidden_layers'],
@@ -171,15 +171,18 @@ def main():
         "num_experts":                     text_config['num_experts'],
         "num_experts_per_tok":             text_config['num_experts_per_tok'],
         "moe_intermediate_size":           text_config['moe_intermediate_size'],
-        "shared_expert_intermediate_size": text_config['shared_expert_intermediate_size'],
-        "full_attention_interval":         text_config['full_attention_interval'],
-        "linear_num_value_heads":          text_config['linear_num_value_heads'],
-        "linear_num_key_heads":            text_config['linear_num_key_heads'],
-        "linear_key_head_dim":             text_config['linear_key_head_dim'],
-        "linear_value_head_dim":           text_config['linear_value_head_dim'],
-        "linear_conv_kernel_dim":          text_config['linear_conv_kernel_dim'],
+        "shared_expert_intermediate_size": text_config.get('shared_expert_intermediate_size', 0),
+        "full_attention_interval":         text_config.get('full_attention_interval', 1),
+        "linear_num_value_heads":          text_config.get('linear_num_value_heads', 0),
+        "linear_num_key_heads":            text_config.get('linear_num_key_heads', 0),
+        "linear_key_head_dim":             text_config.get('linear_key_head_dim', 0),
+        "linear_value_head_dim":           text_config.get('linear_value_head_dim', 0),
+        "linear_conv_kernel_dim":          text_config.get('linear_conv_kernel_dim', 0),
         "partial_rotary_factor":           (rope_params.get('partial_rotary_factor')
-                                            or text_config.get('partial_rotary_factor', 0.25)),
+                                            or text_config.get('partial_rotary_factor',
+                                                               # qwen3_moe rotates the full head
+                                                               1.0 if text_config.get('model_type') == 'qwen3_moe'
+                                                               else 0.25)),
         "rope_theta":                      (rope_params.get('rope_theta')
                                             or text_config.get('rope_theta', 10000000.0)),
         "default_bits":                    default_bits,
