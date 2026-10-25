@@ -109,7 +109,8 @@ Details — memory accounts, the per-token data path, phases — are in
 | Layer-range execution (`layer_range`, `eval_stage`, f32 hidden in/out, per-range snapshots) | Implemented — Phase 3; model-level tests pending |
 | Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; model-level tests pending |
 | `moeflux-net`: frames, `moeflux-node`, `moeflux-coord`, planner (TCP loopback) | Implemented — Phase 5; model-level tests pending |
-| Streaming improvements, router policy, 2-bit | Planned — Phases 6–8 |
+| Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier | Implemented — Phase 6; knobs default off, model-level tests and speed numbers pending |
+| Router policy, 2-bit | Planned — Phases 7–8 |
 
 Build with exactly one model feature:
 

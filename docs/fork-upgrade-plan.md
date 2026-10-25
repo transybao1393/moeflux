@@ -161,14 +161,19 @@ Each phase ends with a measurement; the next phase is decided on numbers.
 | 3 | Implemented | `OpenConfig::layer_range`: only the range's tensors are loaded (compacted under a cap), planned (`BudgetPlan::for_range`) and run; `RsCtx::eval_stage(StageInput::{Tokens, Hidden}, pos, StageOutput::{Logits, Hidden, Discard})` with f32 hidden in/out; `chain_next` norm fusion broken at the range end; snapshot v3 header records the range. A mode B range seeds every expert of the range into the hot tier. |
 | 4 | Implemented | `OpenConfig::max_requests`: a fixed pool of `SeqState`s (KV, linear-attn host + GPU recurrence, prefetch guesses), counted per slot in the plan and allocated at open under a cap; `admit_request` (`PoolFull` when full) / `drop_request` / `eval_request` / `state_{size,save,load}_for`. Switching requests swaps the live state with the parked one (no copies); the single-sequence API runs on `ReqId::DEFAULT`. |
 | 5 | Implemented | `crates/moeflux-net`: versioned length-prefixed frames into fixed buffers; `moeflux-node` (one range per process, frame buffers counted in the cap via `OpenConfig::host_buffers`); `moeflux-coord run` (drives the chain, per-node decode latency) and `plan` (ranges from caps + measured speed). TCP loopback. |
-| 6–8 | Not started | Waiting on model-level verification of 1–5. |
+| 6 | Implemented | Telemetry: `ExpertIoStats` from fixed per-layer atomics — reads/bytes by kind (demand / prefetch / prefill / seed, fast dir), per-layer hot / prefetch / demand counts, decode and prefill wall time with I/O wait, guess accuracy for both guessers; `csv_row` / `layer_csv`, `RsCtx::reset_expert_io_stats`. `OpenConfig::{io_queue_depth, io_bytes_per_sec}` (lock-free gate + GCRA limiter on every read). Prefill stages experts in place: deduped, sorted, coalesced runs of ≤ 8 on the I/O pool. `prefetch_guess = CrossLayer` (layer L's residual through L+1's router on the CPU). `prefetch_lookahead` (L+1's reads issued during L's attention). `fast_experts_dir` (per-layer disk tier). Every knob defaults off = Phase 2 behavior until measured. |
+| 7–8 | Not started | Waiting on model-level verification of 1–6. |
 
 Not yet verified on a model (this dev box has no weights and 18 GB):
 the model groups of `tests/budget_cap.rs`, `tests/expert_source_equivalence.rs`,
-`tests/layer_range.rs`, `tests/requests.rs` and `moeflux-net/tests/loopback.rs`
-are `#[ignore]` until run on a capable host. The cogito (MLA) decode
-path does not use the hot tier yet, and layer ranges / request switching
-are unit-tested but not model-tested on cogito or a17b.
+`tests/layer_range.rs`, `tests/requests.rs`, `tests/streaming.rs` and
+`moeflux-net/tests/loopback.rs` are `#[ignore]` until run on a capable
+host. The cogito (MLA) decode path does not use the hot tier or
+prefetch yet, and layer ranges / request switching are unit-tested but
+not model-tested on cogito or a17b. Phase 6's exit numbers (read
+bytes/token and tok/s vs Phase 2) come from
+`tests/streaming.rs::streaming_stats_report` and the per-knob tests,
+which print the stats CSV; flip a default only after it wins there.
 
 ### Deviations from the plan (phases 3–5)
 
@@ -202,6 +207,51 @@ are unit-tested but not model-tested on cogito or a17b.
 - **The weight filter keeps unknown top-level tensors** on every range
   (only `model.layers.N.*`, the embedding and the head are split).
 
+### Deviations from the plan (phase 6)
+
+- **Nothing is on by default.** No speed could be measured here (no
+  weights), so every Phase 6 knob ships off and the default path is
+  the Phase 2 one; the stats CSV decides each default on the M4.
+- **Cross-layer input is layer L's post-attention residual** (`h_mid`),
+  not layer L's output: the output only exists once L's experts have
+  run on the GPU. It goes through L+1's `post_attention_layernorm` and
+  router gate (4- or 8-bit, serial CPU matvec into fixed buffers) at
+  the top of L+1, after L's expert dispatch is committed. So the guess
+  is better but issued no earlier than today's; the overlap item is
+  separate. No confidence threshold: the top-k guess is always
+  fetched, minus hot experts.
+- **Today's prefetch already overlaps more than the plan assumed:**
+  layer L+1's prefetch is issued while L's expert dispatch is still on
+  the GPU, and runs through L+1's attention. Lookahead moves it one
+  step earlier, into L's attention, using the two existing prefetch
+  sets; the cost is that L's demand misses can queue behind L+1's
+  speculative reads on the shared I/O pool (watch `io_wait_ns`). It
+  needs the previous-token guess: a cross-layer guess isn't known that
+  early, so `CrossLayer` + lookahead is a config error.
+- **Prefill:** hot-tier experts are still copied into staging (the
+  gather kernel needs one base buffer); only non-hot experts are read,
+  each once per layer per chunk. Across chunks an expert is re-read,
+  since staging holds one layer at a time; chunk size is unchanged and
+  the second (+453 MB) staging buffer for read/compute overlap was not
+  added. The old path's 1.77 MB host blob per layer is gone.
+- **Queue depth** is a lock-free gate on reads in flight; `io_threads`
+  already bounds pool reads, so it bites only below `io_threads` (or
+  when the main thread reads). A coalesced prefill run is one permit
+  and is charged its full bytes by the rate limiter (20 ms burst).
+- **Disk tier is per layer, not per expert:** a layer file in
+  `fast_experts_dir/packed_experts/` overrides the primary. Per-expert
+  placement would need a new file format (per-expert files are
+  rejected in §8). Copy the most-used layers (from the routing profile)
+  or, if it fits, all 18 GB.
+- **GPU time is not measured directly:** metal-rs exposes no GPU
+  timestamps (`CmdbufStat::gpu_ns` stays 0). The stats give decode
+  wall time and its I/O-wait share; GPU waits per command buffer label
+  are in `RsCtx::cmdbuf_stats`.
+- **No new budget accounts.** The guesser's buffers (≈ 17 KB on a3b)
+  and the per-layer counters (≈ 2 KB) are fixed at open inside
+  `runtime_overhead`; the decode additions are atomics and fixed
+  arrays (hot-tier lookups still take the tier's existing mutex).
+
 | # | Phase | Work | Exit criteria |
 | --- | --- | --- | --- |
 | 0 | Baseline + telemetry | Run a3b on M4 (mmap and pread, with/without `purge`) and one M1. Add streaming counters: bytes read per token/tier, hits per layer, I/O wait vs GPU time, guess accuracy; CSV output from `profile_smoke.sh`. Routing profile pass. Measure runtime overhead, SSD bandwidth (internal and external), 4 KB / 8 KB frame round-trip M4↔M1 | Baseline CSV; overhead number; expert popularity curve |
@@ -226,6 +276,11 @@ are unit-tested but not model-tested on cogito or a17b.
   Phase 1; today only `tests/engine_op_diff.rs` exercises pread).
 - **Split equivalence:** 40 layers vs 20+10+10, in-process and over loopback.
 - **Request interleaving:** interleaved vs sequential requests match.
+- **Streaming knobs** (`tests/streaming.rs`): cross-layer guesses,
+  lookahead, bounded I/O and the fast experts dir each give
+  bit-identical logits to the default path; prefill reads each routed
+  expert once per layer; the stats test prints bytes/token, guess
+  accuracy and I/O wait as CSV.
 - **Policy quality:** skip / 2-bit judged on task accuracy, not perplexity
   alone (2-bit broke JSON and tool calling in flash-moe).
 - **Speed regression gate:** per-machine tok/s baselines; a phase that drops
