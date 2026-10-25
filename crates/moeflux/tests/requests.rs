@@ -90,6 +90,32 @@ fn unknown_requests_rejected() {
     assert_eq!(ctx.state_size_for(ReqId(5)).unwrap(), ctx.state_size());
 }
 
+#[test]
+fn drop_all_requests_empties_the_pool() {
+    let fake = FakeModel::new("reqdropall");
+    let mut ctx = fake.open(&cfg(3)).expect("open");
+    ctx.admit_request(ReqId(1)).unwrap();
+    ctx.admit_request(ReqId(2)).unwrap();
+    ctx.drop_all_requests();
+    assert_eq!(ctx.requests_in_use(), 1);
+    assert!(ctx.has_request(ReqId::DEFAULT));
+    assert!(!ctx.has_request(ReqId(1)) && !ctx.has_request(ReqId(2)));
+    ctx.admit_request(ReqId(1)).expect("slots free again");
+}
+
+/// Positions are checked before the forward narrows them to i32.
+#[test]
+fn positions_past_i32_rejected() {
+    let fake = FakeModel::new("reqpos");
+    let mut ctx = fake.open(&cfg(1)).expect("open");
+    for start in [i32::MAX as usize, (1usize << 32) + 5] {
+        match ctx.eval_request(ReqId::DEFAULT, StageInput::Tokens(&[1]), start, StageOutput::Discard) {
+            Err(Error::PositionOutOfRange { start_pos, n_tokens: 1 }) => assert_eq!(start_pos, start),
+            other => panic!("expected PositionOutOfRange at {start}, got {other:?}"),
+        }
+    }
+}
+
 /// Every slot's state is in the plan: a cap that fits one request's
 /// KV doesn't fit eight.
 #[test]

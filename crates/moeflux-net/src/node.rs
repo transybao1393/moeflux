@@ -11,7 +11,9 @@
 //! | `Shutdown` | `Ack`, then [`serve`] returns |
 //!
 //! Any failure is answered with an `Error` frame; the connection stays
-//! up. Both frame buffers are allocated once, before the stage's
+//! up. Each new connection starts from a clean pool: the stage drops
+//! every request ([`Stage::reset`]) before the `Hello`, so nothing a
+//! previous (or crashed) coordinator left behind leaks into the next. Both frame buffers are allocated once, before the stage's
 //! context is opened, and counted in its cap
 //! ([`moeflux::OpenConfig::host_buffers`]).
 
@@ -36,6 +38,9 @@ pub trait Stage {
     fn admit(&mut self, req: u64) -> Result<(), String>;
     /// Release request `req`.
     fn drop_request(&mut self, req: u64) -> Result<(), String>;
+    /// Drop every request; the default one comes back empty. Called
+    /// when a coordinator connects.
+    fn reset(&mut self);
     /// Run `input` for request `req` at `pos`. `out` is the output
     /// buffer: `rows × hidden_dim` for a middle stage, `vocab` logits
     /// of the last row for the last stage.
@@ -95,6 +100,7 @@ pub fn serve(stage: &mut dyn Stage, listener: &TcpListener, bufs: &mut NodeBuffe
 
 /// One coordinator connection.
 fn session(stage: &mut dyn Stage, stream: &mut TcpStream, bufs: &mut NodeBuffers) -> Result<Option<Exit>, NetError> {
+    stage.reset();
     let info = stage.info();
     bufs.send.set_hello(info)?;
     bufs.send.write_to(stream)?;
@@ -118,7 +124,9 @@ fn session(stage: &mut dyn Stage, stream: &mut TcpStream, bufs: &mut NodeBuffers
                     Input::Tokens(t) => t.len(),
                     Input::Hidden(x) => x.len() / hd.max(1),
                 };
-                if n_in != rows || rows as u32 > info.max_tokens {
+                if rows == 0 {
+                    Err("frame carries no rows".to_string())
+                } else if n_in != rows || rows as u32 > info.max_tokens {
                     Err(format!("frame of {rows} rows carries {n_in} (max {})", info.max_tokens))
                 } else {
                     match bufs.send.f32s_mut(out_len) {
@@ -189,6 +197,10 @@ impl Stage for CtxStage {
     fn drop_request(&mut self, req: u64) -> Result<(), String> {
         self.ctx.drop_request(moeflux::ReqId(req));
         Ok(())
+    }
+
+    fn reset(&mut self) {
+        self.ctx.drop_all_requests();
     }
 
     fn eval(&mut self, req: u64, input: Input<'_>, pos: usize, out: &mut [f32]) -> Result<(), String> {

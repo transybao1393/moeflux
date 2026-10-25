@@ -1940,6 +1940,11 @@ impl RsCtx<MetalBackend> {
         if n == 0 {
             return Ok(());
         }
+        // The forward takes i32 positions; refuse what would wrap
+        // rather than run RoPE at a truncated position.
+        if start_pos.checked_add(n).map_or(true, |end| end > i32::MAX as usize) {
+            return Err(RsError::PositionOutOfRange { start_pos, n_tokens: n });
+        }
         self.activate_slot(slot);
         self.experts.begin_epoch();
         if n == 1 && eval_token_mode() == EvalTokenMode::Oracle {
@@ -3488,6 +3493,15 @@ impl RsCtx<MetalBackend> {
         self.requests.release(req).is_some()
     }
 
+    /// Release every request and clear the default one: the pool as
+    /// it was after open. Nothing is freed or allocated.
+    pub fn drop_all_requests(&mut self) {
+        let reqs: Vec<ReqId> = self.requests.requests().collect();
+        for req in reqs {
+            self.drop_request(req);
+        }
+    }
+
     /// `true` if `req` is admitted.
     pub fn has_request(&self, req: ReqId) -> bool {
         self.requests.slot_of(req).is_some()
@@ -3693,6 +3707,15 @@ pub enum RsError {
     RequestExists {
         /// The [`ReqId`] value.
         req: u64,
+    },
+    /// [`RsCtx::eval_request`]: the positions don't fit the forward's
+    /// i32 position type.
+    #[error("positions {start_pos}..+{n_tokens} out of range")]
+    PositionOutOfRange {
+        /// First position asked for.
+        start_pos: usize,
+        /// Positions in the call.
+        n_tokens: usize,
     },
     /// A request-scoped snapshot call failed.
     #[error("state snapshot: {0}")]

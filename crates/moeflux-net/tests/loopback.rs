@@ -30,6 +30,8 @@ use moeflux_net::{NetError, NodeInfo};
 const HD: usize = 8;
 const VOCAB: usize = 32;
 const LAYERS: u32 = 12;
+/// Positions a middle [`Mock`] stage refuses.
+const FAIL_POS: usize = 1000;
 
 /// A stand-in stage: mixes input rows with per-request running state,
 /// so wrong routing, wrong positions or lost state change the output.
@@ -79,8 +81,18 @@ impl Stage for Mock {
         Ok(())
     }
 
+    fn reset(&mut self) {
+        self.state.clear();
+        self.state.insert(0, 0.0);
+    }
+
     fn eval(&mut self, req: u64, input: Input<'_>, pos: usize, out: &mut [f32]) -> Result<(), String> {
         let st = self.state.get_mut(&req).ok_or(format!("unknown request {req}"))?;
+        // Middle stages refuse far positions, so a chain can fail
+        // part-way through.
+        if self.range.0 != 0 && self.range.1 != LAYERS && pos >= FAIL_POS {
+            return Err(format!("position {pos} too far"));
+        }
         let rows: Vec<Vec<f32>> = match input {
             Input::Tokens(t) => t.iter().map(|&t| (0..HD).map(|d| t as f32 + d as f32 * 0.5).collect()).collect(),
             Input::Hidden(h) => h.chunks(HD).map(|r| r.to_vec()).collect(),
@@ -221,6 +233,88 @@ fn ranges_that_do_not_tile_the_model_are_refused() {
     for h in [ha, hb, hc] {
         assert_eq!(h.join().unwrap().unwrap(), Exit::Shutdown);
     }
+}
+
+/// A new coordinator connection starts from a clean pool: the same
+/// prompt gives the same logits, and requests a previous coordinator
+/// left admitted are gone.
+#[test]
+fn reconnecting_starts_from_a_clean_pool() {
+    let (addrs, handles): (Vec<_>, Vec<_>) = split().into_iter().map(spawn).unzip();
+    let prompt = [5, 9, 2];
+    let mut first = vec![0f32; VOCAB];
+    {
+        let mut chain = Chain::connect(&addrs).expect("connect");
+        chain.eval(0, &prompt, 0, &mut first).unwrap();
+        chain.admit(5).unwrap();
+        // Dropped without shutdown or cleanup, as a crash would.
+    }
+    let mut chain = Chain::connect(&addrs).expect("reconnect");
+    let mut again = vec![0f32; VOCAB];
+    chain.eval(0, &prompt, 0, &mut again).unwrap();
+    assert_eq!(bits(&first), bits(&again));
+    // The pool (2 slots) has room again: 5 was released.
+    chain.admit(5).unwrap();
+    chain.shutdown().unwrap();
+    for h in handles {
+        assert_eq!(h.join().unwrap().unwrap(), Exit::Shutdown);
+    }
+}
+
+/// Failures leave no node holding part of a step or an admission.
+#[test]
+fn failures_do_not_leave_the_chain_half_applied() {
+    // The middle node's pool is smaller than its neighbours'.
+    let stages = vec![Mock::new(0, 6, 3), Mock::new(6, 9, 2), Mock::new(9, LAYERS, 3)];
+    let (addrs, handles): (Vec<_>, Vec<_>) = stages.into_iter().map(spawn).unzip();
+    let mut chain = Chain::connect(&addrs).expect("connect");
+    let mut logits = vec![0f32; VOCAB];
+
+    // Admission refused by node 1 is rolled back on node 0.
+    chain.admit(5).unwrap();
+    assert!(matches!(chain.admit(6), Err(NetError::Remote(_))));
+    match chain.eval(6, &[1], 0, &mut logits) {
+        Err(NetError::Remote(m)) => assert!(m.contains("unknown request 6"), "{m}"),
+        other => panic!("node 0 kept request 6: {other:?}"),
+    }
+
+    // An eval failing at node 1 drops the request on every node, so
+    // node 0 does not keep the step it already ran.
+    match chain.eval(5, &[1], FAIL_POS, &mut logits) {
+        Err(NetError::Remote(m)) => assert!(m.contains("too far"), "{m}"),
+        other => panic!("expected the middle stage to fail, got {other:?}"),
+    }
+    match chain.eval(5, &[1], 0, &mut logits) {
+        Err(NetError::Remote(m)) => assert!(m.contains("unknown request 5"), "{m}"),
+        other => panic!("request 5 survived a failed step: {other:?}"),
+    }
+
+    // Empty input is refused before anything is sent ...
+    assert!(matches!(chain.eval(0, &[], 0, &mut logits), Err(NetError::Protocol(_))));
+    chain.shutdown().unwrap();
+    for h in handles {
+        assert_eq!(h.join().unwrap().unwrap(), Exit::Shutdown);
+    }
+}
+
+/// ... and a node answers a zero-row frame with an error, not stale
+/// logits.
+#[test]
+fn node_refuses_a_zero_row_frame() {
+    let (addr, h) = spawn(Mock::new(0, LAYERS, 1));
+    let mut s = std::net::TcpStream::connect(&addr).unwrap();
+    let mut buf = moeflux_net::FrameBuf::new(4096);
+    buf.read_reply(&mut s).unwrap(); // Hello
+    buf.set_words::<i32>(moeflux_net::Kind::Tokens, 0, 0, 0, &[]).unwrap();
+    buf.write_to(&mut s).unwrap();
+    match buf.read_reply(&mut s) {
+        Err(NetError::Remote(m)) => assert!(m.contains("no rows"), "{m}"),
+        other => panic!("expected an error frame, got {other:?}"),
+    }
+    drop(s);
+    let chain = Chain::connect(&[addr]).expect("node still serving");
+    chain.shutdown().unwrap();
+    assert_eq!(h.join().unwrap().unwrap(), Exit::Shutdown);
 }
 
 /// The node's buffers are what it reports and plans for.

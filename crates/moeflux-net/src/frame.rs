@@ -15,7 +15,9 @@
 //!
 //! Payloads are 4-byte words: `i32` token ids, `f32` hidden rows
 //! (`count × hidden_dim`), `f32` logits (`vocab`), a [`NodeInfo`], or a
-//! UTF-8 error message.
+//! UTF-8 error message. Unlike the header, payload words are copied in
+//! host byte order — little-endian on every Apple Silicon node, which
+//! is the only target; a big-endian peer would need a swap here.
 //!
 //! A [`FrameBuf`] holds one frame. It is allocated (and touched) once
 //! at its maximum size; reading a frame whose payload would not fit

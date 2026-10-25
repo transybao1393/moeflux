@@ -105,9 +105,18 @@ impl Chain {
         self.nodes.last().map_or(0, |n| n.info.vocab as usize)
     }
 
-    /// Admit `req` on every node.
+    /// Admit `req` on every node. If a node refuses, the nodes that
+    /// had already admitted it drop it again, so a retry starts clean.
     pub fn admit(&mut self, req: u64) -> Result<(), NetError> {
-        self.control(Kind::Admit, req)
+        for i in 0..self.nodes.len() {
+            if let Err(e) = self.control_one(i, Kind::Admit, req) {
+                for j in 0..i {
+                    let _ = self.control_one(j, Kind::Drop, req);
+                }
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     /// Drop `req` on every node.
@@ -121,20 +130,43 @@ impl Chain {
     }
 
     fn control(&mut self, kind: Kind, req: u64) -> Result<(), NetError> {
-        for n in &mut self.nodes {
-            self.a.set_empty(kind, req, 0);
-            self.a.write_to(&mut n.stream)?;
-            self.b.read_reply(&mut n.stream)?;
+        for i in 0..self.nodes.len() {
+            self.control_one(i, kind, req)?;
         }
+        Ok(())
+    }
+
+    fn control_one(&mut self, node: usize, kind: Kind, req: u64) -> Result<(), NetError> {
+        let n = &mut self.nodes[node];
+        self.a.set_empty(kind, req, 0);
+        self.a.write_to(&mut n.stream)?;
+        self.b.read_reply(&mut n.stream)?;
         Ok(())
     }
 
     /// Run `tokens` for request `req` starting at `pos` through the
     /// chain; `logits` receives the last token's logits.
+    ///
+    /// On failure, nodes before the failing one have already advanced
+    /// `req`, so the chain drops `req` everywhere (the default request
+    /// is cleared): no node keeps a partial step. Re-admit to retry.
     pub fn eval(&mut self, req: u64, tokens: &[i32], pos: usize, logits: &mut [f32]) -> Result<(), NetError> {
         if logits.len() != self.vocab() {
             return Err(NetError::Protocol(format!("logits buffer {} != vocab {}", logits.len(), self.vocab())));
         }
+        if tokens.is_empty() {
+            return Err(NetError::Protocol("no tokens to evaluate".into()));
+        }
+        let r = self.eval_chunks(req, tokens, pos, logits);
+        if r.is_err() {
+            for i in 0..self.nodes.len() {
+                let _ = self.control_one(i, Kind::Drop, req);
+            }
+        }
+        r
+    }
+
+    fn eval_chunks(&mut self, req: u64, tokens: &[i32], pos: usize, logits: &mut [f32]) -> Result<(), NetError> {
         for (c, chunk) in tokens.chunks(self.max_tokens).enumerate() {
             let p = (pos + c * self.max_tokens) as u64;
             self.a.set_words(Kind::Tokens, req, p, chunk.len() as u32, chunk)?;

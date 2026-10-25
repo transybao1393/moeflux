@@ -322,3 +322,20 @@ a larger machine, not the 18 GB dev box.
 - [ ] Frame round-trip M4↔M1 over Gigabit Ethernet and Thunderbolt bridge
 - [ ] moeflux decode speed on an M1 GPU
 - [ ] Confirm architecture figures against the model's `config.json`
+
+## 10. Known cap gaps (review of phases 3–5)
+
+- **Checkpoints are outside the plan.** `RsCtx::checkpoint_pos` allocates
+  a `state_size()` buffer per checkpoint at runtime (up to
+  `max_checkpoints`), and `restore_to` clones one more. Under `mem_cap`
+  this is runtime growth the plan never counted; only the after-eval
+  footprint check catches it. Fix: an `Account::Checkpoints` of
+  `max_checkpoints × state_size(n_ctx)` (+1 for the restore copy),
+  buffers allocated and touched at open, reused as a ring. drama_llama's
+  checkpoint path is the caller, so keep its API.
+- **Whole-model weights under a cap** are counted at the file's raw
+  length, while the owned copy is rounded up to a 16 KiB page (< 16 KiB
+  short; the range path's `filtered_bytes` already rounds).
+- **Parked slots' host `LinearAttnState`** is planned but not touched at
+  open, so the open-time footprint check doesn't see it (the cap still
+  holds; it is reserved, not committed).
