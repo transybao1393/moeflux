@@ -28,6 +28,7 @@ use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 use crate::riir::backend::buftype::{KvCacheKBuf, KvCacheVBuf};
 use crate::riir::backend::gpu::MetalBufferPool;
 use crate::riir::backend::{BufId, BufferPool};
+use crate::riir::range::RangeVec;
 use crate::riir::variants::{MAX_SEQ_LEN, VARIANT, Variant};
 
 /// Clamp a requested context length to `[1, MAX_SEQ_LEN]`. Every KV
@@ -546,16 +547,27 @@ impl LayerState {
 ///
 /// `n_ctx` sizes every KV cache (clamped to `[1, MAX_SEQ_LEN]`).
 pub fn alloc_layer_states(n_ctx: usize) -> Vec<LayerState> {
+    (0..VARIANT.num_layers).map(|i| new_layer_state(i, n_ctx)).collect()
+}
+
+/// Per-layer state of one sequence, indexed by global layer index and
+/// holding only the context's layer range (plan phase 3).
+pub type LayerStates = RangeVec<LayerState>;
+
+/// [`alloc_layer_states`] for the layers in `range` only.
+pub fn alloc_layer_states_range(n_ctx: usize, range: std::ops::Range<usize>) -> LayerStates {
+    RangeVec::from_fn(range, |i| new_layer_state(i, n_ctx))
+}
+
+fn new_layer_state(i: usize, n_ctx: usize) -> LayerState {
     use crate::riir::variants::{AttnKind, LayerKind};
-    (0..VARIANT.num_layers)
-        .map(|i| match VARIANT.layer_kind(i) {
-            LayerKind::FullAttn => match VARIANT.attn_kind {
-                AttnKind::Gqa => LayerState::FullAttn(KvCache::new(n_ctx)),
-                AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new(n_ctx)),
-            },
-            LayerKind::LinearAttn => LayerState::LinearAttn(LinearAttnState::new()),
-        })
-        .collect()
+    match VARIANT.layer_kind(i) {
+        LayerKind::FullAttn => match VARIANT.attn_kind {
+            AttnKind::Gqa => LayerState::FullAttn(KvCache::new(n_ctx)),
+            AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new(n_ctx)),
+        },
+        LayerKind::LinearAttn => LayerState::LinearAttn(LinearAttnState::new()),
+    }
 }
 
 /// Reset every layer's state to empty. Mirrors `mf_state_clear_all`
@@ -619,6 +631,19 @@ pub fn pos_max(layers: &[LayerState]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A range holds exactly its layers' states, kinds matching the
+    /// whole-model allocation.
+    #[test]
+    fn range_states_match_full_allocation() {
+        let n = VARIANT.num_layers;
+        let full = alloc_layer_states(64);
+        let part = alloc_layer_states_range(64, n / 2..n);
+        assert_eq!(part.len(), n - n / 2);
+        for (i, s) in part.iter_global() {
+            assert_eq!(s.is_full(), full[i].is_full(), "layer {i}");
+        }
+    }
 
     /// Every full-attn layer is sized to the requested `n_ctx`;
     /// linear-attn layers carry no KV capacity.

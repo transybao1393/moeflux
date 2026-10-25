@@ -35,6 +35,8 @@
 
 use metal::{Buffer, CommandBufferRef, ComputePipelineState, MTLSize, NSUInteger};
 
+use crate::riir::range::RangeVec;
+
 /// Process-wide cache for `MOEFLUX_MOE_GATHER_ID`. Routes the
 /// batched MoE block through `Op::MoeGatherIdFuse` (the one-
 /// dispatch `gather_mm_id.metal` kernel ported from llama.cpp)
@@ -220,9 +222,11 @@ pub struct LayerForwardBuffers {
     pub gate_logits: BufId<RouterLogitsBuf>,
     pub shared_gate: BufId<SharedGateBuf>,
     pub o_proj_stack: BufId<OProjOutBuf>,
-    /// Per-linear-layer recurrence state.
-    pub conv_state: Vec<BufId<ConvStateBuf>>,
-    pub delta_state: Vec<BufId<DeltaStateBuf>>,
+    /// Per-linear-layer recurrence state, indexed by linear-layer
+    /// index ([`linear_layer_idx_for`]). Holds only the context's
+    /// layer range (plan phase 3).
+    pub conv_state: RangeVec<BufId<ConvStateBuf>>,
+    pub delta_state: RangeVec<BufId<DeltaStateBuf>>,
     /// Scratch for one layer's linear-attn pipeline (reused across
     /// layers).
     pub conv_output: BufId<ConvOutBuf>,
@@ -641,6 +645,12 @@ impl LayerForwardBuffers {
     /// so the recurrence buffers (`conv_state` / `delta_state`) start
     /// at zero — matching the C `metal_setup` calloc semantics.
     pub fn new(pool: &mut MetalBufferPool) -> Self {
+        Self::new_for_range(pool, 0..VARIANT.num_layers)
+    }
+
+    /// [`Self::new`] allocating recurrence state only for the
+    /// linear-attn layers in `range` (plan phase 3).
+    pub fn new_for_range(pool: &mut MetalBufferPool, range: std::ops::Range<usize>) -> Self {
         let v = VARIANT;
         let f32_bytes = |n: usize| n * std::mem::size_of::<f32>();
         let q_dim_full = v.num_attn_heads * v.head_dim;
@@ -651,29 +661,7 @@ impl LayerForwardBuffers {
         // (`q_dim_full`) attention output. Pick max so either fits.
         let oproj_in_max = v.linear_total_value().max(q_dim_full);
 
-        let num_linear = v.num_layers - num_full_attn_layers(&v);
-        let conv_state: Vec<BufId<ConvStateBuf>> = (0..num_linear)
-            .map(|_| {
-                pool.alloc(
-                    f32_bytes((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()),
-                    "lfb.conv_state",
-                    true,
-                )
-                .expect("LayerForwardBuffers::new pool alloc")
-            })
-            .collect();
-        let delta_state: Vec<BufId<DeltaStateBuf>> = (0..num_linear)
-            .map(|_| {
-                pool.alloc(
-                    f32_bytes(
-                        v.linear_num_v_heads * Variant::LINEAR_VALUE_DIM * Variant::LINEAR_KEY_DIM,
-                    ),
-                    "lfb.delta_state",
-                    true,
-                )
-                .expect("LayerForwardBuffers::new pool alloc")
-            })
-            .collect();
+        let (conv_state, delta_state) = alloc_recurrence(pool, &range);
 
         Self {
             input: pool
@@ -795,14 +783,54 @@ impl LayerForwardBuffers {
     /// the host-side state vector (which today the GPU doesn't read,
     /// so this is the source of truth on the GPU side).
     pub fn reset_recurrence(&self, pool: &MetalBufferPool) {
-        for &id in &self.conv_state {
-            zero_f32_buffer(pool.handle(id));
-        }
-        for &id in &self.delta_state {
-            zero_f32_buffer(pool.handle(id));
-        }
+        reset_recurrence_ids(pool, &self.conv_state, &self.delta_state);
     }
 
+}
+
+/// Allocate zeroed conv + delta recurrence buffers for the linear-attn
+/// layers in `range`, indexed by linear-layer index. Persistent pool
+/// allocations.
+pub fn alloc_recurrence(
+    pool: &mut MetalBufferPool,
+    range: &std::ops::Range<usize>,
+) -> (RangeVec<BufId<ConvStateBuf>>, RangeVec<BufId<DeltaStateBuf>>) {
+    let v = VARIANT;
+    let f32_bytes = |n: usize| n * std::mem::size_of::<f32>();
+    let span = crate::riir::range::linear_span(range);
+    let conv_state = RangeVec::from_fn(span.clone(), |_| {
+        pool.alloc(
+            f32_bytes((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()),
+            "lfb.conv_state",
+            true,
+        )
+        .expect("LayerForwardBuffers::new pool alloc")
+    });
+    let delta_state = RangeVec::from_fn(span, |_| {
+        pool.alloc(
+            f32_bytes(v.linear_num_v_heads * Variant::LINEAR_VALUE_DIM * Variant::LINEAR_KEY_DIM),
+            "lfb.delta_state",
+            true,
+        )
+        .expect("LayerForwardBuffers::new pool alloc")
+    });
+    (conv_state, delta_state)
+}
+
+/// Zero a set of recurrence buffers (see
+/// [`LayerForwardBuffers::reset_recurrence`]); same no-GPU-in-flight
+/// contract.
+pub fn reset_recurrence_ids(
+    pool: &MetalBufferPool,
+    conv_state: &RangeVec<BufId<ConvStateBuf>>,
+    delta_state: &RangeVec<BufId<DeltaStateBuf>>,
+) {
+    for &id in conv_state.iter() {
+        zero_f32_buffer(pool.handle(id));
+    }
+    for &id in delta_state.iter() {
+        zero_f32_buffer(pool.handle(id));
+    }
 }
 
 /// Zero every byte of a shared-storage Metal buffer. Used by
@@ -848,10 +876,6 @@ pub fn full_attn_layer_idx_for(layer_idx: usize) -> Option<usize> {
     } else {
         None
     }
-}
-
-pub(in crate::riir) fn num_full_attn_layers(v: &Variant) -> usize {
-    v.num_layers / v.full_attn_interval
 }
 
 /// Per-tensor bit-width lookup for the matvec dispatcher. Defaults to

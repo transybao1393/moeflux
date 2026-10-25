@@ -58,6 +58,13 @@ pub struct OpenConfig {
     /// [`crate::riir::RsCtx::save_routing_profile`]). Most-picked
     /// experts are loaded first.
     pub hot_tier_profile: Option<std::path::PathBuf>,
+    /// Contiguous layer range this context runs (plan phase 3, mode B).
+    /// `None` (default) = the whole model. `Some(a..b)` loads, plans and
+    /// runs only layers `a..b`; the embedding exists only when `a == 0`
+    /// and the final norm + LM head only when `b == num_layers`. Drive a
+    /// partial range with [`crate::riir::RsCtx::eval_stage`]; the
+    /// whole-model `eval_prompt` / `eval_token` need the full range.
+    pub layer_range: Option<std::ops::Range<usize>>,
 }
 
 impl Default for OpenConfig {
@@ -70,6 +77,7 @@ impl Default for OpenConfig {
             runtime_overhead: DEFAULT_RUNTIME_OVERHEAD,
             hot_tier_bytes: None,
             hot_tier_profile: None,
+            layer_range: None,
         }
     }
 }
@@ -97,7 +105,17 @@ impl OpenConfig {
                     .into(),
             );
         }
+        if let Some(r) = &self.layer_range {
+            crate::riir::range::validate(r)?;
+        }
         Ok(())
+    }
+
+    /// The layer range to run: [`Self::layer_range`] or the whole model.
+    pub fn resolved_layer_range(&self) -> std::ops::Range<usize> {
+        self.layer_range
+            .clone()
+            .unwrap_or_else(crate::riir::range::full_range)
     }
 }
 
@@ -134,5 +152,17 @@ mod tests {
         assert!(c.validate().is_err());
         let ok = OpenConfig { expert_io: Some(ExpertIoMode::Pread), ..c };
         assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn layer_range_validated() {
+        let n = crate::riir::variants::VARIANT.num_layers;
+        let c = OpenConfig { layer_range: Some(0..n), ..OpenConfig::default() };
+        assert!(c.validate().is_ok());
+        assert_eq!(OpenConfig::default().resolved_layer_range(), 0..n);
+        let empty = OpenConfig { layer_range: Some(3..3), ..OpenConfig::default() };
+        assert!(empty.validate().is_err());
+        let past = OpenConfig { layer_range: Some(1..n + 1), ..OpenConfig::default() };
+        assert!(past.validate().is_err());
     }
 }

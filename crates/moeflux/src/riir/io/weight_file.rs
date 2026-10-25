@@ -79,10 +79,112 @@ pub struct TensorInfo {
 /// (slice view into the mmap, lives as long as `&self`).
 pub struct WeightFile {
     backing: Backing,
-    /// Bytes of weight data (the file length). The backing may be
-    /// longer (owned copies are rounded up to a 16 KiB page).
+    /// Bytes of weight data (the file length, or the compacted length
+    /// of a filtered owned copy). The backing may be longer (owned
+    /// copies are rounded up to a 16 KiB page).
     len: usize,
     tensors: HashMap<String, TensorInfo>,
+    /// Shape facts from the whole manifest, before any filter — what
+    /// the variant guard checks.
+    probe: ManifestProbe,
+}
+
+/// Shape facts read from the whole manifest at open, before a tensor
+/// filter drops anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManifestProbe {
+    /// Highest `model.layers.{N}` index, if any layer tensor exists.
+    pub top_layer: Option<usize>,
+    /// Element count of `model.layers.0.input_layernorm.weight`.
+    pub hidden_dim: Option<usize>,
+}
+
+impl ManifestProbe {
+    fn of(tensors: &HashMap<String, TensorInfo>) -> Self {
+        let top_layer = tensors
+            .keys()
+            .filter_map(|name| {
+                name.strip_prefix("model.layers.")?
+                    .split('.')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max();
+        let hidden_dim = tensors
+            .get("model.layers.0.input_layernorm.weight")
+            .map(|info| info.shape.iter().product::<usize>());
+        Self { top_layer, hidden_dim }
+    }
+}
+
+/// Predicate selecting which manifest tensors a context loads.
+pub type TensorFilter<'a> = &'a dyn Fn(&str) -> bool;
+
+/// One contiguous run of the file copied into a compacted owned
+/// backing: `len` bytes from file offset `src` to backing offset
+/// `dst`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopySpan {
+    pub src: u64,
+    pub dst: u64,
+    pub len: u64,
+}
+
+/// Gap below which two kept tensors are read as one span (the bytes in
+/// between are copied too, saving a syscall).
+const MERGE_GAP: u64 = 64 << 10;
+
+/// Lay out the tensors of `tensors` compactly: merge neighbours into
+/// spans, place each span at a 16 KiB page boundary plus its original
+/// in-page offset (so every tensor keeps its alignment), and rewrite
+/// each tensor's `offset` to its place in the compacted backing.
+/// Returns the spans and the compacted length.
+pub fn compact_layout(tensors: &mut HashMap<String, TensorInfo>) -> (Vec<CopySpan>, u64) {
+    let page = PAGE as u64;
+    let mut order: Vec<(u64, u64, String)> = tensors
+        .iter()
+        .map(|(n, t)| (t.offset, t.offset + t.size, n.clone()))
+        .collect();
+    order.sort();
+    // (src_start, src_end) per span, then each tensor's span index.
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut span_of: Vec<usize> = Vec::with_capacity(order.len());
+    for (start, end, _) in &order {
+        match runs.last_mut() {
+            Some(r) if *start <= r.1 + MERGE_GAP => r.1 = r.1.max(*end),
+            _ => runs.push((*start, *end)),
+        }
+        span_of.push(runs.len() - 1);
+    }
+    let mut spans = Vec::with_capacity(runs.len());
+    let mut cursor = 0u64;
+    for &(start, end) in &runs {
+        let dst = cursor.div_ceil(page) * page + start % page;
+        spans.push(CopySpan { src: start, dst, len: end - start });
+        cursor = dst + (end - start);
+    }
+    for ((start, _, name), &si) in order.iter().zip(&span_of) {
+        let sp = spans[si];
+        tensors.get_mut(name).expect("name from map").offset = sp.dst + (start - sp.src);
+    }
+    (spans, cursor)
+}
+
+/// Bytes a filtered [`WeightLoad::ReadNoCache`] copy of `manifest`
+/// occupies (page-rounded). With no filter, the file length.
+pub fn filtered_bytes(
+    bin_path: &Path,
+    manifest_path: &Path,
+    keep: Option<TensorFilter<'_>>,
+) -> Result<u64, WeightFileError> {
+    let Some(keep) = keep else {
+        return Ok(std::fs::metadata(bin_path)?.len());
+    };
+    let mut tensors = parse_manifest(manifest_path)?;
+    tensors.retain(|n, _| keep(n));
+    let (_, len) = compact_layout(&mut tensors);
+    Ok((len as usize).div_ceil(PAGE).max(1) as u64 * PAGE as u64)
 }
 
 /// How [`WeightFile`] holds the blob.
@@ -121,21 +223,34 @@ const PAGE: usize = 16384;
 /// Read all of `file` into a fresh anonymous mapping with the page
 /// cache disabled for this fd.
 fn read_nocache(file: &File, len: usize) -> Result<MmapMut, std::io::Error> {
+    read_spans_nocache(file, &[CopySpan { src: 0, dst: 0, len: len as u64 }], len)
+}
+
+/// Read each span of `file` into a fresh anonymous mapping of `len`
+/// bytes (page-rounded), with the page cache disabled for this fd.
+fn read_spans_nocache(
+    file: &File,
+    spans: &[CopySpan],
+    len: usize,
+) -> Result<MmapMut, std::io::Error> {
     use std::os::unix::fs::FileExt;
     set_nocache(file)?;
     let mut buf = MmapMut::map_anon(len.div_ceil(PAGE).max(1) * PAGE)?;
     const CHUNK: usize = 64 << 20;
-    let mut off = 0;
-    while off < len {
-        let end = (off + CHUNK).min(len);
-        let n = file.read_at(&mut buf[off..end], off as u64)?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!("weights file ended at {off} of {len} bytes"),
-            ));
+    for sp in spans {
+        let (src, dst, n) = (sp.src as usize, sp.dst as usize, sp.len as usize);
+        let mut off = 0;
+        while off < n {
+            let end = (off + CHUNK).min(n);
+            let got = file.read_at(&mut buf[dst + off..dst + end], (src + off) as u64)?;
+            if got == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!("weights file ended at {} (span of {n} bytes at {src})", src + off),
+                ));
+            }
+            off += got;
         }
-        off += n;
     }
     Ok(buf)
 }
@@ -167,27 +282,61 @@ impl WeightFile {
         manifest_path: &Path,
         load: WeightLoad,
     ) -> Result<Self, WeightFileError> {
+        Self::open_filtered(bin_path, manifest_path, load, None)
+    }
+
+    /// [`Self::open_with`] keeping only the tensors `keep` accepts
+    /// (plan phase 3: a layer range loads only its layers). `None`
+    /// keeps everything.
+    ///
+    /// With [`WeightLoad::ReadNoCache`] only the kept tensors are read,
+    /// into a compacted owned copy ([`compact_layout`]); their offsets
+    /// are rewritten to match, so every consumer that resolves offsets
+    /// through the manifest sees a consistent view. With
+    /// [`WeightLoad::Mmap`] offsets stay file offsets — dropped tensors
+    /// are simply never touched.
+    pub fn open_filtered(
+        bin_path: &Path,
+        manifest_path: &Path,
+        load: WeightLoad,
+        keep: Option<TensorFilter<'_>>,
+    ) -> Result<Self, WeightFileError> {
         let file = File::open(bin_path)?;
-        let len = file.metadata()?.len() as usize;
-        let backing = match load {
+        let file_len = file.metadata()?.len() as usize;
+        let mut tensors = parse_manifest(manifest_path)?;
+        let probe = ManifestProbe::of(&tensors);
+        // Bounds-check the whole manifest against the file first, so a
+        // compacted layout is built from valid spans.
+        check_bounds(&tensors, file_len as u64)?;
+        if let Some(keep) = keep {
+            tensors.retain(|n, _| keep(n));
+        }
+        let (backing, len) = match (load, keep.is_some()) {
             // SAFETY: mmap of a regular file we just opened. The file
             // descriptor is closed when `file` drops (after Mmap takes
             // ownership of the mapping). On Linux/macOS a `MAP_PRIVATE`
             // mmap stays valid until munmap regardless of fd state.
-            WeightLoad::Mmap => Backing::Mmap(unsafe { Mmap::map(&file)? }),
-            WeightLoad::ReadNoCache => Backing::Owned(read_nocache(&file, len)?),
+            (WeightLoad::Mmap, _) => (Backing::Mmap(unsafe { Mmap::map(&file)? }), file_len),
+            (WeightLoad::ReadNoCache, false) => {
+                (Backing::Owned(read_nocache(&file, file_len)?), file_len)
+            }
+            (WeightLoad::ReadNoCache, true) => {
+                let (spans, len) = compact_layout(&mut tensors);
+                let len = len as usize;
+                (Backing::Owned(read_spans_nocache(&file, &spans, len)?), len)
+            }
         };
-        let tensors = parse_manifest(manifest_path)?;
-        let wf = WeightFile { backing, len, tensors };
+        let wf = WeightFile { backing, len, tensors, probe };
         wf.bounds_check_all()?;
         eprintln!(
-            "[weights] {} {:.2} GB from {}",
+            "[weights] {} {:.2} GB from {}{}",
             match load {
                 WeightLoad::Mmap => "mmap'd",
                 WeightLoad::ReadNoCache => "read (F_NOCACHE)",
             },
             wf.len as f64 / 1e9,
-            bin_path.display()
+            bin_path.display(),
+            if keep.is_some() { " (filtered)" } else { "" }
         );
         eprintln!(
             "[manifest] Loaded {} tensors from {}",
@@ -197,9 +346,15 @@ impl WeightFile {
         Ok(wf)
     }
 
-    /// Total bytes in the mmap'd file.
+    /// Total bytes in the mmap'd file (or in the compacted copy of a
+    /// filtered load).
     pub fn file_size(&self) -> usize {
         self.len
+    }
+
+    /// Shape facts from the whole manifest, before any filter.
+    pub fn probe(&self) -> ManifestProbe {
+        self.probe
     }
 
     /// Number of tensors in the manifest.
@@ -257,20 +412,26 @@ impl WeightFile {
     /// — a typical forward pass walks ~1400 tensors per token, the
     /// per-call branch matters in the hot loop.
     fn bounds_check_all(&self) -> Result<(), WeightFileError> {
-        let file_size = self.len as u64;
-        for (name, info) in &self.tensors {
-            let end = info.offset.saturating_add(info.size);
-            if end > file_size {
-                return Err(WeightFileError::OutOfBounds {
-                    name: name.clone(),
-                    offset: info.offset,
-                    end,
-                    file_size,
-                });
-            }
-        }
-        Ok(())
+        check_bounds(&self.tensors, self.len as u64)
     }
+}
+
+fn check_bounds(
+    tensors: &HashMap<String, TensorInfo>,
+    file_size: u64,
+) -> Result<(), WeightFileError> {
+    for (name, info) in tensors {
+        let end = info.offset.saturating_add(info.size);
+        if end > file_size {
+            return Err(WeightFileError::OutOfBounds {
+                name: name.clone(),
+                offset: info.offset,
+                end,
+                file_size,
+            });
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Debug for WeightFile {
@@ -362,6 +523,73 @@ mod tests {
         }
         assert_eq!(o.tensor_bytes("tail").unwrap(), &data[PAGE * 3..]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A filtered `ReadNoCache` load reads only the kept tensors into a
+    /// compacted copy, byte-identical to the mmap'd originals, each at
+    /// its original in-page alignment.
+    #[test]
+    fn filtered_load_compacts_and_matches_mmap() {
+        let dir = std::env::temp_dir().join(format!("moeflux-wff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("w.bin");
+        let manifest = dir.join("w.json");
+        let len = PAGE * 40;
+        let data: Vec<u8> = (0..len).map(|i| (i * 17 % 253) as u8).collect();
+        std::fs::write(&bin, &data).unwrap();
+        // keep_a / keep_b are far apart (two spans); drop_mid sits
+        // between them and is skipped.
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{"tensors": {{
+                    "keep_a": {{"offset": 100, "size": 5000, "shape": [5000], "dtype": "U8"}},
+                    "drop_mid": {{"offset": {m}, "size": 4096, "shape": [4096], "dtype": "U8"}},
+                    "keep_b": {{"offset": {b}, "size": 777, "shape": [777], "dtype": "U8"}}
+                }}}}"#,
+                m = PAGE * 10,
+                b = PAGE * 30 + 64
+            ),
+        )
+        .unwrap();
+        let keep = |n: &str| n.starts_with("keep");
+        let m = WeightFile::open_with(&bin, &manifest, WeightLoad::Mmap).unwrap();
+        let f = WeightFile::open_filtered(&bin, &manifest, WeightLoad::ReadNoCache, Some(&keep))
+            .unwrap();
+        assert!(f.tensor_info("drop_mid").is_none());
+        assert!(f.file_size() < PAGE * 3, "compacted to {}", f.file_size());
+        for name in ["keep_a", "keep_b"] {
+            assert_eq!(m.tensor_bytes(name), f.tensor_bytes(name), "{name}");
+            let mo = m.tensor_info(name).unwrap().offset;
+            let fo = f.tensor_info(name).unwrap().offset;
+            assert_eq!(mo % PAGE as u64, fo % PAGE as u64, "{name} alignment");
+        }
+        assert_eq!(f.probe(), m.probe());
+        let planned = filtered_bytes(&bin, &manifest, Some(&keep)).unwrap();
+        assert_eq!(planned as usize, f.file_size().div_ceil(PAGE) * PAGE);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Neighbouring tensors merge into one span; distant ones don't.
+    #[test]
+    fn compact_layout_merges_close_tensors() {
+        let t = |offset: u64, size: u64| TensorInfo {
+            offset,
+            size,
+            shape: vec![size as usize],
+            dtype: "U8".into(),
+            bits: 0,
+        };
+        let mut m: HashMap<String, TensorInfo> = HashMap::new();
+        m.insert("a".into(), t(0, 1000));
+        m.insert("b".into(), t(1000 + 10, 500));
+        m.insert("c".into(), t(10 << 20, 300));
+        let (spans, len) = compact_layout(&mut m);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(m["a"].offset, 0);
+        assert_eq!(m["b"].offset, 1010);
+        assert_eq!(m["c"].offset % PAGE as u64, (10u64 << 20) % PAGE as u64);
+        assert_eq!(len, m["c"].offset + 300);
     }
 
     /// Manifest parser handles the documented schema, including

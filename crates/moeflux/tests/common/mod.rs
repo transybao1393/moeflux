@@ -6,3 +6,5 @@
 //! test scaffolding.
 
 pub mod diff_helpers;
+
+pub mod fake_model;

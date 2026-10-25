@@ -236,11 +236,27 @@ impl ExpertFiles {
     /// - `nocache = true` sets `F_NOCACHE` on every layer fd, so expert
     ///   reads never grow the page cache. Used under a hard memory cap.
     pub fn open_with(experts_dir: &Path, mmap: bool, nocache: bool) -> Result<Self, ExpertIoError> {
+        Self::open_range(experts_dir, mmap, nocache, 0..VARIANT.num_layers)
+    }
+
+    /// [`Self::open_with`] opening only the layer files in `range`
+    /// (plan phase 3). Slots outside it stay `None`, exactly like a
+    /// missing file; nothing in this context dispatches them.
+    pub fn open_range(
+        experts_dir: &Path,
+        mmap: bool,
+        nocache: bool,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
         let subdir = experts_dir.join("packed_experts");
         let mut layers = Vec::with_capacity(v.num_layers);
         let mut mmap_layers: Vec<Option<Mmap>> = (0..v.num_layers).map(|_| None).collect();
         for i in 0..v.num_layers {
+            if !range.contains(&i) {
+                layers.push(None);
+                continue;
+            }
             let path = subdir.join(format!("layer_{i:02}.bin"));
             match File::open(&path) {
                 Ok(f) => {

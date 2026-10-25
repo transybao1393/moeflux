@@ -21,6 +21,13 @@
 //!   - Linear-attn layer: `linear_conv_bytes` of conv_state then
 //!     `linear_ssm_bytes` of ssm_state.
 //!
+//! - **v3 — layer range** (plan phase 3): a context running layers
+//!   `a..b` of the model writes the v2 header plus two trailing words
+//!   `layer_start = a`, `layer_end = b`, and a body for those layers
+//!   only. A whole-model context still writes v2, byte-identical to
+//!   before. A range context loads only a v3 snapshot of the same
+//!   range.
+//!
 //! The Rust port uses GPU buffers as the canonical store for the
 //! linear-attn recurrence (`linear_buffers.conv_state[i]` /
 //! `delta_state[i]`); save reads them back, load memcpys into them.
@@ -43,7 +50,7 @@ use metal::{Buffer, Device};
 
 use crate::riir::attn::linear_attn_forward::{LayerForwardBuffers, linear_layer_idx_for};
 use crate::riir::moe::deferred;
-use crate::riir::snapshot::state::{LayerState, MlaKvCacheGpu};
+use crate::riir::snapshot::state::{LayerState, LayerStates, MlaKvCacheGpu};
 use crate::riir::variants::{AttnKind, LayerKind, VARIANT, Variant};
 
 /// `'MFLX'` little-endian. Wire-compatible with the C side's
@@ -61,6 +68,10 @@ pub const SNAPSHOT_MAGIC: u32 = 0x4D464C58;
 ///   8 words). Loader accepts v1 for backward compat with Qwen
 ///   variants.
 pub const SNAPSHOT_VERSION: u32 = 2;
+/// Format version written by a layer-range context (v2 + range words).
+pub const SNAPSHOT_VERSION_RANGE: u32 = 3;
+/// v3 header size: v2 plus `layer_start`, `layer_end`.
+pub const SNAPSHOT_HEADER_V3_U32: usize = 12;
 /// Header is exactly this many `u32` fields. Mirrors C
 /// `MF_SNAPSHOT_HEADER_U32`. **v2 adds two trailing words**:
 /// `kv_lora_rank` and `qk_rope_head_dim`.
@@ -176,13 +187,23 @@ fn ensure_mla_buffers(cache: &mut MlaKvCacheGpu, device: &Device) {
 /// **v2** (cogito-v2 full-GPU plan, Phase 7): MLA layers are now
 /// supported — per-layer body is `i32 len + len × kv_lora_rank × 4`
 /// latent bytes + `len × qk_rope_head_dim × 4` rope-K bytes.
-pub fn state_size(layer_states: &[LayerState]) -> usize {
+/// Header words for a snapshot of `layer_states`: v2 for the whole
+/// model, v3 for a layer range.
+fn header_words_for(layer_states: &LayerStates) -> usize {
+    if crate::riir::range::is_full(&layer_states.span()) {
+        SNAPSHOT_HEADER_U32
+    } else {
+        SNAPSHOT_HEADER_V3_U32
+    }
+}
+
+pub fn state_size(layer_states: &LayerStates) -> usize {
     let v = VARIANT;
-    let mut n = SNAPSHOT_HEADER_U32 * std::mem::size_of::<u32>();
+    let mut n = header_words_for(layer_states) * std::mem::size_of::<u32>();
     let fa_stride = full_attn_stride_bytes(&v);
     let la_conv = linear_conv_bytes(&v);
     let la_ssm = linear_ssm_bytes(&v);
-    for (i, layer) in layer_states.iter().enumerate().take(v.num_layers) {
+    for (i, layer) in layer_states.iter_global() {
         match v.layer_kind(i) {
             LayerKind::FullAttn => {
                 n += std::mem::size_of::<i32>();
@@ -218,7 +239,7 @@ pub fn state_size(layer_states: &[LayerState]) -> usize {
 /// first.
 pub fn state_save(
     buf: &mut [u8],
-    layer_states: &[LayerState],
+    layer_states: &LayerStates,
     linear_buffers: Option<&LayerForwardBuffers>,
     pool: Option<&crate::riir::backend::MetalBufferPool>,
 ) -> Result<usize, StateSnapshotError> {
@@ -238,10 +259,16 @@ pub fn state_save(
 
     let mut off = 0usize;
 
-    // Header (v2 — 10 u32 fields).
-    let header: [u32; SNAPSHOT_HEADER_U32] = [
+    // Header (v2 — 10 u32 fields; v3 adds the layer range).
+    let span = layer_states.span();
+    let words = header_words_for(layer_states);
+    let header: [u32; SNAPSHOT_HEADER_V3_U32] = [
         SNAPSHOT_MAGIC,
-        SNAPSHOT_VERSION,
+        if words == SNAPSHOT_HEADER_U32 {
+            SNAPSHOT_VERSION
+        } else {
+            SNAPSHOT_VERSION_RANGE
+        },
         v.num_layers as u32,
         v.full_attn_interval as u32,
         v.num_kv_heads as u32,
@@ -250,14 +277,16 @@ pub fn state_save(
         la_ssm as u32,
         v.kv_lora_rank as u32,
         v.qk_rope_head_dim as u32,
+        span.start as u32,
+        span.end as u32,
     ];
-    for &word in header.iter() {
+    for &word in header[..words].iter() {
         buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
         off += 4;
     }
 
     // Per-layer body.
-    for (i, layer) in layer_states.iter().enumerate().take(v.num_layers) {
+    for (i, layer) in layer_states.iter_global() {
         match v.layer_kind(i) {
             LayerKind::FullAttn => match (v.attn_kind, layer) {
                 (AttnKind::Gqa, LayerState::FullAttn(kv)) => {
@@ -339,7 +368,7 @@ pub fn state_save(
 /// mutated; restore then performs the writes.
 pub fn state_load(
     buf: &[u8],
-    layer_states: &mut [LayerState],
+    layer_states: &mut LayerStates,
     mut linear_buffers: Option<&mut LayerForwardBuffers>,
     pool: Option<&crate::riir::backend::MetalBufferPool>,
     device: &Device,
@@ -369,6 +398,7 @@ pub fn state_load(
     let header_words = match version {
         1 => SNAPSHOT_HEADER_V1_U32,
         2 => SNAPSHOT_HEADER_U32,
+        3 => SNAPSHOT_HEADER_V3_U32,
         _ => {
             return Err(StateSnapshotError::BadVersion {
                 got: version,
@@ -409,9 +439,31 @@ pub fn state_load(
     let la_ssm = linear_ssm_bytes(&v);
     check(24, "linear_conv_bytes", la_conv as u32)?;
     check(28, "linear_ssm_bytes", la_ssm as u32)?;
-    if version == 2 {
+    if version >= 2 {
         check(32, "kv_lora_rank", v.kv_lora_rank as u32)?;
         check(36, "qk_rope_head_dim", v.qk_rope_head_dim as u32)?;
+    }
+    // Layer range: v1/v2 snapshots cover the whole model; v3 names its
+    // range, which must be exactly this context's.
+    let span = layer_states.span();
+    let (snap_start, snap_end) = if version == 3 {
+        (read_u32(40), read_u32(44))
+    } else {
+        (0, v.num_layers as u32)
+    };
+    if snap_start != span.start as u32 {
+        return Err(StateSnapshotError::ShapeMismatch {
+            field: "layer_start",
+            got: snap_start,
+            want: span.start as u32,
+        });
+    }
+    if snap_end != span.end as u32 {
+        return Err(StateSnapshotError::ShapeMismatch {
+            field: "layer_end",
+            got: snap_end,
+            want: span.end as u32,
+        });
     }
 
     let fa_stride = full_attn_stride_bytes(&v);
@@ -422,7 +474,7 @@ pub fn state_load(
     // infer.m:8629..8649.
     {
         let mut q = header_bytes;
-        for i in 0..v.num_layers {
+        for i in span.clone() {
             match v.layer_kind(i) {
                 LayerKind::FullAttn => {
                     if buf.len() - q < 4 {
@@ -477,7 +529,7 @@ pub fn state_load(
 
     // Preflight ok — restore.
     let mut off = header_bytes;
-    for i in 0..v.num_layers {
+    for i in span {
         match v.layer_kind(i) {
             LayerKind::FullAttn => {
                 let len = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());

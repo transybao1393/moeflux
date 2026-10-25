@@ -19,6 +19,8 @@
 //! mmap-direct); `F_NOCACHE` reads that keep them out of the page
 //! cache are part of the same plan (`docs/fork-upgrade-plan.md`).
 
+use std::ops::Range;
+
 use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::moe::expert_forward::MAX_K;
 use crate::riir::variants::{AttnKind, LayerKind, VARIANT, Variant};
@@ -78,8 +80,14 @@ fn round_up(x: u64, to: u64) -> u64 {
 
 /// KV bytes per position summed over every full-attn layer.
 pub fn kv_bytes_per_token(v: Variant) -> u64 {
+    kv_bytes_per_token_in(v, &(0..v.num_layers))
+}
+
+/// [`kv_bytes_per_token`] over the full-attn layers in `range` only.
+pub fn kv_bytes_per_token_in(v: Variant, range: &Range<usize>) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
-    let full_layers = (0..v.num_layers)
+    let full_layers = range
+        .clone()
         .filter(|&i| v.layer_kind(i) == LayerKind::FullAttn)
         .count() as u64;
     let per_layer = match v.attn_kind {
@@ -91,8 +99,14 @@ pub fn kv_bytes_per_token(v: Variant) -> u64 {
 
 /// Linear-attn state bytes (host `LinearAttnState` + GPU mirror).
 pub fn linear_state_bytes(v: Variant) -> u64 {
+    linear_state_bytes_in(v, &(0..v.num_layers))
+}
+
+/// [`linear_state_bytes`] over the linear-attn layers in `range` only.
+pub fn linear_state_bytes_in(v: Variant, range: &Range<usize>) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
-    let linear_layers = (0..v.num_layers)
+    let linear_layers = range
+        .clone()
         .filter(|&i| v.layer_kind(i) == LayerKind::LinearAttn)
         .count() as u64;
     let conv = ((Variant::CONV_KERNEL_SIZE - 1) * v.linear_conv_dim()) as u64;
@@ -111,6 +125,26 @@ impl BudgetPlan {
         weights_bytes: u64,
         runtime_overhead: u64,
     ) -> Self {
+        Self::for_range(
+            n_ctx,
+            mode,
+            weights_bytes,
+            runtime_overhead,
+            &(0..VARIANT.num_layers),
+        )
+    }
+
+    /// [`Self::for_config`] for a context running only the layers in
+    /// `range` (plan phase 3): KV and linear-attn state count only
+    /// those layers; `weights_bytes` is what the context loads for
+    /// them.
+    pub fn for_range(
+        n_ctx: usize,
+        mode: ExpertIoMode,
+        weights_bytes: u64,
+        runtime_overhead: u64,
+        range: &Range<usize>,
+    ) -> Self {
         let v = VARIANT;
         let expert = v.expert_size_4bit() as u64;
         // `MoeBuffers::new`: MAX_K synced + 2 × MAX_K prefetch slots.
@@ -123,8 +157,8 @@ impl BudgetPlan {
         Self {
             entries: vec![
                 (Account::Weights, weights_bytes),
-                (Account::Kv, kv_bytes_per_token(v) * n_ctx as u64),
-                (Account::LinearState, linear_state_bytes(v)),
+                (Account::Kv, kv_bytes_per_token_in(v, range) * n_ctx as u64),
+                (Account::LinearState, linear_state_bytes_in(v, range)),
                 (Account::ExpertSlots, slots),
                 (Account::PrefillStaging, staging),
                 (Account::RuntimeOverhead, runtime_overhead),
@@ -262,6 +296,23 @@ mod tests {
     #[test]
     fn a3b_kv_per_token_is_40_kib() {
         assert_eq!(kv_bytes_per_token(VARIANT), 40 * 1024);
+    }
+
+    /// A split's per-range KV and linear state add up to the whole
+    /// model's.
+    #[test]
+    fn range_accounts_partition_the_model() {
+        let n = VARIANT.num_layers;
+        let full = BudgetPlan::for_config(512, ExpertIoMode::Pread, 0, 0);
+        let cuts = [0, n / 2, n * 3 / 4, n];
+        let (mut kv, mut lin) = (0, 0);
+        for w in cuts.windows(2) {
+            let p = BudgetPlan::for_range(512, ExpertIoMode::Pread, 0, 0, &(w[0]..w[1]));
+            kv += p.get(Account::Kv);
+            lin += p.get(Account::LinearState);
+        }
+        assert_eq!(kv, full.get(Account::Kv));
+        assert_eq!(lin, full.get(Account::LinearState));
     }
 
     #[test]

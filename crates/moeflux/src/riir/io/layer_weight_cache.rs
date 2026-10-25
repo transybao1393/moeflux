@@ -255,4 +255,19 @@ impl LayerWeightCache {
             .map(|i| Self::build(i, wf, wf_buf))
             .collect()
     }
+
+    /// Build a cache for every layer in `range`, indexed by global
+    /// layer index (plan phase 3). Only the range's tensors need to be
+    /// in the manifest.
+    pub fn build_range(
+        range: std::ops::Range<usize>,
+        wf: &WeightFile,
+        wf_buf: &MtlWeightBuf,
+    ) -> Result<crate::riir::range::RangeVec<Self>, MtlWeightBufError> {
+        let base = range.start;
+        let items = range
+            .map(|i| Self::build(i, wf, wf_buf))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::riir::range::RangeVec::new(base, items))
+    }
 }

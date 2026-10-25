@@ -31,6 +31,7 @@ pub mod config;
 pub mod gpu_capture;
 pub mod io;
 pub mod moe;
+pub mod range;
 pub mod snapshot;
 pub mod variants;
 pub use attn::gpu_attn::{
@@ -73,8 +74,10 @@ pub use io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
 pub use io::prefetch::{PrefetchState, PrefetchStatus, SlotSource};
 pub use io::weight_file::{TensorInfo, WeightFile, WeightFileError};
 pub use snapshot::state::{
-    KvCache, LayerState, LinearAttnState, alloc_layer_states, clear_all, pos_max, truncate,
+    KvCache, LayerState, LayerStates, LinearAttnState, alloc_layer_states,
+    alloc_layer_states_range, clear_all, pos_max, truncate,
 };
+pub use range::RangeVec;
 pub use config::OpenConfig;
 pub use io::expert_io_mode::ExpertIoMode;
 pub use variants::{VARIANT, Variant};
@@ -177,10 +180,68 @@ fn eval_token_mode() -> EvalTokenMode {
 /// MLA / linear-attention layers route through a separate dispatch
 /// (Phase F); reaching the GPU GQA path with one means the dispatch
 /// wasn't wired — fail loudly at runtime.
-fn full_kv_mut(layer_states: &mut [LayerState], idx: usize) -> Result<&mut KvCache, RsError> {
+fn full_kv_mut(layer_states: &mut LayerStates, idx: usize) -> Result<&mut KvCache, RsError> {
     match &mut layer_states[idx] {
         LayerState::FullAttn(kv) => Ok(kv),
         LayerState::Mla(_) | LayerState::LinearAttn(_) => Err(RsError::EvalFailed),
+    }
+}
+
+/// What a stage ([`RsCtx::eval_stage`]) consumes for `n` positions.
+#[derive(Debug, Clone, Copy)]
+pub enum StageInput<'a> {
+    /// `n` token ids — only on the first layer range (it holds the
+    /// embedding).
+    Tokens(&'a [i32]),
+    /// `n` hidden-state rows of `hidden_dim` f32s, row-major: the
+    /// previous range's [`StageOutput::Hidden`].
+    Hidden(&'a [f32]),
+}
+
+impl<'a> StageInput<'a> {
+    /// Positions carried, or `None` if a hidden buffer isn't a whole
+    /// number of rows.
+    pub fn n_tokens(&self) -> Option<usize> {
+        match self {
+            StageInput::Tokens(t) => Some(t.len()),
+            StageInput::Hidden(h) => (h.len() % VARIANT.hidden_dim == 0)
+                .then(|| h.len() / VARIANT.hidden_dim),
+        }
+    }
+
+    /// Positions `r` of this input.
+    fn rows(&self, r: std::ops::Range<usize>) -> StageInput<'a> {
+        let hd = VARIANT.hidden_dim;
+        match *self {
+            StageInput::Tokens(t) => StageInput::Tokens(&t[r]),
+            StageInput::Hidden(h) => StageInput::Hidden(&h[r.start * hd..r.end * hd]),
+        }
+    }
+}
+
+/// What a stage ([`RsCtx::eval_stage`]) produces.
+#[derive(Debug)]
+pub enum StageOutput<'a> {
+    /// Last position's logits (`n_vocab` f32s) — only on the last
+    /// layer range (it holds the final norm and LM head).
+    Logits(&'a mut [f32]),
+    /// Every position's hidden state after the range's last layer
+    /// (`n × hidden_dim` f32s, row-major), for the next range.
+    Hidden(&'a mut [f32]),
+    /// Update state only (e.g. a prompt chunk that needs no logits).
+    Discard,
+}
+
+impl StageOutput<'_> {
+    /// Reborrow for positions `r` of an `n`-position call: hidden rows
+    /// are sliced; logits only go to the call that ends at `n`.
+    fn rows(&mut self, r: std::ops::Range<usize>, n: usize) -> StageOutput<'_> {
+        let hd = VARIANT.hidden_dim;
+        match self {
+            StageOutput::Logits(l) if r.end == n => StageOutput::Logits(&mut l[..]),
+            StageOutput::Logits(_) | StageOutput::Discard => StageOutput::Discard,
+            StageOutput::Hidden(h) => StageOutput::Hidden(&mut h[r.start * hd..r.end * hd]),
+        }
     }
 }
 
@@ -212,14 +273,18 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// a runtime knob.
     k_active: usize,
     /// Per-layer KV / linear-attn recurrence state. One entry per
-    /// layer; the variant tag matches the C-side
+    /// layer of [`Self::layer_range`], indexed by global layer; the
+    /// variant tag matches the C-side
     /// `(i + 1) % FULL_ATTN_INTERVAL == 0` test. Allocated zeroed at
     /// [`Self::open`]; mutated in place by the forward pass and the
     /// `memory_*` ops.
-    layer_states: Vec<LayerState>,
-    /// Lazily-built per-layer tensor-offset cache. Per-Ctx (not file-
-    /// scope) — the Phase 4b cross-Ctx bug fix.
-    layer_caches: Option<Vec<LayerWeightCache>>,
+    layer_states: LayerStates,
+    /// Lazily-built per-layer tensor-offset cache for the layer range.
+    /// Per-Ctx (not file-scope) — the Phase 4b cross-Ctx bug fix.
+    layer_caches: Option<RangeVec<LayerWeightCache>>,
+    /// Layers this context runs ([`OpenConfig::layer_range`]); the
+    /// whole model by default.
+    layer_range: std::ops::Range<usize>,
     /// Lazily-built persistent buffer set for the linear-attn forward.
     linear_buffers: Option<LinearAttnBuffers>,
     /// S10b-2: run-lifetime scratch BufIds for the batched linear-attn
@@ -364,24 +429,13 @@ pub struct RsCtx<B: Backend = MetalBackend> {
 fn probe_variant_match(wf: &WeightFile) -> Result<(), RsError> {
     // Layer count: highest `model.layers.{N}.` index in the manifest,
     // plus one. Every variant in `variants.rs` has a distinct
-    // `num_layers`, so this alone discriminates them.
-    let top_layer = wf
-        .iter()
-        .filter_map(|(name, _)| {
-            name.strip_prefix("model.layers.")?
-                .split('.')
-                .next()?
-                .parse::<usize>()
-                .ok()
-        })
-        .max();
-    // Hidden dim: the layer-0 `input_layernorm.weight` is a 1-D
-    // rms-norm vector of length `hidden_dim` (the product covers a
-    // `[1, hidden_dim]` storage variant).
-    let hidden_dim = wf
-        .tensor_info("model.layers.0.input_layernorm.weight")
-        .map(|info| info.shape.iter().product::<usize>());
-    check_variant_dims(top_layer, hidden_dim)
+    // `num_layers`, so this alone discriminates them. Hidden dim: the
+    // layer-0 `input_layernorm.weight` is a 1-D rms-norm vector of
+    // length `hidden_dim` (the product covers a `[1, hidden_dim]`
+    // storage variant). Both are read from the whole manifest, before
+    // a layer-range filter drops tensors.
+    let probe = wf.probe();
+    check_variant_dims(probe.top_layer, probe.hidden_dim)
 }
 
 /// Decision half of [`probe_variant_match`]: compare the manifest's
@@ -475,36 +529,48 @@ impl RsCtx<MetalBackend> {
             .validate()
             .map_err(|detail| RsError::InvalidConfig { detail })?;
         let n_ctx = config.n_ctx;
+        let layer_range = config.resolved_layer_range();
+        let expert_size = VARIANT.expert_size_4bit() as u64;
+        // Experts this context holds: the layer range's only.
+        let range_expert_bytes = layer_range.len() as u64 * VARIANT.num_experts as u64 * expert_size;
         // Under a hard cap, experts are always pread-staged: mmap-direct
         // pages are file-backed and invisible to the cap.
         let expert_io_mode = if config.mem_cap.is_some() {
             ExpertIoMode::Pread
         } else {
-            io::expert_io_mode::select_with(config.expert_io)
+            io::expert_io_mode::select_for(config.expert_io, range_expert_bytes)
         };
-        let expert_size = VARIANT.expert_size_4bit() as u64;
         let mut hot_tier_bytes = match config.mem_cap {
-            None => config.hot_tier_bytes.unwrap_or(0),
+            // A tier larger than the range's experts would never fill.
+            None => config.hot_tier_bytes.unwrap_or(0).min(range_expert_bytes),
             Some(_) => config.hot_tier_bytes.unwrap_or(u64::MAX),
         };
+        // A partial range loads only its own tensors (plan phase 3).
+        let keep_fn = |name: &str| range::keeps_tensor(&layer_range, name);
+        let keep: Option<io::weight_file::TensorFilter<'_>> =
+            (!range::is_full(&layer_range)).then_some(&keep_fn);
         if hot_tier_bytes > 0 && expert_io_mode.is_mmap() {
             return Err(RsError::InvalidConfig {
                 detail: "a hot tier needs Pread expert IO; mmap mode was selected".into(),
             });
         }
         if let Some(cap) = config.mem_cap {
-            let weights_bytes = std::fs::metadata(weights).map_err(|_| RsError::InitFailed)?.len();
-            let mut plan = budget::BudgetPlan::for_config(
+            let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
+                .map_err(|_| RsError::InitFailed)?;
+            let mut plan = budget::BudgetPlan::for_range(
                 n_ctx,
                 expert_io_mode,
                 weights_bytes,
                 config.runtime_overhead,
+                &layer_range,
             );
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
-            // `None` → the hot tier takes whatever the plan leaves.
+            // `None` → the hot tier takes whatever the plan leaves, up
+            // to every expert of the range (mode B: all resident).
             if hot_tier_bytes == u64::MAX {
                 hot_tier_bytes = cap - plan.total();
             }
+            hot_tier_bytes = hot_tier_bytes.min(range_expert_bytes);
             hot_tier_bytes = hot_tier_bytes / expert_size * expert_size;
             plan.set(budget::Account::HotTier, hot_tier_bytes);
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
@@ -524,11 +590,12 @@ impl RsCtx<MetalBackend> {
         } else {
             io::weight_file::WeightLoad::Mmap
         };
-        let wf = WeightFile::open_with(weights, manifest, load).map_err(|_| RsError::InitFailed)?;
-        probe_variant_match(&wf)?;
-        let experts = ExpertFiles::open_with(experts_dir, !capped, capped)
+        let wf = WeightFile::open_filtered(weights, manifest, load, keep)
             .map_err(|_| RsError::InitFailed)?;
-        let layer_states = alloc_layer_states(n_ctx);
+        probe_variant_match(&wf)?;
+        let experts = ExpertFiles::open_range(experts_dir, !capped, capped, layer_range.clone())
+            .map_err(|_| RsError::InitFailed)?;
+        let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone());
         // Top-k is model shape, not a runtime knob — it comes solely
         // from the compiled variant. (A runtime `experts_per_tok`
         // parameter used to live here; it let callers disagree with the
@@ -550,6 +617,7 @@ impl RsCtx<MetalBackend> {
             layer_states,
             k_active,
             layer_caches: None,
+            layer_range,
             linear_buffers: None,
             linear_attn_graph_scratch: None,
             full_attn_graph_scratch: None,
@@ -596,16 +664,34 @@ impl RsCtx<MetalBackend> {
         let device = self.metal_mut()?.device().to_owned();
         let hot = HotTier::new(&device, capacity, expert_size, v.num_layers, v.num_experts)
             .map_err(|e| RsError::OverBudget { detail: e.to_string() })?;
-        let seed = match profile {
-            Some(p) => {
-                let counts = load_profile(p, v.num_layers, v.num_experts).map_err(|e| {
-                    RsError::InvalidConfig {
-                        detail: format!("hot_tier_profile {}: {e}", p.display()),
+        let range = self.layer_range.clone();
+        let seed: Vec<(usize, usize)> = if capacity >= range.len() * v.num_experts {
+            // Mode B: every expert of the range fits — load them all
+            // now, so the tier never misses.
+            range
+                .clone()
+                .filter(|&l| self.experts.has_layer(l))
+                .flat_map(|l| (0..v.num_experts).map(move |e| (l, e)))
+                .collect()
+        } else {
+            match profile {
+                Some(p) => {
+                    let mut counts = load_profile(p, v.num_layers, v.num_experts).map_err(|e| {
+                        RsError::InvalidConfig {
+                            detail: format!("hot_tier_profile {}: {e}", p.display()),
+                        }
+                    })?;
+                    // A profile covers the whole model; seed only the
+                    // layers this context holds.
+                    for (l, row) in counts.chunks_mut(v.num_experts).enumerate() {
+                        if !range.contains(&l) {
+                            row.fill(0);
+                        }
                     }
-                })?;
-                hot.seed_from_counts(&counts)
+                    hot.seed_from_counts(&counts)
+                }
+                None => Vec::new(),
             }
-            None => Vec::new(),
         };
         self.experts.attach_hot_tier(hot);
         // Seed reads go through `read_expert_disk`, which offers each
@@ -622,10 +708,11 @@ impl RsCtx<MetalBackend> {
             .map_err(|_| RsError::InitFailed)?;
         }
         eprintln!(
-            "[hot_tier] {} slots ({}), seeded {} from profile",
+            "[hot_tier] {} slots ({}), seeded {} (layers {:?})",
             capacity,
             budget::fmt_gib(bytes),
-            self.experts.hot_tier().map_or(0, |h| h.stats().resident)
+            self.experts.hot_tier().map_or(0, |h| h.stats().resident),
+            self.layer_range
         );
         Ok(())
     }
@@ -752,6 +839,30 @@ impl RsCtx<MetalBackend> {
 
     pub fn n_vocab(&self) -> usize {
         VARIANT.vocab_size
+    }
+
+    /// f32s per hidden-state row ([`StageInput::Hidden`] /
+    /// [`StageOutput::Hidden`]).
+    pub fn hidden_dim(&self) -> usize {
+        VARIANT.hidden_dim
+    }
+
+    /// Layers this context runs ([`OpenConfig::layer_range`]).
+    pub fn layer_range(&self) -> std::ops::Range<usize> {
+        self.layer_range.clone()
+    }
+
+    /// `true` if this context holds the embedding (its range starts at
+    /// layer 0) and so accepts [`StageInput::Tokens`].
+    pub fn has_embed(&self) -> bool {
+        self.layer_range.start == 0
+    }
+
+    /// `true` if this context holds the final norm and LM head (its
+    /// range ends at the last layer) and so can emit
+    /// [`StageOutput::Logits`].
+    pub fn has_head(&self) -> bool {
+        self.layer_range.end == VARIANT.num_layers
     }
 
     pub fn n_ctx(&self) -> usize {
@@ -1209,7 +1320,7 @@ impl RsCtx<MetalBackend> {
         gpu_combine: bool,
     ) -> Result<(), RsError> {
         let v = VARIANT;
-        if layer_idx < 0 || (layer_idx as usize) >= v.num_layers {
+        if layer_idx < 0 || !self.layer_range.contains(&(layer_idx as usize)) {
             return Err(RsError::EvalFailed);
         }
         if pos < 0 {
@@ -1435,7 +1546,7 @@ impl RsCtx<MetalBackend> {
     /// `kv_a_proj_with_mqa` / `kv_b_proj` instead).
     fn ensure_mla_resources(&mut self) -> Result<(), RsError> {
         self.ensure_backend()?;
-        if self.lm_head_gpu.is_none() {
+        if self.lm_head_gpu.is_none() && self.has_head() {
             let Self {
                 wf,
                 backend,
@@ -1576,13 +1687,14 @@ impl RsCtx<MetalBackend> {
         }
         if self.layer_caches.is_none() {
             let wf_buf = self.backend.as_ref().expect("just-set").weight_buf();
-            let caches =
-                LayerWeightCache::build_all(&self.wf, wf_buf).map_err(|_| RsError::InitFailed)?;
+            let caches = LayerWeightCache::build_range(self.layer_range.clone(), &self.wf, wf_buf)
+                .map_err(|_| RsError::InitFailed)?;
             self.layer_caches = Some(caches);
         }
         if self.linear_buffers.is_none() {
+            let range = self.layer_range.clone();
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.linear_buffers = Some(LinearAttnBuffers::new(pool));
+            self.linear_buffers = Some(LinearAttnBuffers::new_for_range(pool, range));
         }
         // Construction order matters: `LinearAttnGraphScratch` is
         // all-transient (`persistent = false`); the structs after it
@@ -1621,7 +1733,7 @@ impl RsCtx<MetalBackend> {
             let pool = self.backend.as_mut().expect("just-set").pool_mut();
             self.moe_buffers = Some(MoeBuffers::new(pool));
         }
-        if self.lm_head_gpu.is_none() {
+        if self.lm_head_gpu.is_none() && self.has_head() {
             let Self {
                 wf,
                 backend,
@@ -1634,6 +1746,100 @@ impl RsCtx<MetalBackend> {
                 Some(GpuLmHead::new(metal, wf, wf_buf).map_err(|_| RsError::InitFailed)?);
         }
         Ok(())
+    }
+
+    /// Fail unless this context runs the whole model — the
+    /// token-to-logits `eval_*` entry points need both ends.
+    fn require_full_range(&self, what: &str) -> Result<(), RsError> {
+        if self.has_embed() && self.has_head() {
+            return Ok(());
+        }
+        Err(RsError::StageMismatch {
+            detail: format!(
+                "{what} needs the whole model; this context runs layers {:?} — use eval_stage",
+                self.layer_range
+            ),
+        })
+    }
+
+    /// Validate a stage call against this context's range; returns the
+    /// number of positions.
+    fn stage_check(&self, input: &StageInput<'_>, output: &StageOutput<'_>) -> Result<usize, RsError> {
+        let mismatch = |detail: String| Err(RsError::StageMismatch { detail });
+        let Some(n) = input.n_tokens() else {
+            return mismatch(format!(
+                "hidden input is not a whole number of {}-f32 rows",
+                VARIANT.hidden_dim
+            ));
+        };
+        if matches!(input, StageInput::Tokens(_)) && !self.has_embed() {
+            return mismatch(format!(
+                "token input needs the embedding; layers {:?} start mid-model",
+                self.layer_range
+            ));
+        }
+        match output {
+            StageOutput::Logits(l) => {
+                if !self.has_head() {
+                    return mismatch(format!(
+                        "logits need the LM head; layers {:?} end mid-model",
+                        self.layer_range
+                    ));
+                }
+                if l.len() != VARIANT.vocab_size {
+                    return Err(RsError::EvalFailed);
+                }
+            }
+            StageOutput::Hidden(h) => {
+                if h.len() != n * VARIANT.hidden_dim {
+                    return mismatch(format!(
+                        "hidden output holds {} f32s, need {} × {}",
+                        h.len(),
+                        n,
+                        VARIANT.hidden_dim
+                    ));
+                }
+            }
+            StageOutput::Discard => {}
+        }
+        Ok(n)
+    }
+
+    /// Run this context's layer range over `n` positions starting at
+    /// `start_pos` (plan phase 3 — pipeline stages).
+    ///
+    /// - `input`: [`StageInput::Tokens`] on the first range (embedding
+    ///   lookup), otherwise the previous range's
+    ///   [`StageInput::Hidden`] rows.
+    /// - `output`: [`StageOutput::Hidden`] (every position's hidden
+    ///   state after the range's last layer, for the next range),
+    ///   [`StageOutput::Logits`] (last position, last range only) or
+    ///   [`StageOutput::Discard`].
+    ///
+    /// `n == 1` takes the decode path ([`Self::eval_token`]'s), `n > 1`
+    /// the batched prefill path ([`Self::eval_prompt`]'s). On a
+    /// whole-model context, `Tokens` → `Logits` gives the same logits
+    /// as those two calls. At a range boundary the last layer's
+    /// combine is not fused with the next layer's input norm (the next
+    /// range recomputes it from the hidden row), so a split matches
+    /// the whole model within oracle tolerance rather than bit for bit.
+    pub fn eval_stage(
+        &mut self,
+        input: StageInput<'_>,
+        start_pos: usize,
+        output: StageOutput<'_>,
+    ) -> Result<(), RsError> {
+        let n = self.stage_check(&input, &output)?;
+        if n == 0 {
+            return Ok(());
+        }
+        self.experts.begin_epoch();
+        if n == 1 && eval_token_mode() == EvalTokenMode::Oracle {
+            self.step_internal_per_token_oracle(input, start_pos as i32, output)?;
+        } else {
+            self.step_internal(input, start_pos as i32, output)?;
+        }
+        self.check_cap("eval_stage")
     }
 
     /// Process `tokens.len()` tokens at positions `[start_pos,
@@ -1659,8 +1865,13 @@ impl RsCtx<MetalBackend> {
         if tokens.is_empty() {
             return Ok(());
         }
+        self.require_full_range("eval_prompt")?;
         self.experts.begin_epoch();
-        self.step_internal(tokens, start_pos as i32, Some(&mut logits[..]))?;
+        self.step_internal(
+            StageInput::Tokens(tokens),
+            start_pos as i32,
+            StageOutput::Logits(&mut logits[..]),
+        )?;
         self.check_cap("eval_prompt")
     }
 
@@ -1691,12 +1902,18 @@ impl RsCtx<MetalBackend> {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
+        self.require_full_range("eval_token")?;
         self.experts.begin_epoch();
+        let input = StageInput::Tokens(std::slice::from_ref(&token));
         match eval_token_mode() {
-            EvalTokenMode::Oracle => {
-                self.step_internal_per_token_oracle(token, pos as i32, Some(logits))?
+            EvalTokenMode::Oracle => self.step_internal_per_token_oracle(
+                input,
+                pos as i32,
+                StageOutput::Logits(logits),
+            )?,
+            EvalTokenMode::Batched => {
+                self.step_internal(input, pos as i32, StageOutput::Logits(logits))?
             }
-            EvalTokenMode::Batched => self.step_internal(&[token], pos as i32, Some(logits))?,
         }
         self.check_cap("eval_token")
     }
@@ -1724,34 +1941,24 @@ impl RsCtx<MetalBackend> {
     /// oracle since single-token decode doesn't benefit from batching.
     pub(crate) fn step_internal(
         &mut self,
-        tokens: &[i32],
+        input: StageInput<'_>,
         start_pos: i32,
-        logits_out: Option<&mut [f32]>,
+        mut output: StageOutput<'_>,
     ) -> Result<(), RsError> {
-        if tokens.is_empty() {
+        let n = self.stage_check(&input, &output)?;
+        if n == 0 {
             return Ok(());
         }
         if start_pos < 0 {
             return Err(RsError::EvalFailed);
         }
-        if let Some(ref l) = logits_out {
-            if l.len() != VARIANT.vocab_size {
-                return Err(RsError::EvalFailed);
-            }
-        }
 
         // MLA: tokenwise oracle for now (batched MLA = session-5+).
         if matches!(VARIANT.attn_kind, variants::AttnKind::Mla) {
-            let last_idx = tokens.len() - 1;
-            let mut logits_owned = logits_out;
-            for (i, &tok) in tokens.iter().enumerate() {
+            for i in 0..n {
                 let pos = start_pos + i as i32;
-                let logits_arg: Option<&mut [f32]> = if i == last_idx {
-                    logits_owned.take()
-                } else {
-                    None
-                };
-                self.step_internal_per_token_oracle(tok, pos, logits_arg)?;
+                let row_out = output.rows(i..i + 1, n);
+                self.step_internal_per_token_oracle(input.rows(i..i + 1), pos, row_out)?;
             }
             return Ok(());
         }
@@ -1766,21 +1973,15 @@ impl RsCtx<MetalBackend> {
         // (thread-local) so multi-chunk boundary math is exercisable
         // at small N without paying long-prompt wall-clock.
         let chunk_size = batched_chunk_size();
-        let n = tokens.len();
         let mut chunk_start = 0usize;
         let mut chunk_idx = 0usize;
-        let mut logits_owned = logits_out;
         while chunk_start < n {
             let chunk_end = (chunk_start + chunk_size).min(n);
-            let is_last_chunk = chunk_end == n;
-            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let chunk_in = input.rows(chunk_start..chunk_end);
             let chunk_start_pos = start_pos + chunk_start as i32;
-            let chunk_logits = if is_last_chunk {
-                logits_owned.take()
-            } else {
-                None
-            };
-            self.step_internal_batched_gqa(chunk_tokens, chunk_start_pos, chunk_logits, chunk_idx)?;
+            // Logits only for the last chunk; hidden rows per chunk.
+            let chunk_out = output.rows(chunk_start..chunk_end, n);
+            self.step_internal_batched_gqa(chunk_in, chunk_start_pos, chunk_out, chunk_idx)?;
             chunk_start = chunk_end;
             chunk_idx += 1;
         }
@@ -1795,19 +1996,20 @@ impl RsCtx<MetalBackend> {
     /// orchestrator stays stable across sub-steps.
     fn step_internal_batched_gqa(
         &mut self,
-        tokens: &[i32],
+        input: StageInput<'_>,
         start_pos: i32,
-        logits_out: Option<&mut [f32]>,
+        output: StageOutput<'_>,
         chunk_idx: usize,
     ) -> Result<(), RsError> {
         use attn::full_attn_forward::batched_full_attn_layer_forward;
 
         let v = VARIANT;
-        let n = tokens.len();
+        let n = input.n_tokens().ok_or(RsError::EvalFailed)?;
         let hidden_dim = v.hidden_dim;
 
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
+        let range = self.layer_range.clone();
 
         // Field-disjoint mutable borrows. `io_pool` dropped here on
         // 2026-05-20 alongside the pread teardown — the batched
@@ -1888,6 +2090,18 @@ impl RsCtx<MetalBackend> {
         // for n < BATCHED_CHUNK_SIZE).
         let (mut hidden_a_id, mut hidden_b_id) =
             (hidden_double_buffer.hidden_a, hidden_double_buffer.hidden_b);
+        let tokens = match input {
+            StageInput::Tokens(tokens) => tokens,
+            StageInput::Hidden(h) => {
+                // A mid-model range (plan phase 3): the previous range's
+                // hidden rows go straight into `hidden_a`.
+                backend
+                    .pool_mut()
+                    .upload(hidden_a_id, bytemuck::cast_slice(h))
+                    .map_err(|_| RsError::EvalFailed)?;
+                &[]
+            }
+        };
         // The `embed_gather_4bit` kernel does not range-check token
         // ids; the orchestrator does, before the upload.
         for &tok in tokens {
@@ -1895,41 +2109,43 @@ impl RsCtx<MetalBackend> {
                 return Err(RsError::EvalFailed);
             }
         }
-        let embed_off = |name: &str| -> Result<u64, RsError> {
-            wf.tensor_info(name)
-                .map(|t| t.offset)
-                .ok_or(RsError::EvalFailed)
-        };
-        let embed_weight = WeightRef {
-            w_off: embed_off("model.embed_tokens.weight")?,
-            s_off: embed_off("model.embed_tokens.scales")?,
-            b_off: embed_off("model.embed_tokens.biases")?,
-            bits: 4,
-        };
-        backend
-            .pool_mut()
-            .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(tokens))
-            .expect("pool upload token ids");
-        let mut g_head = Graph::new();
-        // The head writes the embedding-gather output into the
-        // run-lifetime `hidden_a` slot of the cross-layer double-
-        // buffer (`BufId<HiddenBuf>`). The Op's `hidden_out` slot is
-        // typed `BufId<EmbedOutBuf>` — same physical role at the
-        // top of the model, with a dedicated `From<HiddenBuf> for
-        // BufId<EmbedOutBuf>` impl that documents the bridge here.
-        g_head.push(Op::EmbedGatherNTokens {
-            label: "embed_gather",
-            token_ids: head_tail_scratch.token_ids,
-            weight: embed_weight,
-            hidden_out: hidden_a_id.into(),
-            hidden_dim: hidden_dim as u32,
-            n_tokens: n as u32,
-        });
-        backend
-            .execute(&g_head, "graph_head")
-            .map_err(|_| RsError::EvalFailed)?;
+        if !tokens.is_empty() {
+            let embed_off = |name: &str| -> Result<u64, RsError> {
+                wf.tensor_info(name)
+                    .map(|t| t.offset)
+                    .ok_or(RsError::EvalFailed)
+            };
+            let embed_weight = WeightRef {
+                w_off: embed_off("model.embed_tokens.weight")?,
+                s_off: embed_off("model.embed_tokens.scales")?,
+                b_off: embed_off("model.embed_tokens.biases")?,
+                bits: 4,
+            };
+            backend
+                .pool_mut()
+                .upload(head_tail_scratch.token_ids, bytemuck::cast_slice(tokens))
+                .expect("pool upload token ids");
+            let mut g_head = Graph::new();
+            // The head writes the embedding-gather output into the
+            // run-lifetime `hidden_a` slot of the cross-layer double-
+            // buffer (`BufId<HiddenBuf>`). The Op's `hidden_out` slot is
+            // typed `BufId<EmbedOutBuf>` — same physical role at the
+            // top of the model, with a dedicated `From<HiddenBuf> for
+            // BufId<EmbedOutBuf>` impl that documents the bridge here.
+            g_head.push(Op::EmbedGatherNTokens {
+                label: "embed_gather",
+                token_ids: head_tail_scratch.token_ids,
+                weight: embed_weight,
+                hidden_out: hidden_a_id.into(),
+                hidden_dim: hidden_dim as u32,
+                n_tokens: n as u32,
+            });
+            backend
+                .execute(&g_head, "graph_head")
+                .map_err(|_| RsError::EvalFailed)?;
+        }
 
-        for layer_idx in 0..v.num_layers {
+        for layer_idx in range {
             backend.begin_layer(chunk_idx, layer_idx);
             // Prefetch is never fired by the batched orchestrator
             // (see the drain() above this loop and its surrounding
@@ -2030,7 +2246,14 @@ impl RsCtx<MetalBackend> {
         // `Op::LmHead`'s job is exactly RmsNorm + Matvec, and both
         // are already wired — norm `hidden_a -> hidden_b`, then an
         // lm_head matvec of the last token's row produces the logits.
-        if let Some(logits) = logits_out {
+        if let StageOutput::Hidden(h) = output {
+            // Not the last range: hand every row to the next range. The
+            // layer graphs above commit-and-wait, so `hidden_a` is final.
+            backend
+                .pool()
+                .download(hidden_a_id, bytemuck::cast_slice_mut(h))
+                .map_err(|_| RsError::EvalFailed)?;
+        } else if let StageOutput::Logits(logits) = output {
             let norm_off = wf
                 .tensor_info("model.norm.weight")
                 .map(|t| t.offset)
@@ -2117,9 +2340,9 @@ impl RsCtx<MetalBackend> {
     /// cached position) and a GPU MLA kernel are follow-up slices.
     fn step_internal_mla_cpu(
         &mut self,
-        token: i32,
+        input: StageInput<'_>,
         pos: i32,
-        logits_out: Option<&mut [f32]>,
+        output: StageOutput<'_>,
     ) -> Result<(), RsError> {
         use attn::mla_attn_cpu::mla_attn_layer_forward_cpu;
         use attn::rope::{compute_yarn_inv_freq, yarn_get_mscale_full};
@@ -2129,6 +2352,7 @@ impl RsCtx<MetalBackend> {
 
         self.ensure_mla_resources()?;
         let v = VARIANT;
+        let range = self.layer_range.clone();
 
         let Self {
             wf,
@@ -2140,7 +2364,6 @@ impl RsCtx<MetalBackend> {
         } = self;
         let backend = backend.as_mut().expect("ensure_mla_resources");
         let (metal, wf_buf, _) = backend.parts_mut();
-        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_mla_resources");
 
         // YaRN constants — recomputed per token; cache-worthy if perf
         // matters but it's microseconds vs the per-layer matvec cost.
@@ -2154,16 +2377,20 @@ impl RsCtx<MetalBackend> {
         );
         let yarn_mscale = yarn_get_mscale_full(v.yarn_factor, v.yarn_mscale, v.yarn_mscale_all_dim);
 
-        // Embed → host hidden buffer.
+        // Embed (or take the previous range's row) → host hidden buffer.
         let mut hidden = vec![0.0f32; v.hidden_dim];
-        io::embedding::embed_lookup(wf, token, &mut hidden).map_err(|_| RsError::EvalFailed)?;
+        match input {
+            StageInput::Tokens(t) => io::embedding::embed_lookup(wf, t[0], &mut hidden)
+                .map_err(|_| RsError::EvalFailed)?,
+            StageInput::Hidden(h) => hidden.copy_from_slice(h),
+        }
 
         // Per-layer scratch.
         let mut residual = vec![0.0f32; v.hidden_dim];
         let mut normed = vec![0.0f32; v.hidden_dim];
         let mut block_out = vec![0.0f32; v.hidden_dim];
 
-        for layer_idx in 0..v.num_layers {
+        for layer_idx in range {
             // ---- Attention sub-block: residual = h; h = h + mla(norm(h)) ----
             residual.copy_from_slice(&hidden);
             let pre_norm_name = format!("model.layers.{layer_idx}.input_layernorm.weight");
@@ -2210,17 +2437,21 @@ impl RsCtx<MetalBackend> {
             }
         }
 
-        // Final RMSNorm.
-        let mut hidden_normed = vec![0.0f32; v.hidden_dim];
-        rms_norm_cpu(wf, "model.norm.weight", &hidden, &mut hidden_normed)
-            .map_err(|_| RsError::EvalFailed)?;
-
-        // LM head — GPU (the only GPU dispatch on this path). Skipped
-        // when `logits_out` is None (prompt-prefix step).
-        if let Some(logits) = logits_out {
-            lm_head_gpu
-                .forward(metal, wf_buf, &hidden_normed, logits)
-                .map_err(|_| RsError::EvalFailed)?;
+        match output {
+            StageOutput::Hidden(h) => h.copy_from_slice(&hidden),
+            StageOutput::Discard => {}
+            StageOutput::Logits(logits) => {
+                // Final RMSNorm.
+                let mut hidden_normed = vec![0.0f32; v.hidden_dim];
+                rms_norm_cpu(wf, "model.norm.weight", &hidden, &mut hidden_normed)
+                    .map_err(|_| RsError::EvalFailed)?;
+                // LM head — GPU (the only GPU dispatch on this path).
+                lm_head_gpu
+                    .as_ref()
+                    .ok_or(RsError::EvalFailed)?
+                    .forward(metal, wf_buf, &hidden_normed, logits)
+                    .map_err(|_| RsError::EvalFailed)?;
+            }
         }
 
         Ok(())
@@ -2235,9 +2466,9 @@ impl RsCtx<MetalBackend> {
     /// CPU. Full GPU MoE integration is a follow-up perf slice.
     fn step_internal_mla_gpu(
         &mut self,
-        token: i32,
+        input: StageInput<'_>,
         pos: i32,
-        logits_out: Option<&mut [f32]>,
+        output: StageOutput<'_>,
     ) -> Result<(), RsError> {
         use attn::mla_attn_forward::mla_attn_layer_forward_gpu;
         use backend::gpu::dense_mlp_gpu::encode_dense_mlp_layer_forward_gpu;
@@ -2248,6 +2479,7 @@ impl RsCtx<MetalBackend> {
 
         self.ensure_mla_resources()?;
         let v = VARIANT;
+        let range = self.layer_range.clone();
 
         let Self {
             wf,
@@ -2271,7 +2503,6 @@ impl RsCtx<MetalBackend> {
         } = self;
         let backend = backend.as_mut().expect("ensure_mla_resources");
         let (metal, wf_buf, pool) = backend.parts_mut();
-        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_mla_resources");
         let mla_buffers = mla_buffers.as_mut().expect("ensure_mla_resources");
         let mla_yarn = mla_yarn.as_ref().expect("ensure_mla_resources");
         let mla_pipes = mla_pipes.as_ref().expect("ensure_mla_resources");
@@ -2286,10 +2517,14 @@ impl RsCtx<MetalBackend> {
 
         // Embed → host hidden vec → GPU scratch.hidden buffer (one
         // host->GPU bounce per token; the layer loop is fully GPU
-        // resident from here).
+        // resident from here). A mid-model range copies the previous
+        // range's row instead.
         let mut hidden_host = vec![0.0f32; v.hidden_dim];
-        io::embedding::embed_lookup(wf, token, &mut hidden_host)
-            .map_err(|_| RsError::EvalFailed)?;
+        match input {
+            StageInput::Tokens(t) => io::embedding::embed_lookup(wf, t[0], &mut hidden_host)
+                .map_err(|_| RsError::EvalFailed)?,
+            StageInput::Hidden(h) => hidden_host.copy_from_slice(h),
+        }
         // SAFETY: shared-storage GPU buffer; no GPU work in flight at
         // top of step (caller honors the moeflux.h:481 contract).
         unsafe {
@@ -2302,7 +2537,7 @@ impl RsCtx<MetalBackend> {
 
         let dim = v.hidden_dim as u32;
 
-        for layer_idx in 0..v.num_layers {
+        for layer_idx in range {
             // ---- Pre-attn block: residual := hidden, normed := rms_norm(hidden) ----
             // Single cmdbuf for the residual snapshot + pre-norm. We
             // commit + wait here because mla_attn_layer_forward_gpu
@@ -2462,17 +2697,23 @@ impl RsCtx<MetalBackend> {
         let final_norm_name = "model.norm.weight";
         // SAFETY: shared-storage; no GPU work in flight (the last
         // residual_add committed + waited above).
-        let hidden_host: Vec<f32> = unsafe {
+        let hidden_host: &[f32] = unsafe {
             let p = scratch.hidden.contents() as *const f32;
-            std::slice::from_raw_parts(p, v.hidden_dim).to_vec()
+            std::slice::from_raw_parts(p, v.hidden_dim)
         };
-        let mut hidden_normed = vec![0.0f32; v.hidden_dim];
-        rms_norm_cpu(wf, final_norm_name, &hidden_host, &mut hidden_normed)
-            .map_err(|_| RsError::EvalFailed)?;
-        if let Some(logits) = logits_out {
-            lm_head_gpu
-                .forward(metal, wf_buf, &hidden_normed, logits)
-                .map_err(|_| RsError::EvalFailed)?;
+        match output {
+            StageOutput::Hidden(h) => h.copy_from_slice(hidden_host),
+            StageOutput::Discard => {}
+            StageOutput::Logits(logits) => {
+                let mut hidden_normed = vec![0.0f32; v.hidden_dim];
+                rms_norm_cpu(wf, final_norm_name, hidden_host, &mut hidden_normed)
+                    .map_err(|_| RsError::EvalFailed)?;
+                lm_head_gpu
+                    .as_ref()
+                    .ok_or(RsError::EvalFailed)?
+                    .forward(metal, wf_buf, &hidden_normed, logits)
+                    .map_err(|_| RsError::EvalFailed)?;
+            }
         }
         Ok(())
     }
@@ -2509,18 +2750,16 @@ impl RsCtx<MetalBackend> {
     /// wraps this in a loop.
     pub(crate) fn step_internal_per_token_oracle(
         &mut self,
-        token: i32,
+        input: StageInput<'_>,
         pos: i32,
-        logits_out: Option<&mut [f32]>,
+        output: StageOutput<'_>,
     ) -> Result<(), RsError> {
         let v = VARIANT;
         if pos < 0 {
             return Err(RsError::EvalFailed);
         }
-        if let Some(ref l) = logits_out {
-            if l.len() != v.vocab_size {
-                return Err(RsError::EvalFailed);
-            }
+        if self.stage_check(&input, &output)? != 1 {
+            return Err(RsError::EvalFailed);
         }
 
         // MLA variants (DeepSeek-V3 / Cogito-V2) run a separate
@@ -2532,15 +2771,16 @@ impl RsCtx<MetalBackend> {
         if matches!(v.attn_kind, variants::AttnKind::Mla) {
             let force_cpu = std::env::var_os("MOEFLUX_FORCE_CPU_MLA").is_some();
             return if force_cpu {
-                self.step_internal_mla_cpu(token, pos, logits_out)
+                self.step_internal_mla_cpu(input, pos, output)
             } else {
-                self.step_internal_mla_gpu(token, pos, logits_out)
+                self.step_internal_mla_gpu(input, pos, output)
             };
         }
 
         self.ensure_linear_resources()?;
         let k_active = self.k_active;
         let expert_io_mode = self.expert_io_mode;
+        let range = self.layer_range.clone();
 
         // Field-disjoint mutable borrows for the layer loop. Same
         // pattern as `layer_forward_dump_inner`.
@@ -2563,14 +2803,14 @@ impl RsCtx<MetalBackend> {
         let layer_caches = layer_caches.as_ref().expect("ensure_linear_resources");
         let linear_buffers = linear_buffers.as_mut().expect("ensure_linear_resources");
         let moe_buffers = moe_buffers.as_mut().expect("ensure_linear_resources");
-        let lm_head_gpu = lm_head_gpu.as_ref().expect("ensure_linear_resources");
         let io_pool: &rayon::ThreadPool = &*io_pool;
 
         // Defensive bracket — drain stale state from a buggy prior
         // call so re-entrancy holds.
         moe::deferred::discard_deferred_experts_in(deferred);
 
-        // Embed token into the persistent input buffer in-place.
+        // Embed token into the persistent input buffer in-place (a
+        // mid-model range copies the previous range's row instead).
         // SAFETY: shared-storage buffer; no GPU work is in flight
         // because we just discarded any deferred state.
         {
@@ -2580,8 +2820,11 @@ impl RsCtx<MetalBackend> {
                     v.hidden_dim,
                 )
             };
-            io::embedding::embed_lookup(wf, token, buf_input_slice)
-                .map_err(|_| RsError::EvalFailed)?;
+            match input {
+                StageInput::Tokens(t) => io::embedding::embed_lookup(wf, t[0], buf_input_slice)
+                    .map_err(|_| RsError::EvalFailed)?,
+                StageInput::Hidden(h) => buf_input_slice.copy_from_slice(h),
+            }
         }
 
         // Per-layer loop. Slice 5d-9 widened the deferred slot to a
@@ -2609,7 +2852,7 @@ impl RsCtx<MetalBackend> {
         // host readback needed during the loop.
         let mut prev_layer_chained = false;
         gpu_capture::decode_begin_token();
-        for layer_idx in 0..v.num_layers {
+        for layer_idx in range.clone() {
             if let Some(cfg) = gpu_capture::config() {
                 if cfg.decode_start(layer_idx) {
                     gpu_capture::start(metal.device(), cfg);
@@ -2672,8 +2915,10 @@ impl RsCtx<MetalBackend> {
             // Slice 5d-8: chain enabled for every non-last layer
             // (gpu_combine is hardcoded true here). Last layer's
             // combine still writes to bufs.moe_hidden so the post-loop
-            // final drain reads from it as before.
-            let chain_next = layer_idx + 1 < v.num_layers;
+            // final drain reads from it as before. The chain stops at
+            // the end of the layer range (plan phase 3): the next
+            // layer's input norm lives in the next range.
+            let chain_next = layer_idx + 1 < range.end;
             let chain_next_norm_off =
                 chain_next.then(|| layer_caches[layer_idx + 1].input_layernorm_w);
 
@@ -2764,11 +3009,23 @@ impl RsCtx<MetalBackend> {
             moe::deferred::complete_deferred_experts_chained(deferred)
                 .map_err(|_| RsError::EvalFailed)?;
         }
-        match logits_out {
-            None => {
+        match output {
+            StageOutput::Discard => {
                 moe::deferred::discard_deferred_experts_in(deferred);
             }
-            Some(logits) => {
+            StageOutput::Hidden(h) => {
+                // Mid-model range: the unchained last layer's combine
+                // output is the row the next range consumes.
+                moe::deferred::complete_deferred_experts_into(
+                    deferred,
+                    moe_buffers,
+                    buffer_pool,
+                    h,
+                )
+                .map_err(|_| RsError::EvalFailed)?;
+            }
+            StageOutput::Logits(logits) => {
+                let lm_head_gpu = lm_head_gpu.as_ref().ok_or(RsError::EvalFailed)?;
                 let mut hidden_final = vec![0.0f32; v.hidden_dim];
                 moe::deferred::complete_deferred_experts_into(
                     deferred,
@@ -2815,7 +3072,7 @@ impl RsCtx<MetalBackend> {
     /// after `memory_clear` see stale recurrence and diverge from a
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
-        clear_all(&mut self.layer_states);
+        clear_all(self.layer_states.as_mut_slice());
         if let (Some(bufs), Some(backend)) = (self.linear_buffers.as_ref(), self.backend.as_ref()) {
             let pool = backend.pool();
             bufs.reset_recurrence(pool);
@@ -2854,7 +3111,7 @@ impl RsCtx<MetalBackend> {
     /// ctx is valid, since the truncation primitive itself is
     /// infallible.
     pub fn memory_seq_rm(&mut self, _seq_id: i32, p0: i32, p1: i32) -> bool {
-        truncate(&mut self.layer_states, p0, p1);
+        truncate(self.layer_states.as_mut_slice(), p0, p1);
         true
     }
 
@@ -2985,7 +3242,7 @@ impl RsCtx<MetalBackend> {
     /// none has any entries. Mirrors `mf_memory_seq_pos_max`
     /// (infer.m:7759).
     pub fn memory_seq_pos_max(&self, _seq_id: i32) -> i32 {
-        pos_max(&self.layer_states)
+        pos_max(self.layer_states.as_slice())
     }
 
     /// Bytes the caller must allocate to hold a snapshot of the
@@ -3115,6 +3372,14 @@ pub enum RsError {
     #[error("invalid open config: {detail}")]
     InvalidConfig {
         /// Which field, and why.
+        detail: String,
+    },
+    /// The call doesn't fit this context's layer range
+    /// ([`OpenConfig::layer_range`]) — e.g. tokens into a mid-model
+    /// range, or `eval_prompt` on a partial range.
+    #[error("stage mismatch: {detail}")]
+    StageMismatch {
+        /// What was asked, and what this context runs.
         detail: String,
     },
     #[error("eval call failed")]

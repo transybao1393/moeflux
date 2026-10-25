@@ -95,12 +95,16 @@ pub fn select() -> ExpertIoMode {
 /// ([`crate::riir::OpenConfig::expert_io`]). `Some(mode)` wins over
 /// `MOEFLUX_EXPERT_IO` and the RAM gate.
 pub fn select_with(configured: Option<ExpertIoMode>) -> ExpertIoMode {
+    select_for(configured, total_expert_bytes(VARIANT))
+}
+
+/// [`select_with`] gating on `expert_bytes` — the experts this context
+/// actually holds (a layer range holds only its layers', plan phase 3).
+pub fn select_for(configured: Option<ExpertIoMode>, expert_bytes: u64) -> ExpertIoMode {
     if let Some(mode) = configured {
         eprintln!("[expert_io] {mode:?} (set by OpenConfig::expert_io)");
         return mode;
     }
-    let v = VARIANT;
-    let expert_bytes = total_expert_bytes(v);
     let ram_bytes = physical_ram_bytes();
     let threshold = ram_bytes / 4 * 3; // 0.75 * ram (integer-safe)
 
