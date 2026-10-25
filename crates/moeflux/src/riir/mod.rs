@@ -687,6 +687,7 @@ impl RsCtx<MetalBackend> {
             prefetch.enable_cross_layer(io::guess::CrossLayerGuesser::new(&wf, layer_range.clone()));
         }
         prefetch.set_lookahead(config.prefetch_lookahead && expert_io_mode.is_pread());
+        prefetch.set_max_experts(config.resolved_prefetch_experts());
         let mut ctx = Self {
             wf,
             backend: None,

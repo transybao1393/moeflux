@@ -23,6 +23,10 @@ pub const DEFAULT_IO_THREADS: usize = 8;
 /// prompts run as several chunks.
 pub const CAPPED_PREFILL_CHUNK: usize = 512;
 
+/// Default [`OpenConfig::prefetch_experts`] under a `mem_cap`: the
+/// strongest 4 guesses per layer (see that field for the numbers).
+pub const DEFAULT_CAPPED_PREFETCH_EXPERTS: usize = 4;
+
 /// The prefill chunk a context with `n_ctx` positions uses when
 /// [`OpenConfig::prefill_chunk`] is `None`:
 /// [`crate::riir::BATCHED_CHUNK_SIZE`] uncapped,
@@ -128,6 +132,20 @@ pub struct OpenConfig {
     /// buffers. Needs `prefetch_guess = PrevToken` (a cross-layer
     /// guess is only known after L's attention). Default `false`.
     pub prefetch_lookahead: bool,
+    /// Experts per layer each speculative decode prefetch reads, the
+    /// strongest guesses first (previous token: highest router
+    /// weight; cross-layer: highest guessed score). `Some(0)` turns
+    /// speculative prefetch off (misses are read on demand only).
+    /// `None` (default): [`DEFAULT_CAPPED_PREFETCH_EXPERTS`] under a
+    /// cap, else all K. Never changes the logits.
+    ///
+    /// Under a cap every wrong guess costs SSD bandwidth the demand
+    /// reads need: on OLMoE-1B-7B at a 6 GiB cap, reading all 8
+    /// guesses wasted 42% of decode reads, and top 4 was the fastest
+    /// setting (8.5 vs 7.4 tok/s with a 0.35 GiB hot tier, 11.8 vs
+    /// 11.3 with 1.19 GiB); prefetch off read least but stalled on
+    /// every miss.
+    pub prefetch_experts: Option<usize>,
     /// Bytes of fixed buffers the embedding application holds next to
     /// the context — e.g. `moeflux-net`'s frame buffers (plan phase 5).
     /// Counted in the budget plan as `host_buffers`, so the cap covers
@@ -161,6 +179,7 @@ impl Default for OpenConfig {
             max_requests: 1,
             prefetch_guess: PrefetchGuess::PrevToken,
             prefetch_lookahead: false,
+            prefetch_experts: None,
             host_buffers: 0,
             prefill_chunk: None,
         }
@@ -224,6 +243,17 @@ impl OpenConfig {
         }
     }
 
+    /// Experts per layer a speculative prefetch reads:
+    /// [`Self::prefetch_experts`], else
+    /// [`DEFAULT_CAPPED_PREFETCH_EXPERTS`] under a cap, else all K.
+    pub fn resolved_prefetch_experts(&self) -> usize {
+        match self.prefetch_experts {
+            Some(n) => n,
+            None if self.mem_cap.is_some() => DEFAULT_CAPPED_PREFETCH_EXPERTS,
+            None => crate::riir::moe::expert_forward::MAX_K,
+        }
+    }
+
     /// The layer range to run: [`Self::layer_range`] or the whole model.
     pub fn resolved_layer_range(&self) -> std::ops::Range<usize> {
         self.layer_range
@@ -283,6 +313,16 @@ mod tests {
         let chosen = OpenConfig { prefill_chunk: Some(1024), ..capped };
         assert_eq!(chosen.resolved_prefill_chunk(), 1024);
         assert!(OpenConfig { prefill_chunk: Some(0), ..c }.validate().is_err());
+    }
+
+    #[test]
+    fn prefetch_experts_defaults_to_top_4_under_a_cap() {
+        let c = OpenConfig::default();
+        assert_eq!(c.resolved_prefetch_experts(), crate::riir::moe::expert_forward::MAX_K);
+        let capped = OpenConfig { mem_cap: Some(6 << 30), ..c };
+        assert_eq!(capped.resolved_prefetch_experts(), DEFAULT_CAPPED_PREFETCH_EXPERTS);
+        let off = OpenConfig { prefetch_experts: Some(0), ..capped };
+        assert_eq!(off.resolved_prefetch_experts(), 0);
     }
 
     #[test]

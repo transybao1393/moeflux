@@ -212,6 +212,19 @@ which print the stats CSV; flip a default only after it wins there.
 - **Nothing is on by default.** No speed could be measured here (no
   weights), so every Phase 6 knob ships off and the default path is
   the Phase 2 one; the stats CSV decides each default on the M4.
+  Exception, measured since on OLMoE-1B-7B (6 GiB cap, 4 prompts ×
+  256 tokens): `prefetch_experts` — speculative reads per layer, the
+  previous token's picks by router weight — defaults to 4 under a cap.
+  Reading all 8 wasted 42% of decode reads (27% of guesses used) on an
+  SSD already at its ~6.7 GB/s ceiling. tok/s, all 8 / top 4 / top 2 /
+  off: 7.4 / 8.5 / 8.3 / 8.1 with a 0.35 GiB hot tier, 11.3 / 11.8 /
+  11.7 / 11.2 with 1.19 GiB; logits bit-identical. Uncapped keeps all
+  K. Routing traces (`MOEFLUX_ROUTING_TRACE`) replayed in
+  `tools/sim_expert_cache.py` found no better guess: a moving router
+  score ties the previous token (±1 pt), recency-ranked and
+  hot-skipping guesses are worse, LFU beats LRU and short-retention
+  tiers, and a 64-slot recent-read window got no hits in the engine
+  (≈145 slot fills per token).
 - **Cross-layer input is layer L's post-attention residual** (`h_mid`),
   not layer L's output: the output only exists once L's experts have
   run on the GPU. It goes through L+1's `post_attention_layernorm` and

@@ -128,6 +128,9 @@ pub struct PrefetchState {
     mode: ExpertIoMode,
     /// Cross-layer guesser when [`PrefetchGuess::CrossLayer`] is on.
     cross: Option<CrossLayerGuesser>,
+    /// Experts per layer a prefetch reads, strongest guess first
+    /// ([`crate::riir::OpenConfig::prefetch_experts`]); `0` = off.
+    max_experts: usize,
 }
 
 #[derive(Debug)]
@@ -248,7 +251,19 @@ impl PrefetchState {
             misses: AtomicU64::new(0),
             mode,
             cross: None,
+            max_experts: MAX_K,
         }
+    }
+
+    /// Read at most `n` experts per layer per prefetch (guesses are
+    /// ordered strongest first); `0` turns speculative prefetch off.
+    pub fn set_max_experts(&mut self, n: usize) {
+        self.max_experts = n.min(MAX_K);
+    }
+
+    /// Experts per layer a prefetch reads.
+    pub fn max_experts(&self) -> usize {
+        self.max_experts
     }
 
     /// Turn on cross-layer guesses ([`PrefetchGuess::CrossLayer`]).
@@ -412,15 +427,24 @@ impl PrefetchState {
     /// If a prior prefetch of the same set is still in flight, drains
     /// it first. Correct callers won't hit that path; the drain is
     /// defensive. The other set's prefetch keeps running.
+    ///
+    /// Only the first [`Self::max_experts`] guesses are read (guesses
+    /// are ordered strongest first); with `0` nothing is dispatched.
     pub fn dispatch(
         &mut self,
         target_layer: usize,
-        predicted: [i32; MAX_K],
+        mut predicted: [i32; MAX_K],
         k: usize,
         data_prefetch: [&mut [u8]; MAX_K],
         pool: &rayon::ThreadPool,
         expert_files: &ExpertFiles,
     ) {
+        if self.max_experts == 0 {
+            return;
+        }
+        for e in predicted[self.max_experts.min(k)..k].iter_mut() {
+            *e = -1;
+        }
         let set = target_layer % 2;
         self.drain_set(set);
         let (tx, rx) = sync_channel::<Result<(), ExpertIoError>>(MAX_K);

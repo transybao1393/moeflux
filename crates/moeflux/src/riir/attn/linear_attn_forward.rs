@@ -2173,8 +2173,15 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                     expert_files.counters().record_guess(Guesser::CrossLayer, k as u64, correct);
                 }
             }
+            // Strongest pick first, so a prefetch limited to the top
+            // few reads the likeliest repeats. Only the guess is
+            // reordered; the dispatch below uses `indices` as routed.
+            let mut order: [usize; MAX_K] = std::array::from_fn(|i| i);
+            order[..k].sort_by(|&a, &b| weights[b].total_cmp(&weights[a]));
             let mut actuals: [i32; MAX_K] = [0; MAX_K];
-            actuals[..k].copy_from_slice(&indices[..k]);
+            for (dst, &i) in actuals[..k].iter_mut().zip(&order[..k]) {
+                *dst = indices[i];
+            }
             prefetch.record_actual(layer_idx, actuals);
 
             // 5. Build per-slot bindings — hits read from
