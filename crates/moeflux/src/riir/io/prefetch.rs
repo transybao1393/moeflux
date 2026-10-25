@@ -354,6 +354,12 @@ impl PrefetchState {
             slot_ptrs[i] = Some(DataPrefetchPtr::from_slice(dst));
         }
         for slot in 0..k {
+            // Negative entries are slots the caller masked out (expert
+            // already resident in the hot tier): nothing to read.
+            if predicted[slot] < 0 {
+                let _ = tx.send(Ok(()));
+                continue;
+            }
             let expert_idx = predicted[slot] as usize;
             let dst_ptr = slot_ptrs[slot].expect("slot 0..k populated");
             let tx = tx.clone();
@@ -363,7 +369,7 @@ impl PrefetchState {
             pool.spawn(move || {
                 let dst = unsafe { dst_ptr.as_mut_slice() };
                 let efs = unsafe { efp.as_ref() };
-                let r = efs.read_expert(target_layer, expert_idx, dst);
+                let r = efs.read_expert_disk(target_layer, expert_idx, dst);
                 let _ = tx.send(r);
             });
         }

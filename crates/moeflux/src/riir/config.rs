@@ -49,6 +49,15 @@ pub struct OpenConfig {
     /// Bytes reserved inside `mem_cap` for Metal/driver/runtime
     /// overhead and scratch. Only used when `mem_cap` is set.
     pub runtime_overhead: u64,
+    /// Size of the RAM hot tier for experts
+    /// ([`crate::riir::io::hot_tier`]). `None`: under a cap, everything
+    /// left after the budget plan; without a cap, no hot tier.
+    /// `Some(0)` disables it. Requires `Pread` expert IO.
+    pub hot_tier_bytes: Option<u64>,
+    /// Routing profile to seed the hot tier from at open (written by
+    /// [`crate::riir::RsCtx::save_routing_profile`]). Most-picked
+    /// experts are loaded first.
+    pub hot_tier_profile: Option<std::path::PathBuf>,
 }
 
 impl Default for OpenConfig {
@@ -59,6 +68,8 @@ impl Default for OpenConfig {
             io_threads: DEFAULT_IO_THREADS,
             mem_cap: None,
             runtime_overhead: DEFAULT_RUNTIME_OVERHEAD,
+            hot_tier_bytes: None,
+            hot_tier_profile: None,
         }
     }
 }
@@ -74,6 +85,10 @@ impl OpenConfig {
         }
         if self.io_threads == 0 {
             return Err("io_threads must be ≥ 1".into());
+        }
+        if self.hot_tier_bytes.is_some_and(|b| b > 0) && self.expert_io == Some(ExpertIoMode::Mmap)
+        {
+            return Err("hot_tier_bytes needs expert_io = Pread (mmap mode binds the files)".into());
         }
         if self.mem_cap.is_some() && self.expert_io == Some(ExpertIoMode::Mmap) {
             return Err(

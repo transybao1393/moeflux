@@ -46,6 +46,8 @@ routing_data.bin
 telemetry/
 profiles/
 *.csv
+# Routing profiles for hot-tier seeding (RsCtx::save_routing_profile)
+*.prof
 
 # Rust
 target/

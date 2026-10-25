@@ -482,14 +482,31 @@ impl RsCtx<MetalBackend> {
         } else {
             io::expert_io_mode::select_with(config.expert_io)
         };
+        let expert_size = VARIANT.expert_size_4bit() as u64;
+        let mut hot_tier_bytes = match config.mem_cap {
+            None => config.hot_tier_bytes.unwrap_or(0),
+            Some(_) => config.hot_tier_bytes.unwrap_or(u64::MAX),
+        };
+        if hot_tier_bytes > 0 && expert_io_mode.is_mmap() {
+            return Err(RsError::InvalidConfig {
+                detail: "a hot tier needs Pread expert IO; mmap mode was selected".into(),
+            });
+        }
         if let Some(cap) = config.mem_cap {
             let weights_bytes = std::fs::metadata(weights).map_err(|_| RsError::InitFailed)?.len();
-            let plan = budget::BudgetPlan::for_config(
+            let mut plan = budget::BudgetPlan::for_config(
                 n_ctx,
                 expert_io_mode,
                 weights_bytes,
                 config.runtime_overhead,
             );
+            plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
+            // `None` → the hot tier takes whatever the plan leaves.
+            if hot_tier_bytes == u64::MAX {
+                hot_tier_bytes = cap - plan.total();
+            }
+            hot_tier_bytes = hot_tier_bytes / expert_size * expert_size;
+            plan.set(budget::Account::HotTier, hot_tier_bytes);
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
             eprintln!(
                 "[budget] cap {} — plan {} ({})",
@@ -498,9 +515,19 @@ impl RsCtx<MetalBackend> {
                 plan.breakdown()
             );
         }
-        let wf = WeightFile::open(weights, manifest).map_err(|_| RsError::InitFailed)?;
+        // Under a hard cap nothing may live in the page cache: weights
+        // are read with F_NOCACHE into owned memory (counted in the
+        // footprint), expert files get F_NOCACHE and no mmap.
+        let capped = config.mem_cap.is_some();
+        let load = if capped {
+            io::weight_file::WeightLoad::ReadNoCache
+        } else {
+            io::weight_file::WeightLoad::Mmap
+        };
+        let wf = WeightFile::open_with(weights, manifest, load).map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
-        let experts = ExpertFiles::open(experts_dir).map_err(|_| RsError::InitFailed)?;
+        let experts = ExpertFiles::open_with(experts_dir, !capped, capped)
+            .map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states(n_ctx);
         // Top-k is model shape, not a runtime knob — it comes solely
         // from the compiled variant. (A runtime `experts_per_tok`
@@ -550,12 +577,76 @@ impl RsCtx<MetalBackend> {
             n_ctx,
             mem_cap: config.mem_cap,
         };
+        if hot_tier_bytes >= expert_size {
+            ctx.attach_hot_tier(hot_tier_bytes, config.hot_tier_profile.as_deref())?;
+        }
         if let Some(cap) = ctx.mem_cap {
             ctx.reserve_at_open(cap)?;
         }
         Ok(ctx)
     }
 
+    /// Build the hot tier (allocated and touched now), seed it from
+    /// `profile` if given, and attach it to the expert files.
+    fn attach_hot_tier(&mut self, bytes: u64, profile: Option<&Path>) -> Result<(), RsError> {
+        use io::hot_tier::{HotTier, load_profile};
+        let v = VARIANT;
+        let expert_size = v.expert_size_4bit();
+        let capacity = HotTier::slots_for_bytes(bytes, expert_size);
+        let device = self.metal_mut()?.device().to_owned();
+        let hot = HotTier::new(&device, capacity, expert_size, v.num_layers, v.num_experts)
+            .map_err(|e| RsError::OverBudget { detail: e.to_string() })?;
+        let seed = match profile {
+            Some(p) => {
+                let counts = load_profile(p, v.num_layers, v.num_experts).map_err(|e| {
+                    RsError::InvalidConfig {
+                        detail: format!("hot_tier_profile {}: {e}", p.display()),
+                    }
+                })?;
+                hot.seed_from_counts(&counts)
+            }
+            None => Vec::new(),
+        };
+        self.experts.attach_hot_tier(hot);
+        // Seed reads go through `read_expert_disk`, which offers each
+        // blob to the (not yet full) tier.
+        {
+            use rayon::prelude::*;
+            let experts = &self.experts;
+            self.io_pool.install(|| {
+                seed.par_iter().try_for_each_init(
+                    || vec![0u8; expert_size],
+                    |buf, &(layer, expert)| experts.read_expert_disk(layer, expert, buf),
+                )
+            })
+            .map_err(|_| RsError::InitFailed)?;
+        }
+        eprintln!(
+            "[hot_tier] {} slots ({}), seeded {} from profile",
+            capacity,
+            budget::fmt_gib(bytes),
+            self.experts.hot_tier().map_or(0, |h| h.stats().resident)
+        );
+        Ok(())
+    }
+
+    /// Expert-IO counters: disk reads/bytes and hot-tier stats.
+    pub fn expert_io_stats(&self) -> io::expert_io::ExpertIoStats {
+        self.experts.io_stats()
+    }
+
+    /// Routing popularity since open, `layer * num_experts + expert`.
+    pub fn routing_counts(&self) -> Vec<u32> {
+        self.experts.routing_counts()
+    }
+
+    /// Write [`Self::routing_counts`] as a profile file for
+    /// [`OpenConfig::hot_tier_profile`].
+    pub fn save_routing_profile(&self, path: &Path) -> Result<(), RsError> {
+        let v = VARIANT;
+        io::hot_tier::save_profile(path, v.num_layers, v.num_experts, &self.routing_counts())
+            .map_err(|_| RsError::StateFailed)
+    }
 
     /// Hard-cap open path: build every resource now and touch the KV
     /// caches, so the context reaches its steady-state footprint
@@ -1568,6 +1659,7 @@ impl RsCtx<MetalBackend> {
         if tokens.is_empty() {
             return Ok(());
         }
+        self.experts.begin_epoch();
         self.step_internal(tokens, start_pos as i32, Some(&mut logits[..]))?;
         self.check_cap("eval_prompt")
     }
@@ -1599,6 +1691,7 @@ impl RsCtx<MetalBackend> {
         if logits.len() != VARIANT.vocab_size {
             return Err(RsError::EvalFailed);
         }
+        self.experts.begin_epoch();
         match eval_token_mode() {
             EvalTokenMode::Oracle => {
                 self.step_internal_per_token_oracle(token, pos as i32, Some(logits))?
@@ -2553,7 +2646,16 @@ impl RsCtx<MetalBackend> {
             // (low-RAM variants whose working set exceeds page-cache
             // capacity) fires it as before.
             if prefetch.mode().is_pread() {
-                if let Some(predicted) = prefetch.predict_for(layer_idx) {
+                if let Some(mut predicted) = prefetch.predict_for(layer_idx) {
+                    // Experts already in the hot tier bind from RAM;
+                    // don't spend SSD bandwidth prefetching them.
+                    if let Some(hot) = experts.hot_tier() {
+                        for e in predicted[..k_active].iter_mut() {
+                            if *e >= 0 && hot.contains(layer_idx, *e as usize) {
+                                *e = -1;
+                            }
+                        }
+                    }
                     let data_prefetch =
                         moe_buffers.data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
                     prefetch.dispatch(

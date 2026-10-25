@@ -46,6 +46,8 @@ pub enum Account {
     PrefillStaging,
     /// Metal/driver/runtime overhead and scratch.
     RuntimeOverhead,
+    /// RAM hot tier of experts (sized from what the cap leaves).
+    HotTier,
 }
 
 impl Account {
@@ -58,6 +60,7 @@ impl Account {
             Account::ExpertSlots => "expert_slots",
             Account::PrefillStaging => "prefill_staging",
             Account::RuntimeOverhead => "runtime_overhead",
+            Account::HotTier => "hot_tier",
         }
     }
 }
@@ -126,6 +129,14 @@ impl BudgetPlan {
                 (Account::PrefillStaging, staging),
                 (Account::RuntimeOverhead, runtime_overhead),
             ],
+        }
+    }
+
+    /// Add (or replace) one account.
+    pub fn set(&mut self, account: Account, bytes: u64) {
+        match self.entries.iter_mut().find(|(a, _)| *a == account) {
+            Some(e) => e.1 = bytes,
+            None => self.entries.push((account, bytes)),
         }
     }
 

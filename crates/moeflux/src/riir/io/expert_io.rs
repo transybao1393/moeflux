@@ -40,6 +40,8 @@ use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
 use memmap2::Mmap;
 use metal::{Buffer, MTLResourceOptions, NSUInteger};
 use moeflux_metal::ResidencySet;
@@ -188,6 +190,25 @@ pub struct ExpertFiles {
     /// Per-layer mmap. Populated at `open` time when `mode == Mmap`.
     /// `None` for the Pread mode and for missing layers.
     mmap_layers: Vec<Option<Mmap>>,
+    /// Optional RAM cache of hot experts ([`Self::attach_hot_tier`]).
+    hot: Option<super::hot_tier::HotTier>,
+    /// Routing popularity, `layer * num_experts + expert`, never
+    /// decayed — the source for [`Self::routing_counts`] profiles.
+    picks: Vec<AtomicU32>,
+    /// Disk reads served (count) and bytes read.
+    disk_reads: AtomicU64,
+    disk_bytes: AtomicU64,
+}
+
+/// Expert-IO counters since open (or the last reset).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpertIoStats {
+    /// Expert blobs read from disk.
+    pub disk_reads: u64,
+    /// Bytes read from disk.
+    pub disk_bytes: u64,
+    /// Hot-tier counters, when a hot tier is attached.
+    pub hot: Option<super::hot_tier::HotTierStats>,
 }
 
 impl ExpertFiles {
@@ -204,6 +225,17 @@ impl ExpertFiles {
     /// runtime gate picks pread mode (see
     /// [`crate::riir::io::expert_io_mode::select`]).
     pub fn open(experts_dir: &Path) -> Result<Self, ExpertIoError> {
+        Self::open_with(experts_dir, true, false)
+    }
+
+    /// [`Self::open`] with explicit page-cache behavior.
+    ///
+    /// - `mmap = false` skips the per-layer mmaps; only valid when the
+    ///   expert-IO mode is `Pread` (every read goes through
+    ///   [`Self::read_expert`]).
+    /// - `nocache = true` sets `F_NOCACHE` on every layer fd, so expert
+    ///   reads never grow the page cache. Used under a hard memory cap.
+    pub fn open_with(experts_dir: &Path, mmap: bool, nocache: bool) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
         let subdir = experts_dir.join("packed_experts");
         let mut layers = Vec::with_capacity(v.num_layers);
@@ -213,16 +245,22 @@ impl ExpertFiles {
             match File::open(&path) {
                 Ok(f) => {
                     disable_readahead(&f);
-                    // SAFETY: file is owned by the closure for the
-                    // duration of the mmap call; the resulting mapping
-                    // survives the file handle (closed when `f` drops
-                    // at end of this match arm). Returned mapping is
-                    // read-only, no aliasing concerns.
-                    let mmap = unsafe { Mmap::map(&f) }.map_err(|e| ExpertIoError::Io {
-                        layer: i,
-                        source: e,
-                    })?;
-                    mmap_layers[i] = Some(mmap);
+                    if nocache {
+                        crate::riir::io::weight_file::set_nocache(&f)
+                            .map_err(|e| ExpertIoError::Io { layer: i, source: e })?;
+                    }
+                    if mmap {
+                        // SAFETY: file is owned by the closure for the
+                        // duration of the mmap call; the resulting mapping
+                        // survives the file handle (closed when `f` drops
+                        // at end of this match arm). Returned mapping is
+                        // read-only, no aliasing concerns.
+                        let m = unsafe { Mmap::map(&f) }.map_err(|e| ExpertIoError::Io {
+                            layer: i,
+                            source: e,
+                        })?;
+                        mmap_layers[i] = Some(m);
+                    }
                     layers.push(Some(f));
                 }
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -239,9 +277,11 @@ impl ExpertFiles {
         let mmap_buffers = (0..v.num_layers).map(|_| None).collect();
         let mmap_buf_ids = (0..v.num_layers).map(|_| None).collect();
         eprintln!(
-            "[experts] {} layer(s) mmap'd \
+            "[experts] {} layer(s) opened, {} mmap'd{} \
              (Metal buffers built on first batched call)",
-            mmap_layers.iter().filter(|m| m.is_some()).count()
+            layers.iter().filter(|f| f.is_some()).count(),
+            mmap_layers.iter().filter(|m| m.is_some()).count(),
+            if nocache { ", F_NOCACHE" } else { "" }
         );
         Ok(Self {
             expert_rset: None,
@@ -251,6 +291,10 @@ impl ExpertFiles {
             mmap_buffers,
             mmap_buf_ids,
             mmap_layers,
+            hot: None,
+            picks: (0..v.num_layers * v.num_experts).map(|_| AtomicU32::new(0)).collect(),
+            disk_reads: AtomicU64::new(0),
+            disk_bytes: AtomicU64::new(0),
         })
     }
 
@@ -406,6 +450,58 @@ impl ExpertFiles {
         expert_idx: usize,
         out: &mut [u8],
     ) -> Result<(), ExpertIoError> {
+        self.read_expert_checks(layer_idx, expert_idx, out)?;
+        if let Some(hot) = &self.hot {
+            if hot.copy_out(layer_idx, expert_idx, out) {
+                return Ok(());
+            }
+        }
+        self.read_expert_disk(layer_idx, expert_idx, out)
+    }
+
+    /// [`Self::read_expert`] without the hot-tier lookup: always reads
+    /// from disk, then offers the bytes to the hot tier. For callers
+    /// that already looked the expert up (decode dispatch) or read
+    /// speculatively (prefetch). Same argument checks.
+    pub fn read_expert_disk(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        out: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        self.read_expert_checks(layer_idx, expert_idx, out)?;
+        let Some(file) = self.layers[layer_idx].as_ref() else {
+            return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
+        };
+        let off = (expert_idx as u64) * (self.expert_size as u64);
+        let n = file.read_at(out, off).map_err(|e| ExpertIoError::Io {
+            layer: layer_idx,
+            source: e,
+        })?;
+        if n != self.expert_size {
+            return Err(ExpertIoError::ShortRead {
+                layer: layer_idx,
+                expert: expert_idx,
+                expected: self.expert_size,
+                actual: n,
+            });
+        }
+        self.disk_reads.fetch_add(1, Ordering::Relaxed);
+        self.disk_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        if let Some(hot) = &self.hot {
+            hot.offer(layer_idx, expert_idx, out);
+        }
+        Ok(())
+    }
+
+    /// Argument validation shared by the read paths; returns the
+    /// error for the first failing check (`Ok` only if all pass).
+    fn read_expert_checks(
+        &self,
+        layer_idx: usize,
+        expert_idx: usize,
+        out: &[u8],
+    ) -> Result<(), ExpertIoError> {
         let v: Variant = VARIANT;
         if layer_idx >= v.num_layers {
             return Err(ExpertIoError::BadLayerIdx {
@@ -425,23 +521,52 @@ impl ExpertFiles {
                 actual: out.len(),
             });
         }
-        let Some(file) = self.layers[layer_idx].as_ref() else {
-            return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
-        };
-        let off = (expert_idx as u64) * (self.expert_size as u64);
-        let n = file.read_at(out, off).map_err(|e| ExpertIoError::Io {
-            layer: layer_idx,
-            source: e,
-        })?;
-        if n != self.expert_size {
-            return Err(ExpertIoError::ShortRead {
-                layer: layer_idx,
-                expert: expert_idx,
-                expected: self.expert_size,
-                actual: n,
-            });
-        }
         Ok(())
+    }
+
+    /// Attach a hot tier. Subsequent [`Self::read_expert`] calls are
+    /// served from it on a hit and offer misses for admission.
+    pub fn attach_hot_tier(&mut self, hot: super::hot_tier::HotTier) {
+        self.hot = Some(hot);
+    }
+
+    /// The attached hot tier, if any.
+    pub fn hot_tier(&self) -> Option<&super::hot_tier::HotTier> {
+        self.hot.as_ref()
+    }
+
+    /// Record a routed pick of `(layer, expert)` — feeds the routing
+    /// profile and the hot tier's popularity counters.
+    pub fn record_pick(&self, layer: usize, expert: usize, n: u32) {
+        let v = VARIANT;
+        if layer >= v.num_layers || expert >= v.num_experts {
+            return;
+        }
+        self.picks[layer * v.num_experts + expert].fetch_add(n, Ordering::Relaxed);
+        if let Some(hot) = &self.hot {
+            hot.record_picks(layer, expert, n);
+        }
+    }
+
+    /// Routing popularity since open, `layer * num_experts + expert`.
+    pub fn routing_counts(&self) -> Vec<u32> {
+        self.picks.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+    }
+
+    /// Disk and hot-tier counters.
+    pub fn io_stats(&self) -> ExpertIoStats {
+        ExpertIoStats {
+            disk_reads: self.disk_reads.load(Ordering::Relaxed),
+            disk_bytes: self.disk_bytes.load(Ordering::Relaxed),
+            hot: self.hot.as_ref().map(|h| h.stats()),
+        }
+    }
+
+    /// Mark a new token for the hot tier's GPU-hazard rule.
+    pub fn begin_epoch(&self) {
+        if let Some(hot) = &self.hot {
+            hot.begin_epoch();
+        }
     }
 
     /// Number of layers (matches [`Variant::num_layers`]).

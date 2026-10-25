@@ -1943,6 +1943,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
     let weights = &intermediates.routing_weights;
     let shared_gate_score = intermediates.shared_gate_score;
     let k = indices.len();
+    for &idx in indices.iter() {
+        expert_files.record_pick(layer_idx, idx as usize, 1);
+    }
 
     if gpu_combine {
         // Bindings layout: one `(&Buffer, byte_offset)` per active
@@ -1975,6 +1978,15 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             use rayon::prelude::*;
             const MAX_K: usize = crate::riir::moe::expert_forward::MAX_K;
 
+            // 0. Hot tier first: a resident expert binds its RAM slot
+            //    directly (zero copy, zero I/O) and skips steps 2-3.
+            let mut hot_bind: [Option<(&metal::Buffer, u64)>; MAX_K] = [None; MAX_K];
+            if let Some(hot) = expert_files.hot_tier() {
+                for slot in 0..k {
+                    hot_bind[slot] = hot.lookup(layer_idx, indices[slot] as usize);
+                }
+            }
+
             // 1. Drain any in-flight prefetch and check whether it
             //    targeted THIS layer.
             let prefetch_status = prefetch.wait_for(layer_idx);
@@ -1988,6 +2000,9 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             let mut hit_count: u64 = 0;
             if let Some(status) = prefetch_status {
                 for slot in 0..k {
+                    if hot_bind[slot].is_some() {
+                        continue;
+                    }
                     let actual = indices[slot];
                     for buf_idx in 0..status.k {
                         if status.loaded_indices[buf_idx] == actual {
@@ -1998,7 +2013,8 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                     }
                 }
             }
-            prefetch.record_outcome(hit_count, k as u64 - hit_count);
+            let hot_count = hot_bind[..k].iter().filter(|b| b.is_some()).count() as u64;
+            prefetch.record_outcome(hit_count, k as u64 - hit_count - hot_count);
 
             // 3. Parallel sync-pread the misses into data_synced.
             //    Hoist disjoint-slice array outside the rayon closure
@@ -2011,9 +2027,10 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                         .par_iter_mut()
                         .enumerate()
                         .try_for_each(|(slot, dst)| {
-                            if data_set_per_slot[slot] == SlotSource::Synced {
+                            if hot_bind[slot].is_none() && data_set_per_slot[slot] == SlotSource::Synced
+                            {
                                 let expert_idx = indices[slot] as usize;
-                                expert_files.read_expert(layer_idx, expert_idx, *dst)
+                                expert_files.read_expert_disk(layer_idx, expert_idx, *dst)
                             } else {
                                 Ok(())
                             }
@@ -2041,7 +2058,8 @@ pub(in crate::riir) fn moe_dispatch_per_token(
                 .collect::<Vec<_>>();
             bindings_synced
                 .iter()
-                .map(|id| (buffer_pool.handle(*id), 0u64))
+                .enumerate()
+                .map(|(slot, id)| hot_bind[slot].unwrap_or((buffer_pool.handle(*id), 0u64)))
                 .collect()
         };
 
@@ -2828,6 +2846,11 @@ where
     // for the per-token oracle's `record_actual` write at the end of
     // this function. `moe_buffers` is similarly decode-only.
     let _ = moe_buffers;
+    // Routing popularity (profile + hot-tier admission), both modes.
+    for (bi, &expert_id) in buckets.expert_ids.iter().enumerate() {
+        let picks = buckets.offsets[bi + 1] - buckets.offsets[bi];
+        expert_files.record_pick(layer_idx, expert_id as usize, picks as u32);
+    }
     let expert_base_id: BufId<ExpertBaseBuf> = match moe.expert_base {
         None => {
             expert_files
@@ -2840,6 +2863,8 @@ where
             let mut blob_scratch = vec![0u8; expert_size];
             let pool = backend.pool_mut();
             for &expert_id in buckets.expert_ids.iter() {
+                // Hot-tier hit → memcpy from RAM; miss → disk read,
+                // offered to the hot tier for admission.
                 expert_files.read_expert(layer_idx, expert_id as usize, &mut blob_scratch)?;
                 let off = expert_id as usize * expert_size;
                 pool.upload_at(base_id, off, &blob_scratch)?;

@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use serde::Deserialize;
 
 /// Errors from the weight-file loader.
@@ -78,8 +78,78 @@ pub struct TensorInfo {
 /// [`WeightFile::open`]; tensor data via [`WeightFile::tensor_bytes`]
 /// (slice view into the mmap, lives as long as `&self`).
 pub struct WeightFile {
-    mmap: Mmap,
+    backing: Backing,
+    /// Bytes of weight data (the file length). The backing may be
+    /// longer (owned copies are rounded up to a 16 KiB page).
+    len: usize,
     tensors: HashMap<String, TensorInfo>,
+}
+
+/// How [`WeightFile`] holds the blob.
+enum Backing {
+    /// File-backed mmap: pages live in the OS page cache.
+    Mmap(Mmap),
+    /// Anonymous, page-aligned copy read with `F_NOCACHE`: counted in
+    /// the process footprint, never in the page cache. Used under a
+    /// hard memory cap.
+    Owned(MmapMut),
+}
+
+impl Backing {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Backing::Mmap(m) => m,
+            Backing::Owned(m) => m,
+        }
+    }
+}
+
+/// How [`WeightFile::open_with`] loads the blob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightLoad {
+    /// mmap the file (historical default; page-cache backed).
+    Mmap,
+    /// Read the whole file with `F_NOCACHE` into an anonymous,
+    /// 16 KiB-page-aligned allocation.
+    ReadNoCache,
+}
+
+/// Apple Silicon VM page size; also the alignment
+/// `newBufferWithBytesNoCopy` requires.
+const PAGE: usize = 16384;
+
+/// Read all of `file` into a fresh anonymous mapping with the page
+/// cache disabled for this fd.
+fn read_nocache(file: &File, len: usize) -> Result<MmapMut, std::io::Error> {
+    use std::os::unix::fs::FileExt;
+    set_nocache(file)?;
+    let mut buf = MmapMut::map_anon(len.div_ceil(PAGE).max(1) * PAGE)?;
+    const CHUNK: usize = 64 << 20;
+    let mut off = 0;
+    while off < len {
+        let end = (off + CHUNK).min(len);
+        let n = file.read_at(&mut buf[off..end], off as u64)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("weights file ended at {off} of {len} bytes"),
+            ));
+        }
+        off += n;
+    }
+    Ok(buf)
+}
+
+/// `fcntl(fd, F_NOCACHE, 1)`: reads on this fd bypass the unified
+/// buffer cache, so loading model files doesn't grow the page cache.
+pub fn set_nocache(file: &File) -> Result<(), std::io::Error> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: valid owned fd for the duration of the call.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1i32) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl WeightFile {
@@ -88,18 +158,35 @@ impl WeightFile {
     /// `<artifacts>/model_weights.json` (matching the C `Ctx::open`
     /// argument order).
     pub fn open(bin_path: &Path, manifest_path: &Path) -> Result<Self, WeightFileError> {
+        Self::open_with(bin_path, manifest_path, WeightLoad::Mmap)
+    }
+
+    /// [`Self::open`] with an explicit load strategy.
+    pub fn open_with(
+        bin_path: &Path,
+        manifest_path: &Path,
+        load: WeightLoad,
+    ) -> Result<Self, WeightFileError> {
         let file = File::open(bin_path)?;
-        // SAFETY: mmap of a regular file we just opened. The file
-        // descriptor is closed when `file` drops (after Mmap takes
-        // ownership of the mapping). On Linux/macOS a `MAP_PRIVATE`
-        // mmap stays valid until munmap regardless of fd state.
-        let mmap = unsafe { Mmap::map(&file)? };
+        let len = file.metadata()?.len() as usize;
+        let backing = match load {
+            // SAFETY: mmap of a regular file we just opened. The file
+            // descriptor is closed when `file` drops (after Mmap takes
+            // ownership of the mapping). On Linux/macOS a `MAP_PRIVATE`
+            // mmap stays valid until munmap regardless of fd state.
+            WeightLoad::Mmap => Backing::Mmap(unsafe { Mmap::map(&file)? }),
+            WeightLoad::ReadNoCache => Backing::Owned(read_nocache(&file, len)?),
+        };
         let tensors = parse_manifest(manifest_path)?;
-        let wf = WeightFile { mmap, tensors };
+        let wf = WeightFile { backing, len, tensors };
         wf.bounds_check_all()?;
         eprintln!(
-            "[weights] mmap'd {:.2} GB from {}",
-            wf.mmap.len() as f64 / 1e9,
+            "[weights] {} {:.2} GB from {}",
+            match load {
+                WeightLoad::Mmap => "mmap'd",
+                WeightLoad::ReadNoCache => "read (F_NOCACHE)",
+            },
+            wf.len as f64 / 1e9,
             bin_path.display()
         );
         eprintln!(
@@ -112,7 +199,7 @@ impl WeightFile {
 
     /// Total bytes in the mmap'd file.
     pub fn file_size(&self) -> usize {
-        self.mmap.len()
+        self.len
     }
 
     /// Number of tensors in the manifest.
@@ -138,7 +225,7 @@ impl WeightFile {
         let info = self.tensor_info(name)?;
         let start = info.offset as usize;
         let end = start + info.size as usize;
-        Some(&self.mmap[start..end])
+        Some(&self.backing.bytes()[start..end])
     }
 
     /// Borrowed byte slice `[offset, offset + len)` of the mmap'd
@@ -152,10 +239,10 @@ impl WeightFile {
     pub fn bytes_at(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let start = offset as usize;
         let end = start.checked_add(len)?;
-        if end > self.mmap.len() {
+        if end > self.len {
             return None;
         }
-        Some(&self.mmap[start..end])
+        Some(&self.backing.bytes()[start..end])
     }
 
     /// Iterator over `(name, info)` pairs. Order is HashMap-defined
@@ -170,7 +257,7 @@ impl WeightFile {
     /// — a typical forward pass walks ~1400 tensors per token, the
     /// per-call branch matters in the hot loop.
     fn bounds_check_all(&self) -> Result<(), WeightFileError> {
-        let file_size = self.mmap.len() as u64;
+        let file_size = self.len as u64;
         for (name, info) in &self.tensors {
             let end = info.offset.saturating_add(info.size);
             if end > file_size {
@@ -189,7 +276,7 @@ impl WeightFile {
 impl std::fmt::Debug for WeightFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeightFile")
-            .field("file_size", &self.mmap.len())
+            .field("file_size", &self.len)
             .field("num_tensors", &self.tensors.len())
             .finish()
     }
@@ -242,6 +329,40 @@ fn parse_manifest(path: &Path) -> Result<HashMap<String, TensorInfo>, WeightFile
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ReadNoCache` returns byte-identical tensors to `Mmap`, with a
+    /// file length that isn't a page multiple (exercises the padded
+    /// tail of the owned copy).
+    #[test]
+    fn read_nocache_matches_mmap() {
+        let dir = std::env::temp_dir().join(format!("moeflux-wf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("w.bin");
+        let manifest = dir.join("w.json");
+        let len = PAGE * 3 + 123;
+        let data: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&bin, &data).unwrap();
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{"tensors": {{
+                    "a": {{"offset": 0, "size": 4096, "shape": [4096], "dtype": "U8"}},
+                    "tail": {{"offset": {}, "size": 123, "shape": [123], "dtype": "U8"}}
+                }}}}"#,
+                PAGE * 3
+            ),
+        )
+        .unwrap();
+        let m = WeightFile::open_with(&bin, &manifest, WeightLoad::Mmap).unwrap();
+        let o = WeightFile::open_with(&bin, &manifest, WeightLoad::ReadNoCache).unwrap();
+        assert_eq!(m.file_size(), len);
+        assert_eq!(o.file_size(), len);
+        for name in ["a", "tail"] {
+            assert_eq!(m.tensor_bytes(name), o.tensor_bytes(name), "{name}");
+        }
+        assert_eq!(o.tensor_bytes("tail").unwrap(), &data[PAGE * 3..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Manifest parser handles the documented schema, including
     /// older manifests without `bits`. Doesn't need a real model.
