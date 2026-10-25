@@ -91,3 +91,29 @@ fn streaming_stats_report() {
     // Every pread decode layer after the first token is scored.
     assert!(st.guess_prev.layers > 0, "{st:?}");
 }
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn bounded_io_matches_and_respects_rate() {
+    let base = run(&mut open(&base_cfg()));
+    let rate = 400u64 << 20; // 400 MiB/s
+    let mut ctx = open(&OpenConfig {
+        io_queue_depth: Some(2),
+        io_bytes_per_sec: Some(rate),
+        ..base_cfg()
+    });
+    ctx.reset_expert_io_stats();
+    let t0 = std::time::Instant::now();
+    let got = run(&mut ctx);
+    let secs = t0.elapsed().as_secs_f64();
+    let st = ctx.expert_io_stats();
+    print_stats("bounded", &st);
+    assert_same("bounded io", &base, &got);
+    // Bytes over wall time can exceed the rate by at most the burst.
+    let burst = rate as f64 * moeflux::riir::io::io_limit::RATE_BURST.as_secs_f64();
+    assert!(
+        st.disk_bytes as f64 <= rate as f64 * secs + burst,
+        "{} bytes in {secs:.2}s over {rate} B/s",
+        st.disk_bytes
+    );
+}

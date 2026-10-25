@@ -198,9 +198,13 @@ pub struct ExpertFiles {
     /// Streaming telemetry (reads by kind, per layer, timings,
     /// guess accuracy) — see [`super::io_stats`].
     counters: IoCounters,
+    /// Queue-depth and bytes/s limits every disk read passes through
+    /// ([`Self::set_io_limits`]).
+    limits: IoLimits,
 }
 
 pub use super::io_stats::ExpertIoStats;
+use super::io_limit::IoLimits;
 use super::io_stats::{IoCounters, ReadKind};
 
 impl ExpertFiles {
@@ -302,6 +306,7 @@ impl ExpertFiles {
             hot: None,
             picks: (0..v.num_layers * v.num_experts).map(|_| AtomicU32::new(0)).collect(),
             counters: IoCounters::new(v.num_layers),
+            limits: IoLimits::default(),
         })
     }
 
@@ -508,10 +513,12 @@ impl ExpertFiles {
             return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
         };
         let off = (expert_idx as u64) * (self.expert_size as u64);
+        let permit = self.limits.admit(self.expert_size as u64);
         let n = file.read_at(out, off).map_err(|e| ExpertIoError::Io {
             layer: layer_idx,
             source: e,
         })?;
+        drop(permit);
         if n != self.expert_size {
             return Err(ExpertIoError::ShortRead {
                 layer: layer_idx,
@@ -589,6 +596,11 @@ impl ExpertFiles {
     /// Disk, timing, guess and hot-tier counters.
     pub fn io_stats(&self) -> ExpertIoStats {
         self.counters.snapshot(self.hot.as_ref().map(|h| h.stats()))
+    }
+
+    /// Bound every subsequent disk read by `limits` (plan §3 rule 6).
+    pub fn set_io_limits(&mut self, limits: IoLimits) {
+        self.limits = limits;
     }
 
     /// The telemetry store, for the forward paths to record into.

@@ -34,8 +34,19 @@ pub struct OpenConfig {
     /// `Some(_)` wins over the env var.
     pub expert_io: Option<ExpertIoMode>,
     /// Worker threads for parallel expert `pread` and prefetch.
-    /// Must be ≥ 1.
+    /// Must be ≥ 1. Pool reads block, so this also bounds the reads
+    /// the pool has in flight.
     pub io_threads: usize,
+    /// Maximum expert reads in flight at once across every reader —
+    /// decode misses, speculative prefetch, prefill staging and hot-
+    /// tier seeding ([`crate::riir::io::io_limit::IoGate`]). `None`
+    /// (default) adds no bound beyond `io_threads`. Must be ≥ 1.
+    pub io_queue_depth: Option<usize>,
+    /// Optional limit on expert-read bandwidth, bytes per second
+    /// ([`crate::riir::io::io_limit::RateLimiter`]); speculative
+    /// prefetch counts against it like any other read. `None`
+    /// (default) is unlimited. Must be ≥ 1.
+    pub io_bytes_per_sec: Option<u64>,
     /// Hard memory cap in bytes. `None` (default) = no cap, historical
     /// behavior. `Some(cap)`:
     /// - expert IO is forced to [`ExpertIoMode::Pread`]; asking for
@@ -85,6 +96,8 @@ impl Default for OpenConfig {
             n_ctx: MAX_SEQ_LEN,
             expert_io: None,
             io_threads: DEFAULT_IO_THREADS,
+            io_queue_depth: None,
+            io_bytes_per_sec: None,
             mem_cap: None,
             runtime_overhead: DEFAULT_RUNTIME_OVERHEAD,
             hot_tier_bytes: None,
@@ -110,6 +123,12 @@ impl OpenConfig {
         }
         if self.max_requests == 0 {
             return Err("max_requests must be ≥ 1".into());
+        }
+        if self.io_queue_depth == Some(0) {
+            return Err("io_queue_depth must be ≥ 1".into());
+        }
+        if self.io_bytes_per_sec == Some(0) {
+            return Err("io_bytes_per_sec must be ≥ 1".into());
         }
         if self.hot_tier_bytes.is_some_and(|b| b > 0) && self.expert_io == Some(ExpertIoMode::Mmap)
         {
@@ -159,6 +178,16 @@ mod tests {
         assert!(no_threads.validate().is_err());
         let no_requests = OpenConfig { max_requests: 0, ..OpenConfig::default() };
         assert!(no_requests.validate().is_err());
+        let no_depth = OpenConfig { io_queue_depth: Some(0), ..OpenConfig::default() };
+        assert!(no_depth.validate().is_err());
+        let no_rate = OpenConfig { io_bytes_per_sec: Some(0), ..OpenConfig::default() };
+        assert!(no_rate.validate().is_err());
+        let bounded = OpenConfig {
+            io_queue_depth: Some(4),
+            io_bytes_per_sec: Some(1 << 30),
+            ..OpenConfig::default()
+        };
+        assert!(bounded.validate().is_ok());
     }
 
     #[test]

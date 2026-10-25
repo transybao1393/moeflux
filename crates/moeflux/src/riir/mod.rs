@@ -607,8 +607,12 @@ impl RsCtx<MetalBackend> {
         let wf = WeightFile::open_filtered(weights, manifest, load, keep)
             .map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
-        let experts = ExpertFiles::open_range(experts_dir, !capped, capped, layer_range.clone())
+        let mut experts = ExpertFiles::open_range(experts_dir, !capped, capped, layer_range.clone())
             .map_err(|_| RsError::InitFailed)?;
+        experts.set_io_limits(io::io_limit::IoLimits::new(
+            config.io_queue_depth,
+            config.io_bytes_per_sec,
+        ));
         let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone());
         // The request pool: slot 0 (the default request) is live; the
         // others' host state is allocated now, their GPU buffers with
