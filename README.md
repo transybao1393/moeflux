@@ -106,15 +106,17 @@ Details — memory accounts, the per-token data path, phases — are in
 | Differential oracles (CPU vs Metal, batched vs per-token, MLX) | Exists |
 | `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; model-level tests pending |
 | `F_NOCACHE` reads, fixed hot tier, routing profiles, expert-IO counters | Implemented — Phase 2; model-level tests pending |
-| Layer-range execution | Planned — Phase 3 |
-| Per-request state | Planned — Phase 4 |
-| `moeflux-net`, coordinator, planner | Planned — Phase 5 |
+| Layer-range execution (`layer_range`, `eval_stage`, f32 hidden in/out, per-range snapshots) | Implemented — Phase 3; model-level tests pending |
+| Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; model-level tests pending |
+| `moeflux-net`: frames, `moeflux-node`, `moeflux-coord`, planner (TCP loopback) | Implemented — Phase 5; model-level tests pending |
 | Streaming improvements, router policy, 2-bit | Planned — Phases 6–8 |
 
 Build with exactly one model feature:
 
 ```bash
 cargo build --features model-qwen3-6-35b-a3b
+# the whole workspace, moeflux-net included
+cargo build --workspace --features model-qwen3-6-35b-a3b
 ```
 
 ## Provenance

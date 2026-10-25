@@ -158,12 +158,49 @@ Each phase ends with a measurement; the next phase is decided on numbers.
 | 0 | Partly done | `scripts/check_test_host.sh`; `RsCtx::expert_io_stats()` (disk reads/bytes, hot-tier hits/misses/admissions/evictions); `routing_counts()` / `save_routing_profile()`. Baselines need the M4 / M1 and the model. |
 | 1 | Implemented | `OpenConfig` + `RsCtx::open_with` (`n_ctx`, `expert_io`, `io_threads`, `mem_cap`, `runtime_overhead`); KV sized from `n_ctx`; `budget.rs` plan, reserve-and-touch at open, `phys_footprint` check at open and after every `eval_*`; mmap refused under a cap. `layer_range` moves to Phase 3. |
 | 2 | Implemented | Under a cap: weights read with `F_NOCACHE` into owned page-aligned memory, expert fds `F_NOCACHE` and not mmapped. `io/hot_tier.rs`: fixed-size, frequency-admitted, epoch-protected; decode binds hits zero-copy, prefetch skips hot experts, prefill copies hits. Seeding from a routing profile. |
-| 3–8 | Not started | Waiting on model-level verification of 1–2. |
+| 3 | Implemented | `OpenConfig::layer_range`: only the range's tensors are loaded (compacted under a cap), planned (`BudgetPlan::for_range`) and run; `RsCtx::eval_stage(StageInput::{Tokens, Hidden}, pos, StageOutput::{Logits, Hidden, Discard})` with f32 hidden in/out; `chain_next` norm fusion broken at the range end; snapshot v3 header records the range. A mode B range seeds every expert of the range into the hot tier. |
+| 4 | Implemented | `OpenConfig::max_requests`: a fixed pool of `SeqState`s (KV, linear-attn host + GPU recurrence, prefetch guesses), counted per slot in the plan and allocated at open under a cap; `admit_request` (`PoolFull` when full) / `drop_request` / `eval_request` / `state_{size,save,load}_for`. Switching requests swaps the live state with the parked one (no copies); the single-sequence API runs on `ReqId::DEFAULT`. |
+| 5 | Implemented | `crates/moeflux-net`: versioned length-prefixed frames into fixed buffers; `moeflux-node` (one range per process, frame buffers counted in the cap via `OpenConfig::host_buffers`); `moeflux-coord run` (drives the chain, per-node decode latency) and `plan` (ranges from caps + measured speed). TCP loopback. |
+| 6–8 | Not started | Waiting on model-level verification of 1–5. |
 
 Not yet verified on a model (this dev box has no weights and 18 GB):
-`tests/budget_cap.rs` model group and `tests/expert_source_equivalence.rs`
+the model groups of `tests/budget_cap.rs`, `tests/expert_source_equivalence.rs`,
+`tests/layer_range.rs`, `tests/requests.rs` and `moeflux-net/tests/loopback.rs`
 are `#[ignore]` until run on a capable host. The cogito (MLA) decode
-path does not use the hot tier yet.
+path does not use the hot tier yet, and layer ranges / request switching
+are unit-tested but not model-tested on cogito or a17b.
+
+### Deviations from the plan (phases 3–5)
+
+- **Split equivalence is within tolerance, not bit-exact.** Breaking the
+  `chain_next` norm fusion at a range boundary changes the order of one
+  RMSNorm, so 40 vs 20+10+10 is compared with the oracle tolerance
+  (`assert_logits_close`). A whole-range `eval_stage` matches
+  `eval_prompt` / `eval_token` bit for bit, and network vs in-process
+  split is bit for bit.
+- **`eval_stage` with one row takes the decode path**; `eval_prompt` with
+  one token takes the batched path. Compare like with like.
+- **The deferred K-expert ring is not per request.** Every eval drains it
+  before returning, so it is empty at every request switch; only the
+  prefetch guesses move with the request.
+- **Checkpoints (`checkpoint_pos` / `restore_to`) stay on the default
+  request.** Per-request snapshots go through `state_save_for` /
+  `state_load_for`.
+- **Without a cap, the pool's GPU buffers are allocated lazily** at the
+  first eval, like every other GPU resource on the uncapped path. Under
+  a cap everything is allocated and touched at open.
+- **Star topology.** Hidden states return to the coordinator between
+  stages (one extra hop per stage). It keeps nodes independent and lets
+  the coordinator time each node; a node-to-node ring is future work.
+- **Network buffers are planned through `OpenConfig::host_buffers`**
+  (new `host_buffers` budget account) rather than inside moeflux: the
+  node allocates and touches its two frame buffers before opening.
+- **The planner works from per-layer estimates** (manifest tensor sizes +
+  the KV / linear-state formulas, fixed costs from `BudgetPlan`), with
+  uniform per-layer work. Each node's own capped open stays the
+  authoritative check.
+- **The weight filter keeps unknown top-level tensors** on every range
+  (only `model.layers.N.*`, the embedding and the head are split).
 
 | # | Phase | Work | Exit criteria |
 | --- | --- | --- | --- |
