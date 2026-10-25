@@ -195,6 +195,10 @@ pub fn set_gather_tile_variant_override(v: Option<GatherTileVariant>) {
 /// new designs land in vB, promote to vA when they win on rebooted
 /// A/B.
 const SDPA_VA: &str = "attn_sdpa_causal_flash_va";
+/// The vA kernel instantiated at `head_dim == 128` (OLMoE). Unfolded
+/// direct-device only — no GQA fold or vB staging instance exists at
+/// this head_dim.
+const SDPA_VA_HD128: &str = "attn_sdpa_causal_flash_va_hd128";
 /// GQA-folded SDPA — staging-based, one threadgroup per `(q_tile,
 /// head-pair)`. Used when `SdpaCall::fold == 2`. Separate from the
 /// vA/vB slot system; retained until a direct-device GQA variant
@@ -403,8 +407,9 @@ pub struct GatherQmmCall<'a> {
 /// `kv_dim = num_kv_heads * head_dim`. Per-query causal mask: query `i`
 /// attends to `[0, start_pos + i + 1)`. Single dispatch, no scratch —
 /// the kernel keeps its online-softmax state threadgroup/register-
-/// resident. `head_dim` must equal 256 (the kernel's threadgroup arrays
-/// are sized at compile time around `FA_HD = 256`, a3b).
+/// resident. `head_dim` must be 256 (every kernel slot) or 128 (the
+/// unfolded vA kernel only) — the threadgroup arrays are sized at
+/// compile time per head_dim.
 #[derive(Clone, Copy)]
 pub struct SdpaCall<'a> {
     /// Query tensor — `[n_tokens, num_heads, head_dim]` f32.
@@ -421,7 +426,7 @@ pub struct SdpaCall<'a> {
     pub num_heads: u32,
     /// Query heads sharing one KV head (GQA fan-out).
     pub heads_per_kv: u32,
-    /// Per-head dimension. Must be 256.
+    /// Per-head dimension. 256, or 128 with `fold == 1`.
     pub head_dim: u32,
     /// `kv_dim = num_kv_heads * head_dim` — row stride of the KV caches.
     pub kv_dim: u32,
@@ -481,6 +486,8 @@ pub struct Kernels {
     gather_bm16: [ComputePipelineState; 8],
     /// Slot vA (production) — direct-device SDPA.
     sdpa_va: ComputePipelineState,
+    /// Slot vA at `head_dim == 128`.
+    sdpa_va_hd128: ComputePipelineState,
     /// GQA-folded SDPA (staging-based) — `fold == 2 && vb`.
     sdpa_gqa2_va: ComputePipelineState,
     /// GQA-folded SDPA (direct-device) — `fold == 2 && !vb`.
@@ -609,6 +616,7 @@ impl Kernels {
             gather_bm64,
             gather_bm16,
             sdpa_va: build(SDPA_VA)?,
+            sdpa_va_hd128: build(SDPA_VA_HD128)?,
             sdpa_gqa2_va: build(SDPA_GQA2_VA)?,
             sdpa_gqa2_dd: build(SDPA_GQA2_DD)?,
             sdpa_vb: build(SDPA_VB)?,
@@ -750,9 +758,10 @@ impl KernelCall for SdpaCall<'_> {
         if self.n_tokens == 0 || self.kv_len == 0 {
             return;
         }
-        assert_eq!(
-            self.head_dim, 256,
-            "attn_sdpa_causal_flash_va is compiled for head_dim == 256"
+        assert!(
+            self.head_dim == 256 || self.head_dim == 128,
+            "attn_sdpa_causal_flash_* is compiled for head_dim 256 or 128, got {}",
+            self.head_dim
         );
 
         debug_assert!(
@@ -768,11 +777,20 @@ impl KernelCall for SdpaCall<'_> {
         // Slot × fold dispatch. Both vA (direct-device) and vB
         // (staging) support unfolded + GQA-folded (fold=2). Each has
         // its own query-tile size.
-        let (pso, tile_q) = match (self.fold > 1, self.vb) {
-            (false, false) => (&kernels.sdpa_va, VB_TILE_Q),
-            (true, false) => (&kernels.sdpa_gqa2_dd, VB_TILE_Q),
-            (false, true) => (&kernels.sdpa_vb, FA_BR),
-            (true, true) => (&kernels.sdpa_gqa2_va, FA_BR),
+        //
+        // head_dim 128 has only the unfolded vA instance: it ignores
+        // `vb` (an A/B knob for the 256 kernels) and requires
+        // `fold == 1`.
+        let (pso, tile_q) = if self.head_dim == 128 {
+            assert_eq!(self.fold, 1, "no GQA-folded SDPA instance at head_dim 128");
+            (&kernels.sdpa_va_hd128, VB_TILE_Q)
+        } else {
+            match (self.fold > 1, self.vb) {
+                (false, false) => (&kernels.sdpa_va, VB_TILE_Q),
+                (true, false) => (&kernels.sdpa_gqa2_dd, VB_TILE_Q),
+                (false, true) => (&kernels.sdpa_vb, FA_BR),
+                (true, true) => (&kernels.sdpa_gqa2_va, FA_BR),
+            }
         };
         let num_q_tiles = self.n_tokens.div_ceil(tile_q);
         let total_tgs = num_q_tiles * (self.num_heads / self.fold);

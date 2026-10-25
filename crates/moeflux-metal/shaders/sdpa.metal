@@ -535,21 +535,28 @@ constant uint VB_D8  = FA_HD / 8;               // head_dim tiles of 8 (= 32)
 constant uint VB_C8  = VB_C / 8;                // KV chunks of 8 in a block (= 8)
 constant uint VB_NO  = VB_D8 / VB_NSG;          // O column-tiles per simdgroup (= 4)
 
-kernel void attn_sdpa_causal_flash_va(
-    device const float* Q             [[buffer(0)]],
-    device const float* K_cache       [[buffer(1)]],
-    device const float* V_cache       [[buffer(2)]],
-    device float*       out           [[buffer(3)]],
-    constant uint&      n_tokens      [[buffer(4)]],
-    constant uint&      num_heads     [[buffer(5)]],
-    constant uint&      heads_per_kv  [[buffer(6)]],
-    constant uint&      kv_dim        [[buffer(7)]],
-    constant uint&      start_pos     [[buffer(8)]],
-    constant uint&      kv_len        [[buffer(9)]],
-    constant float&     softmax_scale [[buffer(10)]],
-    uint tg_idx [[threadgroup_position_in_grid]],   // q_tile * num_heads + h
-    uint lid    [[thread_position_in_threadgroup]]
+// vA body, templated on head_dim `HD` (the 256 entry is the original
+// a3b kernel; the 128 entry serves OLMoE). `HD` must be a multiple of
+// 64 so the O column-tiles split evenly across the 8 simdgroups:
+// NO = HD / 8 / VB_NSG (4 at 256, 2 at 128). The threadgroup arrays
+// are declared by the entry points (Metal allows `threadgroup`
+// declarations only at kernel scope).
+template<uint HD>
+static void sdpa_va_impl(
+    device const float* Q,
+    device const float* K_cache,
+    device const float* V_cache,
+    device float*       out,
+    uint n_tokens, uint num_heads, uint heads_per_kv,
+    uint kv_dim, uint start_pos, uint kv_len, float softmax_scale,
+    threadgroup float* sq,
+    threadgroup float* so,
+    threadgroup float* ss,
+    uint tg_idx, uint lid
 ) {
+    static_assert(HD % 64 == 0, "HD must be a multiple of 64");
+    constexpr uint NO = HD / 8 / VB_NSG;    // O column-tiles per simdgroup
+
     uint q_tile = tg_idx / num_heads;
     uint h      = tg_idx % num_heads;
     uint q0     = q_tile * VB_Q;
@@ -564,31 +571,30 @@ kernel void attn_sdpa_causal_flash_va(
     // use `fast::exp2` consistently — same trick as vA.
     const float log2_scale = softmax_scale * M_LOG2E_F;
 
-    // Threadgroup memory (~18 KB total).
-    threadgroup float sq[VB_Q * FA_HD];     //  8 KB  Q tile
-    threadgroup float so[VB_Q * FA_HD];     //  8 KB  O accumulator (unnormalized)
-    threadgroup float ss[VB_Q * VB_C];      //  2 KB  scores → P matrix
+    // Threadgroup memory (~18 KB total at HD = 256), declared by the
+    // entry point: sq = Q tile, so = O accumulator (unnormalized),
+    // ss = scores → P matrix.
 
     // Load Q tile into sq. With VB_Q == VB_NSG, each simdgroup owns one
-    // query row of FA_HD floats. Lane i covers head_dim positions
-    // [i, i+32, ..., i+224] — 8 stores/lane.
+    // query row of HD floats. Lane i covers head_dim positions
+    // [i, i+32, ..., i+HD-32] — HD/32 stores/lane.
     {
         uint trow = simd_id;
         if (trow < br_valid) {
             device const float* qsrc =
-                Q + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
-            for (uint k = 0; k < FA_HD / 32; ++k) {
-                sq[trow * FA_HD + lane + k * 32] = qsrc[lane + k * 32];
+                Q + ((size_t)(q0 + trow) * num_heads + h) * HD;
+            for (uint k = 0; k < HD / 32; ++k) {
+                sq[trow * HD + lane + k * 32] = qsrc[lane + k * 32];
             }
         } else {
-            for (uint k = 0; k < FA_HD / 32; ++k) {
-                sq[trow * FA_HD + lane + k * 32] = 0.0f;
+            for (uint k = 0; k < HD / 32; ++k) {
+                sq[trow * HD + lane + k * 32] = 0.0f;
             }
         }
     }
 
-    // Zero so. 256 threads each clear VB_Q*FA_HD / FA_THREADS = 8 elements.
-    for (uint i = lid; i < VB_Q * FA_HD; i += FA_THREADS) {
+    // Zero so. 256 threads each clear VB_Q*HD / FA_THREADS elements.
+    for (uint i = lid; i < VB_Q * HD; i += FA_THREADS) {
         so[i] = 0.0f;
     }
 
@@ -618,14 +624,14 @@ kernel void attn_sdpa_causal_flash_va(
             simdgroup_float8x8 mqk = simdgroup_float8x8(0.0f);
             // Walk head_dim in pairs of 8-step k-tiles (16 floats/iter),
             // matching llama.cpp's ILP-packing pattern.
-            for (uint k_pair = 0; k_pair < VB_D8 / 2; ++k_pair) {
+            for (uint k_pair = 0; k_pair < (HD / 8) / 2; ++k_pair) {
                 simdgroup_float8x8 mq0, mq1, mk0, mk1;
                 uint k_off = k_pair * 16;
-                simdgroup_load(mq0, sq + k_off + 0, FA_HD);
-                simdgroup_load(mq1, sq + k_off + 8, FA_HD);
+                simdgroup_load(mq0, sq + k_off + 0, HD);
+                simdgroup_load(mq1, sq + k_off + 8, HD);
                 device const float* pk =
                     K_cache + (size_t)(c0 + simd_id * 8) * kv_dim
-                            + kv_h * FA_HD + k_off;
+                            + kv_h * HD + k_off;
                 simdgroup_load(mk0, pk + 0, kv_dim, ulong2(0, 0), true);
                 simdgroup_load(mk1, pk + 8, kv_dim, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(mqk, mq0, mk0, mqk);
@@ -684,45 +690,45 @@ kernel void attn_sdpa_causal_flash_va(
             // multiply is also a no-op; we'd only enter the loop for
             // 0 < corr < 1 (m grew).
             if (corr != 1.0f && corr != 0.0f) {
-                for (uint k = 0; k < FA_HD / 32; ++k) {
-                    so[trow * FA_HD + lane + k * 32] *= corr;
+                for (uint k = 0; k < HD / 32; ++k) {
+                    so[trow * HD + lane + k * 32] *= corr;
                 }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // -- PV: O += P · V.
-        //    Each simdgroup handles VB_NO (= 4) output column-tiles,
+        //    Each simdgroup handles NO (= 4 at HD = 256) output column-tiles,
         //    striped across the head_dim. Simdgroup s owns d-cols
-        //      [s*8 + ii*8*VB_NSG  ..  +8)  for ii in [0, VB_NO).
+        //      [s*8 + ii*8*VB_NSG  ..  +8)  for ii in [0, NO).
         //    lo[ii] is 8x8 (8 query rows × 8 d-cols); P (vs) is 8x8 at
         //    the current cc-chunk of ss; V (mv) is read direct from
         //    device. --
         {
-            simdgroup_float8x8 lo[VB_NO];
-            for (uint ii = 0; ii < VB_NO; ++ii) {
+            simdgroup_float8x8 lo[NO];
+            for (uint ii = 0; ii < NO; ++ii) {
                 uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
-                simdgroup_load(lo[ii], so + d_off, FA_HD,
+                simdgroup_load(lo[ii], so + d_off, HD,
                                ulong2(0, 0), false);
             }
             for (uint cc = 0; cc < VB_C8; ++cc) {
                 simdgroup_float8x8 vs;
                 simdgroup_load(vs, ss + cc * 8, VB_C,
                                ulong2(0, 0), false);
-                for (uint ii = 0; ii < VB_NO; ++ii) {
+                for (uint ii = 0; ii < NO; ++ii) {
                     simdgroup_float8x8 mv;
                     uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
                     device const float* pv =
                         V_cache + (size_t)(c0 + cc * 8) * kv_dim
-                                + kv_h * FA_HD + d_off;
+                                + kv_h * HD + d_off;
                     simdgroup_load(mv, pv, kv_dim,
                                    ulong2(0, 0), false);
                     simdgroup_multiply_accumulate(lo[ii], vs, mv, lo[ii]);
                 }
             }
-            for (uint ii = 0; ii < VB_NO; ++ii) {
+            for (uint ii = 0; ii < NO; ++ii) {
                 uint d_off = simd_id * 8 + ii * 8 * VB_NSG;
-                simdgroup_store(lo[ii], so + d_off, FA_HD,
+                simdgroup_store(lo[ii], so + d_off, HD,
                                 ulong2(0, 0), false);
             }
         }
@@ -730,18 +736,46 @@ kernel void attn_sdpa_causal_flash_va(
     }
 
     // -- Finalize: write so / S to device out.
-    //    Each simdgroup writes one query row of FA_HD floats. --
+    //    Each simdgroup writes one query row of HD floats. --
     {
         uint trow = simd_id;
         if (trow >= br_valid) return;
         float inv = (S > 0.0f) ? (1.0f / S) : 0.0f;
         device float* osrc =
-            out + ((size_t)(q0 + trow) * num_heads + h) * FA_HD;
-        for (uint k = 0; k < FA_HD / 32; ++k) {
-            osrc[lane + k * 32] = so[trow * FA_HD + lane + k * 32] * inv;
+            out + ((size_t)(q0 + trow) * num_heads + h) * HD;
+        for (uint k = 0; k < HD / 32; ++k) {
+            osrc[lane + k * 32] = so[trow * HD + lane + k * 32] * inv;
         }
     }
 }
+
+
+#define SDPA_VA_ENTRY(NAME, HD_)                                           \
+kernel void NAME(                                                          \
+    device const float* Q             [[buffer(0)]],                       \
+    device const float* K_cache       [[buffer(1)]],                       \
+    device const float* V_cache       [[buffer(2)]],                       \
+    device float*       out           [[buffer(3)]],                       \
+    constant uint&      n_tokens      [[buffer(4)]],                       \
+    constant uint&      num_heads     [[buffer(5)]],                       \
+    constant uint&      heads_per_kv  [[buffer(6)]],                       \
+    constant uint&      kv_dim        [[buffer(7)]],                       \
+    constant uint&      start_pos     [[buffer(8)]],                       \
+    constant uint&      kv_len        [[buffer(9)]],                       \
+    constant float&     softmax_scale [[buffer(10)]],                      \
+    uint tg_idx [[threadgroup_position_in_grid]],   /* q_tile*heads+h */   \
+    uint lid    [[thread_position_in_threadgroup]]                         \
+) {                                                                        \
+    threadgroup float sq[VB_Q * (HD_)];     /* Q tile */                   \
+    threadgroup float so[VB_Q * (HD_)];     /* O accumulator */            \
+    threadgroup float ss[VB_Q * VB_C];      /* scores -> P */              \
+    sdpa_va_impl<HD_>(Q, K_cache, V_cache, out, n_tokens, num_heads,      \
+        heads_per_kv, kv_dim, start_pos, kv_len, softmax_scale,           \
+        sq, so, ss, tg_idx, lid);                                         \
+}
+
+SDPA_VA_ENTRY(attn_sdpa_causal_flash_va, 256)
+SDPA_VA_ENTRY(attn_sdpa_causal_flash_va_hd128, 128)
 
 // ============================================================================
 // FlashAttention-2 causal SDPA — GQA-folded, direct-device.
