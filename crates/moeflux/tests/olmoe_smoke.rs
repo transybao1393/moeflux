@@ -3,7 +3,8 @@
 //! decode, compared against an MLX reference greedy run of the same
 //! 4-bit weights.
 //!
-//! `#[ignore]` because it needs the converted model on disk. Paths
+//! `#[ignore]` because it needs the converted model on disk. Every
+//! test opens under a hard `mem_cap`. Paths
 //! default to `$HOME/models/olmoe-1b-7b/{artifacts,root}`; override
 //! the parent with `MOEFLUX_OLMOE_DIR`. Run with:
 //!
@@ -16,6 +17,7 @@
 
 use std::path::PathBuf;
 
+use moeflux::riir::budget::footprint;
 use moeflux::{Ctx, Error, OpenConfig};
 
 const VOCAB: usize = 50_304;
@@ -38,17 +40,20 @@ fn model_dir() -> PathBuf {
         })
 }
 
+/// 0.35 GiB of hot tier, in whole experts.
+const HOT_TIER_3G: u64 = 106 * 3_538_944;
+
 fn open() -> Result<Ctx, Error> {
+    open_capped(3 << 30, Some(HOT_TIER_3G))
+}
+
+fn open_capped(cap: u64, hot_tier_bytes: Option<u64>) -> Result<Ctx, Error> {
     let dir = model_dir();
     let art = dir.join("artifacts");
-    // Sized for an 18 GiB host with little headroom: the chunk-8192
-    // prefill scratch alone is ~2.4 GiB, so a 3 GiB cap only fits
-    // with no hot tier and a short KV cache (the prompt + decode use
-    // < 40 positions).
     let cfg = OpenConfig {
-        n_ctx: 512,
-        mem_cap: Some(3482 << 20),
-        hot_tier_bytes: Some(0),
+        n_ctx: 2048,
+        mem_cap: Some(cap),
+        hot_tier_bytes,
         ..OpenConfig::default()
     };
     Ctx::open_with(
@@ -143,4 +148,59 @@ fn olmoe_batched_prefill_matches_per_token() -> Result<(), Error> {
     assert_eq!(argmax(&batched), argmax(&per_token));
     assert!(cos > 0.999, "cosine {cos}");
     Ok(())
+}
+
+/// Child-process body of the cap tests: open, prefill the prompt,
+/// decode 32 tokens; the process's lifetime peak must stay under the
+/// cap, and the footprint right after open must be ≥ 95 % of it —
+/// nothing big may be allocated after the open-time check.
+fn peak_stays_at_open(cap: u64, hot_tier_bytes: Option<u64>) {
+    let mut ctx = open_capped(cap, hot_tier_bytes).expect("open");
+    let at_open = footprint().expect("footprint").current;
+    let mut logits = vec![0.0f32; VOCAB];
+    ctx.eval_prompt(PROMPT, 0, 0, &mut logits).expect("prefill");
+    let mut pos = PROMPT.len();
+    for _ in 0..32 {
+        ctx.eval_token(argmax(&logits), pos, 0, &mut logits).expect("decode");
+        pos += 1;
+    }
+    let peak = footprint().expect("footprint").peak;
+    eprintln!(
+        "[olmoe-cap] cap {cap} B: open footprint {at_open} B, lifetime peak {peak} B ({:.1} %)",
+        100.0 * at_open as f64 / peak as f64
+    );
+    assert!(peak <= cap, "lifetime peak {peak} B over cap {cap} B");
+    assert!(at_open * 100 >= peak * 95, "open footprint {at_open} B < 95 % of peak {peak} B");
+}
+
+/// The lifetime peak is per process, so each cap case runs in a fresh
+/// child (this test binary, re-run on one test with
+/// `OLMOE_CAP_CHILD` set).
+fn run_in_child(test: &str, body: impl FnOnce()) {
+    if std::env::var_os("OLMOE_CAP_CHILD").is_some() {
+        body();
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args([test, "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+        .env("OLMOE_CAP_CHILD", "1")
+        .status()
+        .expect("spawn child");
+    assert!(status.success(), "{test} child failed: {status}");
+}
+
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk; holds ~4.8 GiB"]
+fn olmoe_cap_6gib_auto_hot_tier_peak_is_planned_at_open() {
+    run_in_child("olmoe_cap_6gib_auto_hot_tier_peak_is_planned_at_open", || {
+        peak_stays_at_open(6 << 30, None)
+    });
+}
+
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_cap_3gib_peak_is_planned_at_open() {
+    run_in_child("olmoe_cap_3gib_peak_is_planned_at_open", || {
+        peak_stays_at_open(3 << 30, Some(HOT_TIER_3G))
+    });
 }

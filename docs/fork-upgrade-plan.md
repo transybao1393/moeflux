@@ -360,17 +360,59 @@ a larger machine, not the 18 GB dev box.
   the open-time check missed it (`MetalBufferPool::touch_aligned`);
   and `commit_plan` allocated the colored buffers while still holding
   the old transients, so the first prefill peaked at scratch + colors
-  above the open footprint (it now releases them first).
+  above the open footprint (it now releases them first, and under a
+  cap it does not re-color at all — see the next item).
+- **Allocations after open, invisible to the tripwire — fixed.** A
+  capped run could open at 3.17 GiB and still peak at 4.06 GiB
+  (`/usr/bin/time`, 3.4 GiB cap, chunk 8192) with no error: the
+  footprint grew in the first eval, and `check_cap` only compared the
+  *current* footprint after each eval. Staged sampling (after open /
+  prefill / decode 1 / decode 32) plus `footprint -v` region diffs
+  found, for OLMoE at cap 6 GiB, hot tier 0.35 GiB, chunk 512:
+  - the pool itself does not grow (225 buffers, constant);
+  - `commit_plan` lifetime coloring at the first prefill swapped the
+    scratch transients for colored buffers, net **+48 MB** (5 × 16 MiB
+    allocated, 2 × 16 + 3 × 4 MiB freed) — a capped open now freezes
+    the pool layout (`MetalBufferPool::freeze_layout`): the planned,
+    touched scratch is used uncolored;
+  - the **first GPU submit** makes the driver allocate ≈ **80 MB** of
+    IOAccelerator command/encoder state (bisected to the head graph's
+    `execute`) — `reserve_at_open` now submits a trivial graph before
+    the footprint check;
+  - pipelines are compiled when the backend is built (an explicit
+    `warm_all` at open changed nothing);
+  - what is left grows < 5 MB over 32 decode steps (heap).
+
+  `check_footprint` now also fails when the lifetime peak
+  (`ri_lifetime_max_phys_footprint`) is over the cap *and* above the
+  peak sampled at the start of `open_with` (`baseline_peak`), so a
+  transient breach between checks is reported. Semantics: a peak no
+  higher than the baseline predates the context and is ignored, so in
+  a process that earlier held a larger context, a transient below that
+  old peak is invisible.
+
+  | OLMoE, n_ctx 2048 | open footprint | lifetime peak | open / peak |
+  | --- | --- | --- | --- |
+  | e4c2003 (chunk 8192), cap 3.4 GiB, n_ctx 512, hot 0, 8 decode | 3.17 GiB | 4,354,861,248 B (`time -l`) | ≈ 78 % |
+  | chunk 512, before the `commit_plan` release fix, 8 decode | 1,764,299,904 B | 1,900,074,304 B | 92.9 % |
+  | bfd4070, cap 6 GiB, hot 0.35 GiB | 1,764,332,672 B | 1,845,417,088 B | 95.6 % |
+  | after, cap 3 GiB, hot 0.35 GiB | 1,844,941,888 B | 1,849,955,456 B | 99.7 % |
+  | after, cap 6 GiB, auto hot tier (3.38 GiB, all experts) | 5,095,452,160 B | 5,100,973,568 B | 99.9 % |
+
+  (prefill of the 25-token prompt + 32 decode steps unless noted;
+  `olmoe_smoke.rs` `olmoe_cap_*` assert peak ≤ cap and open ≥ 95 % of
+  peak, each in a child process.)
 - **`runtime_overhead` measured.** A capped open logs `planned
   exactly` (plan minus `runtime_overhead`) and the signed `unplanned`
   remainder of the measured footprint; `MOEFLUX_POOL_DUMP=1` adds the
   GPU pool by label (`MetalBufferPool::bytes_by_label`). OLMoE-1B-7B on
   the M3 Pro (2026-10-25; cap 6 GiB, n_ctx 2048, hot tier 106 slots,
-  chunk 512): planned exactly 1,780,708,352 B; open footprint
-  1,762,907,136 B; after a 25-token prefill + 8 decode steps
-  1,829,328,000 B, peak 1,843,352,576 B. The slot ring is planned
-  2 MiB-rounded (~31 MB high), so the unitemized remainder is ≈ 90 MiB
-  at peak, ≈ 60 MiB held. `DEFAULT_RUNTIME_OVERHEAD` drops from the
+  chunk 512): planned exactly 1,780,708,352 B; with the fixes below
+  the open footprint is 1,844,941,888 B and the peak through prefill +
+  32 decode steps 1,849,955,456 B. The slot ring is planned
+  2 MiB-rounded (~31 MB high), so the unitemized remainder is ≈ 90 MiB,
+  nearly all of it the first-submit driver state, now at open.
+  `DEFAULT_RUNTIME_OVERHEAD` drops from the
   1.5 GiB guess to 512 MiB (> 5× margin, for full 512-token chunks and
   larger variants — re-measure a3b/a17b the same way). With it, OLMoE
   at `mem_cap` 3 GiB, n_ctx 2048, auto hot tier plans 3.00 GiB (hot

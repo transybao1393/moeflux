@@ -11,7 +11,9 @@
 //!    [`footprint`]. Over the cap fails `open`.
 //! 3. **Tripwire** — each `eval_*` call re-samples the footprint and
 //!    returns [`crate::riir::RsError::OverBudget`] if it crossed the
-//!    cap (an accounting bug, by construction).
+//!    cap (an accounting bug, by construction). Both checks compare the
+//!    lifetime peak too, so a transient breach since the start of
+//!    `open_with` is reported ([`check_footprint`] has the semantics).
 //!
 //! `phys_footprint` counts anonymous and GPU (IOAccelerator) memory
 //! but not clean file-backed pages, so mmap'd model files sit outside
@@ -31,12 +33,13 @@ const TWO_MIB: u64 = 2 << 20;
 /// Default reservation for what the plan does not itemize: Metal
 /// device/driver state and pipelines, the small fixed pool buffers
 /// (per-token layer buffers, router/combine scratch, logits), thread
-/// stacks, the heap and per-eval host vectors. Measured on
-/// OLMoE-1B-7B (M3 Pro, 2026-10-25) at ≈ 90 MiB above the plan at the
-/// peak of a capped open + prefill + decode (≈ 60 MiB held after);
-/// 512 MiB is that plus a > 5× margin for longer prefill chunks and
-/// larger variants (`docs/fork-upgrade-plan.md` §10). Only used under
-/// a cap.
+/// stacks, the heap, the driver state of the first GPU submit and
+/// per-eval host vectors. Measured on OLMoE-1B-7B (M3 Pro,
+/// 2026-10-25): ≈ 60 MiB above the exactly-planned bytes at open, and
+/// the peak through a 25-token prefill + 32 decode steps stays within
+/// 5 MiB of that. 512 MiB is that plus a > 5× margin for longer
+/// prefill chunks and larger variants (`docs/fork-upgrade-plan.md`
+/// §10). Only used under a cap.
 pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB / 2;
 
 /// One named slice of the cap.
@@ -331,9 +334,19 @@ pub fn footprint() -> Option<Footprint> {
     })
 }
 
-/// Fail if the current footprint is over `cap`. A failed sample is
-/// treated as a failure — under a hard cap, unknown is not safe.
-pub fn check_footprint(cap: u64, when: &str) -> Result<Footprint, String> {
+/// Fail if the current footprint, or the peak reached since the
+/// context started opening, is over `cap`. A failed sample is treated
+/// as a failure — under a hard cap, unknown is not safe.
+///
+/// The OS only keeps a *lifetime* peak (`ri_lifetime_max_phys_footprint`,
+/// since process start). `baseline_peak` is that peak sampled at the
+/// start of `open_with`: a peak above it was reached during this
+/// context's life and is checked against the cap, so a transient
+/// breach between two checks is reported, not missed. A peak no
+/// higher than the baseline predates the context (an earlier, larger
+/// context in the same process) and is ignored — which also means a
+/// transient that stays below that older peak cannot be seen.
+pub fn check_footprint(cap: u64, baseline_peak: u64, when: &str) -> Result<Footprint, String> {
     let fp = footprint().ok_or_else(|| format!("{when}: could not read phys_footprint"))?;
     if fp.current > cap {
         return Err(format!(
@@ -341,6 +354,14 @@ pub fn check_footprint(cap: u64, when: &str) -> Result<Footprint, String> {
             fmt_gib(fp.current),
             fmt_gib(cap),
             fmt_gib(fp.peak)
+        ));
+    }
+    if fp.peak > baseline_peak && fp.peak > cap {
+        return Err(format!(
+            "{when}: peak footprint {} since open exceeds cap {} (now {})",
+            fmt_gib(fp.peak),
+            fmt_gib(cap),
+            fmt_gib(fp.current)
         ));
     }
     Ok(fp)
@@ -450,7 +471,17 @@ mod tests {
         let fp = footprint().expect("proc_pid_rusage");
         assert!(fp.current > 0);
         assert!(fp.peak >= fp.current);
-        assert!(check_footprint(u64::MAX, "test").is_ok());
-        assert!(check_footprint(1, "test").is_err());
+        assert!(check_footprint(u64::MAX, 0, "test").is_ok());
+        assert!(check_footprint(1, 0, "test").is_err());
+        // A peak from before the baseline is not this context's.
+        let below = fp.peak.max(fp.current) + (1 << 30);
+        assert!(check_footprint(below, u64::MAX, "test").is_ok());
+        // One reached after it is, even once the current is back down.
+        // (Only the error side is race-free: the peak is monotone, but
+        // parallel tests can raise it past any baseline sampled here.)
+        let between = (fp.current + fp.peak) / 2;
+        if fp.peak > fp.current + 2 {
+            assert!(check_footprint(between, 0, "test").is_err());
+        }
     }
 }

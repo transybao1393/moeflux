@@ -56,9 +56,22 @@ pub struct MetalBufferPool {
     /// lifetime of the pool. Append-only; order is independent of
     /// `buffers` because we never index into it.
     aligned_anchors: Vec<MtlBuffer<u8>>,
+    /// Set by [`Self::freeze_layout`]: `commit_plan` keeps every BufId
+    /// on its own buffer instead of re-coloring.
+    layout_frozen: bool,
 }
 
 impl MetalBufferPool {
+    /// Stop `commit_plan` from re-coloring: every BufId keeps its own
+    /// buffer, already allocated and touched. A capped open calls this
+    /// so the first prefill allocates nothing (coloring would free the
+    /// transients but allocate the colors after the open-time check).
+    /// Correct either way — coloring only shares buffers between
+    /// non-overlapping lifetimes.
+    pub fn freeze_layout(&mut self) {
+        self.layout_frozen = true;
+    }
+
     /// Write every [`Self::alloc_aligned`] buffer once. Their heap
     /// backing is not zeroed at allocation (unlike [`BufferPool::alloc`]),
     /// so its pages stay uncommitted — invisible to the footprint —
@@ -118,6 +131,7 @@ impl MetalBufferPool {
             byte_sizes: Vec::new(),
             bufid_to_physical: Vec::new(),
             aligned_anchors: Vec::new(),
+            layout_frozen: false,
         }
     }
 
@@ -402,6 +416,10 @@ impl BufferPool for MetalBufferPool {
     fn commit_plan(&mut self, graph: &Graph) -> Result<(), GraphError> {
         use super::lifetime::{ColorId, analyze_lifetimes, greedy_color};
         use std::collections::HashMap;
+
+        if self.layout_frozen {
+            return Ok(());
+        }
 
         let lifetimes = analyze_lifetimes(graph);
         let coloring = greedy_color(&lifetimes);

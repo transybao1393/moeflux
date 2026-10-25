@@ -425,6 +425,10 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     planned_exact: Option<u64>,
     /// [`OpenConfig::runtime_overhead`], for the open-time log.
     runtime_overhead: u64,
+    /// Process lifetime-peak footprint sampled when `open_with`
+    /// started; the cap checks count only a peak above it
+    /// ([`budget::check_footprint`]). 0 when uncapped.
+    baseline_peak: u64,
     /// Request pool (plan phase 4): which request owns each slot and
     /// which slot's state is live in `layer_states` /
     /// `linear_buffers.{conv,delta}_state` / `prefetch`.
@@ -550,6 +554,10 @@ impl RsCtx<MetalBackend> {
         config
             .validate()
             .map_err(|detail| RsError::InvalidConfig { detail })?;
+        let baseline_peak = match config.mem_cap {
+            Some(_) => budget::footprint().ok_or(RsError::InitFailed)?.peak,
+            None => 0,
+        };
         let n_ctx = config.n_ctx;
         let prefill_chunk = config.resolved_prefill_chunk();
         let layer_range = config.resolved_layer_range();
@@ -717,6 +725,7 @@ impl RsCtx<MetalBackend> {
             prefill_chunk,
             planned_exact,
             runtime_overhead: config.runtime_overhead,
+            baseline_peak,
             requests: requests::RequestTable::new(config.max_requests),
             parked,
         };
@@ -832,6 +841,25 @@ impl RsCtx<MetalBackend> {
             // `ensure_mla_resources` allocates every slot's MLA caches.
             variants::AttnKind::Mla => self.ensure_mla_resources()?,
         }
+        // The plan counts the prefill scratch uncolored; keep it that
+        // way. Lifetime coloring at the first prefill would allocate
+        // the colors after the check below (net growth, measured).
+        if let Some(backend) = self.backend.as_mut() {
+            backend.pool_mut().freeze_layout();
+        }
+        // The first GPU submit makes the driver allocate its command
+        // and encoder state (≈ 80 MB of IOAccelerator memory on M3 Pro,
+        // measured), which would otherwise land after the check below,
+        // in the first eval. Submit a trivial graph now.
+        if let (Some(backend), Some(moe)) = (self.backend.as_mut(), self.moe_graph_scratch.as_ref()) {
+            let mut g = backend::Graph::new();
+            g.push(backend::Op::ZeroBuffer {
+                label: "open.warm_submit",
+                buf: moe.out_sum,
+                n_bytes: 4,
+            });
+            backend.execute(&g, "open.warm_submit").map_err(|_| RsError::InitFailed)?;
+        }
         if let Some(backend) = self.backend.as_ref() {
             let pool = backend.pool();
             // The expert slot ring (`expert_slots`) is heap-backed and
@@ -873,7 +901,7 @@ impl RsCtx<MetalBackend> {
                 }
             }
         }
-        let fp = budget::check_footprint(cap, "open")
+        let fp = budget::check_footprint(cap, self.baseline_peak, "open")
             .map_err(|detail| RsError::OverBudget { detail })?;
         eprintln!(
             "[budget] open footprint {} of cap {}",
@@ -885,8 +913,18 @@ impl RsCtx<MetalBackend> {
 
     /// Re-check the footprint against the cap (no-op without one).
     fn check_cap(&self, when: &str) -> Result<(), RsError> {
+        if std::env::var_os("MOEFLUX_POOL_DUMP").is_some() {
+            if let Some(b) = self.backend.as_ref() {
+                let pool = b.pool();
+                eprintln!(
+                    "[budget] {when}: pool {} in {} buffers",
+                    budget::fmt_gib(pool.total_bytes()),
+                    pool.bytes_by_label().iter().map(|e| e.2).sum::<usize>()
+                );
+            }
+        }
         match self.mem_cap {
-            Some(cap) => budget::check_footprint(cap, when)
+            Some(cap) => budget::check_footprint(cap, self.baseline_peak, when)
                 .map(|_| ())
                 .map_err(|detail| RsError::OverBudget { detail }),
             None => Ok(()),
