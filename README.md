@@ -23,14 +23,18 @@ user-set memory cap, on one Mac or across a small cluster of Macs.
   so other services on the same machine are untouched. Everything is
   reserved at open; if it does not fit, `open` fails before anything
   else is affected.
-- **Streaming experts, strengthened.** Experts stream from SSD with
-  `F_NOCACHE` reads into a fixed hot tier and slot ring, with
+- **Streaming experts, designed for a hard cap.** Experts stream from
+  SSD with `F_NOCACHE` reads into a fixed hot tier and slot ring, with
   profile-seeded, frequency-based caching and speculative prefetch.
+- **Router hook.** After routing, the engine hands each layer's
+  picked experts and gate weights to a policy, which decides per
+  expert whether to run it at 4-bit, run it at 2-bit, or skip it.
+  The policy can live outside moeflux; the engine exposes the hook.
 - **Two modes, one code path.**
   - *Mode A — single node:* Mac mini M4 24 GB, experts on an external
     SSD, 10 GB cap.
   - *Mode B — three-node pipeline:* M4 + 2 × M1 16 GB, each node runs
-    a contiguous layer range with its experts fully in its hot tier.
+    a contiguous layer range with its experts resident in RAM.
 - **Throughput:** several requests in flight across the pipeline.
 - **Telemetry:** per token, per layer, per tier.
 
