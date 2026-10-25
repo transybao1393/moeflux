@@ -71,6 +71,12 @@ pub struct OpenConfig {
     /// plan; admission beyond this fails cleanly. Must be ≥ 1; the
     /// default, 1, is the single-sequence context.
     pub max_requests: usize,
+    /// Bytes of fixed buffers the embedding application holds next to
+    /// the context — e.g. `moeflux-net`'s frame buffers (plan phase 5).
+    /// Counted in the budget plan as `host_buffers`, so the cap covers
+    /// them; allocate (and touch) them before `open_with` so the
+    /// at-open footprint check sees them. Only used with `mem_cap`.
+    pub host_buffers: u64,
 }
 
 impl Default for OpenConfig {
@@ -85,6 +91,7 @@ impl Default for OpenConfig {
             hot_tier_profile: None,
             layer_range: None,
             max_requests: 1,
+            host_buffers: 0,
         }
     }
 }

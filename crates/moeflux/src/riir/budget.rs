@@ -51,6 +51,9 @@ pub enum Account {
     RuntimeOverhead,
     /// RAM hot tier of experts (sized from what the cap leaves).
     HotTier,
+    /// Fixed buffers the application holds next to the context
+    /// ([`crate::riir::OpenConfig::host_buffers`], e.g. network frames).
+    HostBuffers,
 }
 
 impl Account {
@@ -64,6 +67,7 @@ impl Account {
             Account::PrefillStaging => "prefill_staging",
             Account::RuntimeOverhead => "runtime_overhead",
             Account::HotTier => "hot_tier",
+            Account::HostBuffers => "host_buffers",
         }
     }
 }

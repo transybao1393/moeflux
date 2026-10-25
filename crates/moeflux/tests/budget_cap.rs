@@ -83,6 +83,25 @@ fn full_context_kv_does_not_fit_a_small_cap() {
     assert!(matches!(err, Error::OverBudget { .. }), "{err:?}");
 }
 
+/// The application's fixed buffers (`moeflux-net` frames) are planned
+/// inside the cap: buffers alone larger than the cap fail the plan.
+#[test]
+fn host_buffers_count_against_the_cap() {
+    let w = scratch_file("weights_host.bin", 1 << 20);
+    let cfg = OpenConfig {
+        n_ctx: 64,
+        mem_cap: Some(2 * GIB),
+        runtime_overhead: 0,
+        hot_tier_bytes: Some(0),
+        host_buffers: 3 * GIB,
+        ..OpenConfig::default()
+    };
+    match open_with(&w, &cfg).err().expect("must fail") {
+        Error::OverBudget { detail } => assert!(detail.contains("host_buffers="), "{detail}"),
+        other => panic!("expected OverBudget, got {other:?}"),
+    }
+}
+
 #[cfg(feature = "model-qwen3-6-35b-a3b")]
 mod model {
     use super::*;

@@ -574,6 +574,9 @@ impl RsCtx<MetalBackend> {
                 &layer_range,
                 config.max_requests,
             );
+            if config.host_buffers > 0 {
+                plan.set(budget::Account::HostBuffers, config.host_buffers);
+            }
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
             // `None` → the hot tier takes whatever the plan leaves, up
             // to every expert of the range (mode B: all resident).
