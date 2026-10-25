@@ -9,6 +9,7 @@
 
 use crate::riir::budget::DEFAULT_RUNTIME_OVERHEAD;
 use crate::riir::io::expert_io_mode::ExpertIoMode;
+pub use crate::riir::io::prefetch::PrefetchGuess;
 use crate::riir::variants::MAX_SEQ_LEN;
 
 /// Default IO worker-thread count — the historical hard-coded value.
@@ -82,6 +83,12 @@ pub struct OpenConfig {
     /// plan; admission beyond this fails cleanly. Must be ≥ 1; the
     /// default, 1, is the single-sequence context.
     pub max_requests: usize,
+    /// How speculative decode prefetch guesses each layer's experts
+    /// (plan phase 6). Default [`PrefetchGuess::PrevToken`] is the
+    /// historical behavior; [`PrefetchGuess::CrossLayer`] predicts
+    /// layer L+1 from layer L's residual. Bit-identical logits either
+    /// way; only pread-mode GQA decode prefetches.
+    pub prefetch_guess: PrefetchGuess,
     /// Bytes of fixed buffers the embedding application holds next to
     /// the context — e.g. `moeflux-net`'s frame buffers (plan phase 5).
     /// Counted in the budget plan as `host_buffers`, so the cap covers
@@ -104,6 +111,7 @@ impl Default for OpenConfig {
             hot_tier_profile: None,
             layer_range: None,
             max_requests: 1,
+            prefetch_guess: PrefetchGuess::PrevToken,
             host_buffers: 0,
         }
     }

@@ -2066,14 +2066,39 @@ pub(in crate::riir) fn moe_dispatch_per_token(
             )?;
             expert_files.counters().record_io_wait(io_t0.elapsed().as_nanos() as u64);
 
+            // 3b. Cross-layer guesses (plan phase 6): keep this layer's
+            //     post-attention residual for the next layer's guess.
+            //     CMD2+3 (which wrote `h_mid`) has completed and this
+            //     layer's expert dispatch isn't committed yet.
+            if let Some(c) = prefetch.cross_mut() {
+                if c.can_guess(layer_idx + 1) {
+                    // SAFETY: shared-storage buffer of `hidden_dim`
+                    // f32s; no GPU work writing it is in flight.
+                    let h_mid = unsafe {
+                        std::slice::from_raw_parts(
+                            buffer_pool.handle(buffers.h_mid).contents() as *const f32,
+                            v.hidden_dim,
+                        )
+                    };
+                    c.snapshot(layer_idx, h_mid);
+                }
+            }
+
             // 4. Score the previous-token guess (telemetry), then
             //    record actuals as the prediction for the next
             //    token's same-layer prefetch. Done before dispatch
             //    so it's independent of dispatch success.
-            if let Some(prev) = prefetch.predict_for(layer_idx) {
+            {
                 use crate::riir::io::io_stats::{Guesser, guess_overlap};
-                let correct = guess_overlap(&prev[..k], &indices[..k]);
-                expert_files.counters().record_guess(Guesser::PrevToken, k as u64, correct);
+                if let Some(prev) = prefetch.predict_for(layer_idx) {
+                    let correct = guess_overlap(&prev[..k], &indices[..k]);
+                    expert_files.counters().record_guess(Guesser::PrevToken, k as u64, correct);
+                }
+                let cross = prefetch.cross_mut().and_then(|c| c.take_guess_for(layer_idx));
+                if let Some(cross) = cross {
+                    let correct = guess_overlap(&cross[..k], &indices[..k]);
+                    expert_files.counters().record_guess(Guesser::CrossLayer, k as u64, correct);
+                }
             }
             let mut actuals: [i32; MAX_K] = [0; MAX_K];
             actuals[..k].copy_from_slice(&indices[..k]);

@@ -73,7 +73,7 @@ pub use attn::linear_attn_forward::{
 pub use attn::linear_attn_forward::{LinearAttnBuffers, LinearAttnForwardError};
 pub use attn::sdpa::{SdpaError, sdpa_cpu};
 pub use io::mtl_weight_buf::{MtlWeightBuf, MtlWeightBufError};
-pub use io::prefetch::{PrefetchState, PrefetchStatus, SlotSource};
+pub use io::prefetch::{PrefetchGuess, PrefetchState, PrefetchStatus, SlotSource};
 pub use io::weight_file::{TensorInfo, WeightFile, WeightFileError};
 pub use snapshot::state::{
     KvCache, LayerState, LayerStates, LinearAttnState, alloc_layer_states,
@@ -642,7 +642,15 @@ impl RsCtx<MetalBackend> {
             .thread_name(|i| format!("moeflux-io-{}", i))
             .build()
             .map_err(|_| RsError::InitFailed)?;
-        let prefetch = PrefetchState::new(VARIANT.num_layers, expert_io_mode);
+        let mut prefetch = PrefetchState::new(VARIANT.num_layers, expert_io_mode);
+        // Cross-layer guesses (plan phase 6): only the GQA decode path
+        // prefetches, and only in pread mode.
+        if config.prefetch_guess == PrefetchGuess::CrossLayer
+            && expert_io_mode.is_pread()
+            && VARIANT.attn_kind == variants::AttnKind::Gqa
+        {
+            prefetch.enable_cross_layer(io::guess::CrossLayerGuesser::new(&wf, layer_range.clone()));
+        }
         let mut ctx = Self {
             wf,
             backend: None,
@@ -3017,7 +3025,13 @@ impl RsCtx<MetalBackend> {
             // (low-RAM variants whose working set exceeds page-cache
             // capacity) fires it as before.
             if prefetch.mode().is_pread() {
-                if let Some(mut predicted) = prefetch.predict_for(layer_idx) {
+                // Cross-layer guess from the previous layer's residual
+                // (plan phase 6) when enabled and available; else the
+                // previous token's picks.
+                let cross = prefetch
+                    .cross_mut()
+                    .and_then(|c| c.guess(wf, layer_idx, k_active));
+                if let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) {
                     // Experts already in the hot tier bind from RAM;
                     // don't spend SSD bandwidth prefetching them.
                     if let Some(hot) = experts.hot_tier() {

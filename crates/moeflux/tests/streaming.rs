@@ -17,7 +17,7 @@
 mod common;
 
 use common::diff_helpers::default_a3b_paths;
-use moeflux::{Ctx, ExpertIoMode, ExpertIoStats, OpenConfig};
+use moeflux::{Ctx, ExpertIoMode, ExpertIoStats, OpenConfig, PrefetchGuess};
 
 const GIB: u64 = 1 << 30;
 const N_CTX: usize = 2048;
@@ -139,4 +139,27 @@ fn prefill_reads_each_expert_once_per_layer() {
         assert_eq!(row.prefill_reads, distinct, "layer {l}: {row:?}");
     }
     assert_eq!(st.prefill.bytes, st.prefill.reads * v.expert_size_4bit() as u64);
+}
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn cross_layer_guess_matches_and_reports_accuracy() {
+    let base = run(&mut open(&base_cfg()));
+    let mut ctx = open(&OpenConfig {
+        prefetch_guess: PrefetchGuess::CrossLayer,
+        ..base_cfg()
+    });
+    ctx.reset_expert_io_stats();
+    let got = run(&mut ctx);
+    let st = ctx.expert_io_stats();
+    print_stats("cross_layer", &st);
+    assert_same("cross-layer guess", &base, &got);
+    eprintln!(
+        "[streaming] guess accuracy: prev-token {:?}, cross-layer {:?}",
+        st.guess_prev.accuracy(),
+        st.guess_cross.accuracy()
+    );
+    // Every layer after the first of each decode token is guessed.
+    let v = moeflux::riir::VARIANT;
+    assert_eq!(st.guess_cross.layers, DECODE as u64 * (v.num_layers as u64 - 1), "{st:?}");
 }

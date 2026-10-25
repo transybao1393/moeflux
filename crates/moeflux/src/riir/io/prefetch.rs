@@ -51,6 +51,7 @@ use std::sync::mpsc::{Receiver, sync_channel};
 
 use crate::riir::io::expert_io::{ExpertFiles, ExpertIoError};
 use crate::riir::io::expert_io_mode::ExpertIoMode;
+use crate::riir::io::guess::CrossLayerGuesser;
 use crate::riir::io::io_stats::ReadKind;
 use crate::riir::moe::expert_forward::MAX_K;
 
@@ -74,6 +75,22 @@ pub enum SlotSource {
     /// `buf_idx`. Encoder binds
     /// `data_prefetch[prefetch_set][buf_idx]`.
     Prefetched(usize),
+}
+
+/// How speculative prefetch guesses the experts of the layer about to
+/// run ([`crate::riir::OpenConfig::prefetch_guess`], plan phase 6).
+/// Either way the forward pass routes on its own logits; the guess
+/// only decides which experts are read early.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum PrefetchGuess {
+    /// The previous token's picks for the same layer (historical).
+    #[default]
+    PrevToken,
+    /// Layer L's post-attention residual through layer L+1's norm and
+    /// router gate, on the CPU ([`super::guess::CrossLayerGuesser`]);
+    /// falls back to `PrevToken` for a range's first layer and where
+    /// the gate can't be read. GQA variants in pread mode only.
+    CrossLayer,
 }
 
 /// State machine owned by `RsCtx`. Tracks per-layer predictions and
@@ -104,6 +121,8 @@ pub struct PrefetchState {
     /// firing side and the consuming side agree on whether prefetch
     /// I/O is happening at all.
     mode: ExpertIoMode,
+    /// Cross-layer guesser when [`PrefetchGuess::CrossLayer`] is on.
+    cross: Option<CrossLayerGuesser>,
 }
 
 #[derive(Debug)]
@@ -222,7 +241,18 @@ impl PrefetchState {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             mode,
+            cross: None,
         }
+    }
+
+    /// Turn on cross-layer guesses ([`PrefetchGuess::CrossLayer`]).
+    pub fn enable_cross_layer(&mut self, guesser: CrossLayerGuesser) {
+        self.cross = Some(guesser);
+    }
+
+    /// The cross-layer guesser, when enabled.
+    pub fn cross_mut(&mut self) -> Option<&mut CrossLayerGuesser> {
+        self.cross.as_mut()
     }
 
     /// Expert-IO mode for this run. See [`ExpertIoMode`].
@@ -279,6 +309,9 @@ impl PrefetchState {
         for slot in self.last_token_indices.iter_mut() {
             *slot = None;
         }
+        if let Some(c) = self.cross.as_mut() {
+            c.clear();
+        }
     }
 
     /// Wait for any in-flight prefetch targeted at `layer_idx`,
@@ -312,6 +345,9 @@ impl PrefetchState {
     pub fn swap_predictions(&mut self, other: &mut Vec<Option<[i32; MAX_K]>>) {
         self.drain();
         std::mem::swap(&mut self.last_token_indices, other);
+        if let Some(c) = self.cross.as_mut() {
+            c.clear();
+        }
     }
 
     /// The prediction for `layer_idx`, if one exists. `None` means

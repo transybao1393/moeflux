@@ -47,5 +47,6 @@ pub mod riir;
 #[cfg(target_os = "macos")]
 pub use riir::{
     CheckpointError, DEFAULT_MAX_CHECKPOINTS, ExpertIoMode, ExpertIoStats, LayerIoStats,
-    OpenConfig, RsCtx as Ctx, ReqId, RsError as Error, StageInput, StageOutput,
+    OpenConfig, PrefetchGuess, RsCtx as Ctx, ReqId, RsError as Error, StageInput,
+    StageOutput,
 };
