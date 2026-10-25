@@ -305,6 +305,14 @@ impl PrefetchState {
         }
     }
 
+    /// Swap the per-layer predictions with `other` — a request switch
+    /// (plan phase 4): each request keeps its own last-token routing as
+    /// its guesses. Drains any in-flight prefetch first.
+    pub fn swap_predictions(&mut self, other: &mut Vec<Option<[i32; MAX_K]>>) {
+        self.drain();
+        std::mem::swap(&mut self.last_token_indices, other);
+    }
+
     /// The prediction for `layer_idx`, if one exists. `None` means
     /// no prediction yet (first token, or post-`invalidate_all`).
     pub fn predict_for(&self, layer_idx: usize) -> Option<[i32; MAX_K]> {

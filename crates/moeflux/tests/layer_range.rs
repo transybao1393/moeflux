@@ -120,7 +120,7 @@ fn range_budget_plans_only_its_layers() {
         let keep = |name: &str| range::keeps_tensor(r, name);
         let keep: Option<&dyn Fn(&str) -> bool> = (!range::is_full(r)).then_some(&keep);
         let w = filtered_bytes(&fake.weights, &fake.manifest, keep).unwrap();
-        BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, overhead, r)
+        BudgetPlan::for_range(n_ctx, ExpertIoMode::Pread, w, overhead, r, 1)
     };
     let full_plan = plan(&(0..n));
     let short_plan = plan(&short);

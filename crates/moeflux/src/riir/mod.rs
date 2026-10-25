@@ -32,6 +32,7 @@ pub mod gpu_capture;
 pub mod io;
 pub mod moe;
 pub mod range;
+pub mod requests;
 pub mod snapshot;
 pub mod variants;
 pub use attn::gpu_attn::{
@@ -78,6 +79,7 @@ pub use snapshot::state::{
     alloc_layer_states_range, clear_all, pos_max, truncate,
 };
 pub use range::RangeVec;
+pub use requests::{ReqId, RequestTable, SeqState};
 pub use config::OpenConfig;
 pub use io::expert_io_mode::ExpertIoMode;
 pub use variants::{VARIANT, Variant};
@@ -410,6 +412,13 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     n_ctx: usize,
     /// Hard memory cap ([`OpenConfig::mem_cap`]); `None` = uncapped.
     mem_cap: Option<u64>,
+    /// Request pool (plan phase 4): which request owns each slot and
+    /// which slot's state is live in `layer_states` /
+    /// `linear_buffers.{conv,delta}_state` / `prefetch`.
+    requests: requests::RequestTable,
+    /// Parked state per slot. The active slot's entry is an empty
+    /// placeholder — its state is checked out into the live fields.
+    parked: Vec<requests::SeqState>,
     // Future phases populate: vocab.
 }
 
@@ -563,6 +572,7 @@ impl RsCtx<MetalBackend> {
                 weights_bytes,
                 config.runtime_overhead,
                 &layer_range,
+                config.max_requests,
             );
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
             // `None` → the hot tier takes whatever the plan leaves, up
@@ -596,6 +606,22 @@ impl RsCtx<MetalBackend> {
         let experts = ExpertFiles::open_range(experts_dir, !capped, capped, layer_range.clone())
             .map_err(|_| RsError::InitFailed)?;
         let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone());
+        // The request pool: slot 0 (the default request) is live; the
+        // others' host state is allocated now, their GPU buffers with
+        // the rest of the GPU resources (at open under a cap).
+        let parked: Vec<requests::SeqState> = (0..config.max_requests)
+            .map(|slot| {
+                if slot == 0 {
+                    requests::SeqState::default()
+                } else {
+                    requests::SeqState {
+                        layer_states: alloc_layer_states_range(n_ctx, layer_range.clone()),
+                        predictions: vec![None; VARIANT.num_layers],
+                        ..requests::SeqState::default()
+                    }
+                }
+            })
+            .collect();
         // Top-k is model shape, not a runtime knob — it comes solely
         // from the compiled variant. (A runtime `experts_per_tok`
         // parameter used to live here; it let callers disagree with the
@@ -644,6 +670,8 @@ impl RsCtx<MetalBackend> {
             expert_io_mode,
             n_ctx,
             mem_cap: config.mem_cap,
+            requests: requests::RequestTable::new(config.max_requests),
+            parked,
         };
         if hot_tier_bytes >= expert_size {
             ctx.attach_hot_tier(hot_tier_bytes, config.hot_tier_profile.as_deref())?;
@@ -741,23 +769,19 @@ impl RsCtx<MetalBackend> {
     fn reserve_at_open(&mut self, cap: u64) -> Result<(), RsError> {
         match VARIANT.attn_kind {
             variants::AttnKind::Gqa => self.ensure_linear_resources()?,
-            variants::AttnKind::Mla => {
-                self.ensure_mla_resources()?;
-                let device = self.metal_mut()?.device().to_owned();
-                for layer in self.layer_states.iter_mut() {
-                    if let LayerState::Mla(mla) = layer {
-                        mla.ensure_buffers(&device);
-                    }
-                }
-            }
+            // `ensure_mla_resources` allocates every slot's MLA caches.
+            variants::AttnKind::Mla => self.ensure_mla_resources()?,
         }
         if let Some(backend) = self.backend.as_ref() {
             let pool = backend.pool();
-            for layer in self.layer_states.iter() {
-                match layer {
-                    LayerState::FullAttn(kv) => kv.touch(pool),
-                    LayerState::Mla(mla) => mla.touch(),
-                    LayerState::LinearAttn(_) => {}
+            let parked = self.parked.iter().map(|s| &s.layer_states);
+            for states in std::iter::once(&self.layer_states).chain(parked) {
+                for layer in states.iter() {
+                    match layer {
+                        LayerState::FullAttn(kv) => kv.touch(pool),
+                        LayerState::Mla(mla) => mla.touch(),
+                        LayerState::LinearAttn(_) => {}
+                    }
                 }
             }
         }
@@ -1332,6 +1356,7 @@ impl RsCtx<MetalBackend> {
 
         let layer_idx_us = layer_idx as usize;
         let is_full = v.layer_kind(layer_idx_us) == variants::LayerKind::FullAttn;
+        self.activate_slot(0);
 
         // Ensure all lazy resources exist.
         self.ensure_linear_resources()?;
@@ -1569,9 +1594,12 @@ impl RsCtx<MetalBackend> {
             .metal()
             .device()
             .to_owned();
-        for state in self.layer_states.iter_mut() {
-            if let LayerState::Mla(mla) = state {
-                mla.ensure_buffers(&device);
+        let parked = self.parked.iter_mut().map(|s| &mut s.layer_states);
+        for states in std::iter::once(&mut self.layer_states).chain(parked) {
+            for state in states.iter_mut() {
+                if let LayerState::Mla(mla) = state {
+                    mla.ensure_buffers(&device);
+                }
             }
         }
         // GPU MLA forward resources — buffers + YaRN tables + pipelines.
@@ -1675,13 +1703,17 @@ impl RsCtx<MetalBackend> {
         {
             let Self {
                 layer_states,
+                parked,
                 backend,
                 ..
             } = self;
             let pool = backend.as_mut().expect("just-set").pool_mut();
-            for layer in layer_states.iter_mut() {
-                if let LayerState::FullAttn(kv) = layer {
-                    kv.ensure_buffers(pool);
+            let parked = parked.iter_mut().map(|s| &mut s.layer_states);
+            for states in std::iter::once(layer_states).chain(parked) {
+                for layer in states.iter_mut() {
+                    if let LayerState::FullAttn(kv) = layer {
+                        kv.ensure_buffers(pool);
+                    }
                 }
             }
         }
@@ -1693,8 +1725,25 @@ impl RsCtx<MetalBackend> {
         }
         if self.linear_buffers.is_none() {
             let range = self.layer_range.clone();
-            let pool = self.backend.as_mut().expect("just-set").pool_mut();
-            self.linear_buffers = Some(LinearAttnBuffers::new_for_range(pool, range));
+            let active = self.requests.active();
+            let Self {
+                backend,
+                linear_buffers,
+                parked,
+                ..
+            } = self;
+            let pool = backend.as_mut().expect("just-set").pool_mut();
+            // The live recurrence belongs to the active request; every
+            // other slot gets its own, allocated here once (persistent,
+            // before the transient graph scratch below).
+            *linear_buffers = Some(LinearAttnBuffers::new_for_range(pool, range.clone()));
+            for (slot, st) in parked.iter_mut().enumerate() {
+                if slot != active {
+                    let (conv, delta) = attn::linear_attn_forward::alloc_recurrence(pool, &range);
+                    st.conv_state = conv;
+                    st.delta_state = delta;
+                }
+            }
         }
         // Construction order matters: `LinearAttnGraphScratch` is
         // all-transient (`persistent = false`); the structs after it
@@ -1829,10 +1878,28 @@ impl RsCtx<MetalBackend> {
         start_pos: usize,
         output: StageOutput<'_>,
     ) -> Result<(), RsError> {
+        self.eval_request(ReqId::DEFAULT, input, start_pos, output)
+    }
+
+    /// [`Self::eval_stage`] on request `req`'s sequence (plan phase 4).
+    /// `req` must be admitted ([`Self::admit_request`]); switching to it
+    /// swaps its state in (no copy) if another request ran last.
+    pub fn eval_request(
+        &mut self,
+        req: ReqId,
+        input: StageInput<'_>,
+        start_pos: usize,
+        output: StageOutput<'_>,
+    ) -> Result<(), RsError> {
+        let slot = self
+            .requests
+            .slot_of(req)
+            .ok_or(RsError::UnknownRequest { req: req.0 })?;
         let n = self.stage_check(&input, &output)?;
         if n == 0 {
             return Ok(());
         }
+        self.activate_slot(slot);
         self.experts.begin_epoch();
         if n == 1 && eval_token_mode() == EvalTokenMode::Oracle {
             self.step_internal_per_token_oracle(input, start_pos as i32, output)?;
@@ -1866,6 +1933,7 @@ impl RsCtx<MetalBackend> {
             return Ok(());
         }
         self.require_full_range("eval_prompt")?;
+        self.activate_slot(0);
         self.experts.begin_epoch();
         self.step_internal(
             StageInput::Tokens(tokens),
@@ -1903,6 +1971,7 @@ impl RsCtx<MetalBackend> {
             return Err(RsError::EvalFailed);
         }
         self.require_full_range("eval_token")?;
+        self.activate_slot(0);
         self.experts.begin_epoch();
         let input = StageInput::Tokens(std::slice::from_ref(&token));
         match eval_token_mode() {
@@ -3072,6 +3141,7 @@ impl RsCtx<MetalBackend> {
     /// after `memory_clear` see stale recurrence and diverge from a
     /// freshly-allocated Ctx.
     pub fn memory_clear(&mut self) {
+        self.activate_slot(0);
         clear_all(self.layer_states.as_mut_slice());
         if let (Some(bufs), Some(backend)) = (self.linear_buffers.as_ref(), self.backend.as_ref()) {
             let pool = backend.pool();
@@ -3111,6 +3181,7 @@ impl RsCtx<MetalBackend> {
     /// ctx is valid, since the truncation primitive itself is
     /// infallible.
     pub fn memory_seq_rm(&mut self, _seq_id: i32, p0: i32, p1: i32) -> bool {
+        self.activate_slot(0);
         truncate(self.layer_states.as_mut_slice(), p0, p1);
         true
     }
@@ -3242,7 +3313,7 @@ impl RsCtx<MetalBackend> {
     /// none has any entries. Mirrors `mf_memory_seq_pos_max`
     /// (infer.m:7759).
     pub fn memory_seq_pos_max(&self, _seq_id: i32) -> i32 {
-        pos_max(self.layer_states.as_slice())
+        pos_max(self.slot_states(0).as_slice())
     }
 
     /// Bytes the caller must allocate to hold a snapshot of the
@@ -3250,7 +3321,7 @@ impl RsCtx<MetalBackend> {
     /// linearly with the largest KV length across full-attn layers;
     /// re-query after each evaluation if the state has changed.
     pub fn state_size(&self) -> usize {
-        snapshot::state_snapshot::state_size(&self.layer_states)
+        snapshot::state_snapshot::state_size(self.slot_states(0))
     }
 
     /// Serialize the current state into `buf`. Returns the number of
@@ -3262,6 +3333,15 @@ impl RsCtx<MetalBackend> {
     /// buffers` aren't initialized yet (call `eval_prompt` /
     /// `eval_token` / `memory_clear` once before the first save).
     pub fn state_save(
+        &mut self,
+        buf: &mut [u8],
+    ) -> Result<usize, snapshot::state_snapshot::StateSnapshotError> {
+        self.activate_slot(0);
+        self.state_save_active(buf)
+    }
+
+    /// [`Self::state_save`] of the live (active) request's state.
+    fn state_save_active(
         &mut self,
         buf: &mut [u8],
     ) -> Result<usize, snapshot::state_snapshot::StateSnapshotError> {
@@ -3294,6 +3374,139 @@ impl RsCtx<MetalBackend> {
     /// On error the ctx state is left unchanged (preflight rejects
     /// before the destructive write).
     pub fn state_load(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<(), snapshot::state_snapshot::StateSnapshotError> {
+        self.activate_slot(0);
+        self.state_load_active(buf)
+    }
+
+    /// Admit request `req` into a free pool slot, with empty state
+    /// (plan phase 4). Fails with [`RsError::PoolFull`] when every slot
+    /// ([`OpenConfig::max_requests`]) is taken — nothing is allocated;
+    /// the pool was reserved at open.
+    pub fn admit_request(&mut self, req: ReqId) -> Result<(), RsError> {
+        let slot = self.requests.admit(req).map_err(|e| match e {
+            requests::AdmitError::Full => RsError::PoolFull {
+                max_requests: self.requests.capacity(),
+            },
+            requests::AdmitError::Exists => RsError::RequestExists { req: req.0 },
+        })?;
+        self.reset_slot(slot);
+        Ok(())
+    }
+
+    /// Release request `req`'s slot back to the pool. Returns `false`
+    /// if `req` wasn't admitted. Dropping [`ReqId::DEFAULT`] clears it
+    /// ([`Self::memory_clear`]) — the default request always exists.
+    pub fn drop_request(&mut self, req: ReqId) -> bool {
+        if req == ReqId::DEFAULT {
+            self.memory_clear();
+            return true;
+        }
+        self.requests.release(req).is_some()
+    }
+
+    /// `true` if `req` is admitted.
+    pub fn has_request(&self, req: ReqId) -> bool {
+        self.requests.slot_of(req).is_some()
+    }
+
+    /// Request pool size ([`OpenConfig::max_requests`]).
+    pub fn max_requests(&self) -> usize {
+        self.requests.capacity()
+    }
+
+    /// Requests admitted now, the default one included.
+    pub fn requests_in_use(&self) -> usize {
+        self.requests.in_use()
+    }
+
+    /// [`Self::state_size`] for request `req`.
+    pub fn state_size_for(&self, req: ReqId) -> Result<usize, RsError> {
+        let slot = self.requests.slot_of(req).ok_or(RsError::UnknownRequest { req: req.0 })?;
+        Ok(snapshot::state_snapshot::state_size(self.slot_states(slot)))
+    }
+
+    /// [`Self::state_save`] of request `req`'s state.
+    pub fn state_save_for(&mut self, req: ReqId, buf: &mut [u8]) -> Result<usize, RsError> {
+        let slot = self.requests.slot_of(req).ok_or(RsError::UnknownRequest { req: req.0 })?;
+        self.activate_slot(slot);
+        Ok(self.state_save_active(buf)?)
+    }
+
+    /// [`Self::state_load`] into request `req`'s state.
+    pub fn state_load_for(&mut self, req: ReqId, buf: &[u8]) -> Result<(), RsError> {
+        let slot = self.requests.slot_of(req).ok_or(RsError::UnknownRequest { req: req.0 })?;
+        self.activate_slot(slot);
+        Ok(self.state_load_active(buf)?)
+    }
+
+    /// Per-layer state of pool slot `slot`, wherever it lives now.
+    fn slot_states(&self, slot: usize) -> &LayerStates {
+        if slot == self.requests.active() {
+            &self.layer_states
+        } else {
+            &self.parked[slot].layer_states
+        }
+    }
+
+    /// Make `slot`'s state the live one. A no-op if it already is (the
+    /// single-request case); otherwise drains in-flight work and swaps
+    /// the live state with the parked one — pointer swaps, no copies.
+    fn activate_slot(&mut self, slot: usize) {
+        let cur = self.requests.active();
+        if cur == slot {
+            return;
+        }
+        // Every eval leaves the ring empty; defensive, like the
+        // orchestrators' own entry brackets.
+        moe::deferred::discard_deferred_experts_in(&mut self.deferred);
+        self.prefetch.drain();
+        // Live → parked[cur] (the placeholder comes out), then
+        // parked[slot] → live (the placeholder goes in).
+        self.swap_live_state(cur);
+        self.swap_live_state(slot);
+        self.requests.set_active(slot);
+    }
+
+    fn swap_live_state(&mut self, slot: usize) {
+        let st = &mut self.parked[slot];
+        std::mem::swap(&mut self.layer_states, &mut st.layer_states);
+        if let Some(lb) = self.linear_buffers.as_mut() {
+            std::mem::swap(&mut lb.conv_state, &mut st.conv_state);
+            std::mem::swap(&mut lb.delta_state, &mut st.delta_state);
+        }
+        self.prefetch.swap_predictions(&mut st.predictions);
+    }
+
+    /// Empty `slot`'s state (on admission).
+    fn reset_slot(&mut self, slot: usize) {
+        if slot == self.requests.active() {
+            moe::deferred::discard_deferred_experts_in(&mut self.deferred);
+            clear_all(self.layer_states.as_mut_slice());
+            if let (Some(bufs), Some(backend)) = (self.linear_buffers.as_ref(), self.backend.as_ref())
+            {
+                bufs.reset_recurrence(backend.pool());
+            }
+            self.prefetch.invalidate_all();
+        } else {
+            let st = &mut self.parked[slot];
+            clear_all(st.layer_states.as_mut_slice());
+            if let Some(backend) = self.backend.as_ref() {
+                // Parked buffers are not bound by any in-flight work.
+                attn::linear_attn_forward::reset_recurrence_ids(
+                    backend.pool(),
+                    &st.conv_state,
+                    &st.delta_state,
+                );
+            }
+            st.predictions.fill(None);
+        }
+    }
+
+    /// [`Self::state_load`] into the live (active) request's state.
+    fn state_load_active(
         &mut self,
         buf: &[u8],
     ) -> Result<(), snapshot::state_snapshot::StateSnapshotError> {
@@ -3382,6 +3595,27 @@ pub enum RsError {
         /// What was asked, and what this context runs.
         detail: String,
     },
+    /// [`RsCtx::admit_request`]: every request slot is taken.
+    #[error("request pool full ({max_requests} slots)")]
+    PoolFull {
+        /// [`OpenConfig::max_requests`].
+        max_requests: usize,
+    },
+    /// The request was never admitted (or was dropped).
+    #[error("unknown request {req}")]
+    UnknownRequest {
+        /// The [`ReqId`] value.
+        req: u64,
+    },
+    /// [`RsCtx::admit_request`] for a request already admitted.
+    #[error("request {req} already admitted")]
+    RequestExists {
+        /// The [`ReqId`] value.
+        req: u64,
+    },
+    /// A request-scoped snapshot call failed.
+    #[error("state snapshot: {0}")]
+    Snapshot(#[from] snapshot::state_snapshot::StateSnapshotError),
     #[error("eval call failed")]
     EvalFailed,
     #[error("state save/load failed")]

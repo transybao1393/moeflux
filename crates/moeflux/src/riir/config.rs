@@ -65,6 +65,12 @@ pub struct OpenConfig {
     /// partial range with [`crate::riir::RsCtx::eval_stage`]; the
     /// whole-model `eval_prompt` / `eval_token` need the full range.
     pub layer_range: Option<std::ops::Range<usize>>,
+    /// Requests (sequences) the context can hold at once (plan phase
+    /// 4). Each gets its own KV caches and linear-attn state for the
+    /// layer range, all allocated at open and counted in the budget
+    /// plan; admission beyond this fails cleanly. Must be ≥ 1; the
+    /// default, 1, is the single-sequence context.
+    pub max_requests: usize,
 }
 
 impl Default for OpenConfig {
@@ -78,6 +84,7 @@ impl Default for OpenConfig {
             hot_tier_bytes: None,
             hot_tier_profile: None,
             layer_range: None,
+            max_requests: 1,
         }
     }
 }
@@ -93,6 +100,9 @@ impl OpenConfig {
         }
         if self.io_threads == 0 {
             return Err("io_threads must be ≥ 1".into());
+        }
+        if self.max_requests == 0 {
+            return Err("max_requests must be ≥ 1".into());
         }
         if self.hot_tier_bytes.is_some_and(|b| b > 0) && self.expert_io == Some(ExpertIoMode::Mmap)
         {
@@ -140,6 +150,8 @@ mod tests {
         assert!(too_big.validate().is_err());
         let no_threads = OpenConfig { io_threads: 0, ..OpenConfig::default() };
         assert!(no_threads.validate().is_err());
+        let no_requests = OpenConfig { max_requests: 0, ..OpenConfig::default() };
+        assert!(no_requests.validate().is_err());
     }
 
     #[test]

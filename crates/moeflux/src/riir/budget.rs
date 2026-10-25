@@ -38,9 +38,10 @@ pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB + GIB / 2;
 pub enum Account {
     /// Non-expert weights (`model_weights.bin`).
     Weights,
-    /// Full-attention KV caches at `n_ctx`.
+    /// Full-attention KV caches at `n_ctx`, for every request slot.
     Kv,
-    /// Linear-attention conv + recurrence state (host + GPU copies).
+    /// Linear-attention conv + recurrence state (host + GPU copies),
+    /// for every request slot.
     LinearState,
     /// Expert slot ring: synced + two prefetch sets, 2 MiB-aligned.
     ExpertSlots,
@@ -131,20 +132,24 @@ impl BudgetPlan {
             weights_bytes,
             runtime_overhead,
             &(0..VARIANT.num_layers),
+            1,
         )
     }
 
     /// [`Self::for_config`] for a context running only the layers in
-    /// `range` (plan phase 3): KV and linear-attn state count only
-    /// those layers; `weights_bytes` is what the context loads for
-    /// them.
+    /// `range` (plan phase 3) with a pool of `max_requests` sequence
+    /// states (plan phase 4): KV and linear-attn state count only those
+    /// layers, once per request slot; `weights_bytes` is what the
+    /// context loads for them.
     pub fn for_range(
         n_ctx: usize,
         mode: ExpertIoMode,
         weights_bytes: u64,
         runtime_overhead: u64,
         range: &Range<usize>,
+        max_requests: usize,
     ) -> Self {
+        let reqs = max_requests.max(1) as u64;
         let v = VARIANT;
         let expert = v.expert_size_4bit() as u64;
         // `MoeBuffers::new`: MAX_K synced + 2 × MAX_K prefetch slots.
@@ -157,8 +162,8 @@ impl BudgetPlan {
         Self {
             entries: vec![
                 (Account::Weights, weights_bytes),
-                (Account::Kv, kv_bytes_per_token_in(v, range) * n_ctx as u64),
-                (Account::LinearState, linear_state_bytes_in(v, range)),
+                (Account::Kv, reqs * kv_bytes_per_token_in(v, range) * n_ctx as u64),
+                (Account::LinearState, reqs * linear_state_bytes_in(v, range)),
                 (Account::ExpertSlots, slots),
                 (Account::PrefillStaging, staging),
                 (Account::RuntimeOverhead, runtime_overhead),
@@ -307,12 +312,25 @@ mod tests {
         let cuts = [0, n / 2, n * 3 / 4, n];
         let (mut kv, mut lin) = (0, 0);
         for w in cuts.windows(2) {
-            let p = BudgetPlan::for_range(512, ExpertIoMode::Pread, 0, 0, &(w[0]..w[1]));
+            let p = BudgetPlan::for_range(512, ExpertIoMode::Pread, 0, 0, &(w[0]..w[1]), 1);
             kv += p.get(Account::Kv);
             lin += p.get(Account::LinearState);
         }
         assert_eq!(kv, full.get(Account::Kv));
         assert_eq!(lin, full.get(Account::LinearState));
+    }
+
+    /// Per-request state scales with the pool; shared accounts don't.
+    #[test]
+    fn request_pool_scales_state_accounts() {
+        let r = 0..VARIANT.num_layers;
+        let one = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 1);
+        let four = BudgetPlan::for_range(256, ExpertIoMode::Pread, 7, 9, &r, 4);
+        assert_eq!(four.get(Account::Kv), 4 * one.get(Account::Kv));
+        assert_eq!(four.get(Account::LinearState), 4 * one.get(Account::LinearState));
+        for a in [Account::Weights, Account::ExpertSlots, Account::PrefillStaging] {
+            assert_eq!(four.get(a), one.get(a), "{}", a.name());
+        }
     }
 
     #[test]
