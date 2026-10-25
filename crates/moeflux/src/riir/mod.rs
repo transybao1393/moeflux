@@ -651,6 +651,7 @@ impl RsCtx<MetalBackend> {
         {
             prefetch.enable_cross_layer(io::guess::CrossLayerGuesser::new(&wf, layer_range.clone()));
         }
+        prefetch.set_lookahead(config.prefetch_lookahead && expert_io_mode.is_pread());
         let mut ctx = Self {
             wf,
             backend: None,
@@ -3024,7 +3025,9 @@ impl RsCtx<MetalBackend> {
             // (the original 2026-05-20 tearout finding). Pread mode
             // (low-RAM variants whose working set exceeds page-cache
             // capacity) fires it as before.
-            if prefetch.mode().is_pread() {
+            // With lookahead (plan phase 6) the previous layer already
+            // issued this layer's prefetch during its attention.
+            if prefetch.mode().is_pread() && !prefetch.in_flight_for(layer_idx) {
                 // Cross-layer guess from the previous layer's residual
                 // (plan phase 6) when enabled and available; else the
                 // previous token's picks.
@@ -3034,13 +3037,7 @@ impl RsCtx<MetalBackend> {
                 if let Some(mut predicted) = cross.or_else(|| prefetch.predict_for(layer_idx)) {
                     // Experts already in the hot tier bind from RAM;
                     // don't spend SSD bandwidth prefetching them.
-                    if let Some(hot) = experts.hot_tier() {
-                        for e in predicted[..k_active].iter_mut() {
-                            if *e >= 0 && hot.contains(layer_idx, *e as usize) {
-                                *e = -1;
-                            }
-                        }
-                    }
+                    io::prefetch::mask_hot(experts.hot_tier(), layer_idx, &mut predicted[..k_active]);
                     let data_prefetch =
                         moe_buffers.data_prefetch_slots_mut_array(buffer_pool, prefetch_set);
                     prefetch.dispatch(

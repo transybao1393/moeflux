@@ -94,15 +94,20 @@ pub enum PrefetchGuess {
 }
 
 /// State machine owned by `RsCtx`. Tracks per-layer predictions and
-/// at most one in-flight async prefetch.
+/// up to two in-flight async prefetches — one per prefetch set, i.e.
+/// per target-layer parity (the second only with
+/// [`Self::set_lookahead`]).
 #[derive(Debug)]
 pub struct PrefetchState {
     /// Per-layer last-token K indices, used as the prediction for
     /// the next token's same-layer prefetch. `None` until the layer
     /// has been run at least once (or until `invalidate_all` resets).
     last_token_indices: Vec<Option<[i32; MAX_K]>>,
-    /// In-flight prefetch, if any.
-    in_flight: Option<InFlight>,
+    /// In-flight prefetch per set (`target_layer % 2`), if any.
+    in_flight: [Option<InFlight>; 2],
+    /// Issue layer L+1's prefetch during layer L's attention
+    /// ([`crate::riir::OpenConfig::prefetch_lookahead`]).
+    lookahead: bool,
     /// Slot-level hit counter (per-slot prediction matched the
     /// per-token routing). Accumulates across the lifetime of the
     /// state; reset via [`PrefetchState::reset_stats`] for per-request
@@ -237,7 +242,8 @@ impl PrefetchState {
     pub fn new(num_layers: usize, mode: ExpertIoMode) -> Self {
         Self {
             last_token_indices: vec![None; num_layers],
-            in_flight: None,
+            in_flight: [None, None],
+            lookahead: false,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             mode,
@@ -248,6 +254,24 @@ impl PrefetchState {
     /// Turn on cross-layer guesses ([`PrefetchGuess::CrossLayer`]).
     pub fn enable_cross_layer(&mut self, guesser: CrossLayerGuesser) {
         self.cross = Some(guesser);
+    }
+
+    /// Issue each layer's prefetch one layer early (plan phase 6
+    /// overlap). See [`crate::riir::OpenConfig::prefetch_lookahead`].
+    pub fn set_lookahead(&mut self, on: bool) {
+        self.lookahead = on;
+    }
+
+    /// `true` if lookahead prefetch is on.
+    pub fn lookahead(&self) -> bool {
+        self.lookahead
+    }
+
+    /// `true` if a prefetch targeting `layer_idx` is in flight.
+    pub fn in_flight_for(&self, layer_idx: usize) -> bool {
+        self.in_flight[layer_idx % 2]
+            .as_ref()
+            .is_some_and(|f| f.target_layer == layer_idx)
     }
 
     /// The cross-layer guesser, when enabled.
@@ -293,7 +317,14 @@ impl PrefetchState {
     /// distinct from `wait_for`) shouldn't be reading
     /// `data_prefetch[slot]` afterward.
     pub fn drain(&mut self) {
-        if let Some(in_flight) = self.in_flight.take() {
+        for set in 0..2 {
+            self.drain_set(set);
+        }
+    }
+
+    /// Drain the in-flight prefetch of one set, if any.
+    fn drain_set(&mut self, set: usize) {
+        if let Some(in_flight) = self.in_flight[set].take() {
             for _ in 0..in_flight.k {
                 let _ = in_flight.rx.recv();
             }
@@ -314,14 +345,15 @@ impl PrefetchState {
         }
     }
 
-    /// Wait for any in-flight prefetch targeted at `layer_idx`,
+    /// Wait for any in-flight prefetch in `layer_idx`'s set,
     /// returning the loaded indices if (a) the target matches, and
     /// (b) all K tasks completed without error. Returns `None` if
     /// no prefetch was in flight, the target was a different layer
-    /// (stale prefetch), or any task errored. In all cases, the
-    /// in-flight slot is drained and consumed.
+    /// (stale prefetch), or any task errored. In all cases, that
+    /// set's in-flight slot is drained and consumed; the other set's
+    /// (a lookahead for the next layer) is left running.
     pub fn wait_for(&mut self, layer_idx: usize) -> Option<PrefetchStatus> {
-        let in_flight = self.in_flight.take()?;
+        let in_flight = self.in_flight[layer_idx % 2].take()?;
         let mut all_ok = true;
         for _ in 0..in_flight.k {
             match in_flight.rx.recv() {
@@ -377,8 +409,9 @@ impl PrefetchState {
     /// entries in `predicted` and the count of slot pointers used
     /// from `data_prefetch`.
     ///
-    /// If a prior prefetch is still in-flight, drains it first.
-    /// Correct callers won't hit that path; the drain is defensive.
+    /// If a prior prefetch of the same set is still in flight, drains
+    /// it first. Correct callers won't hit that path; the drain is
+    /// defensive. The other set's prefetch keeps running.
     pub fn dispatch(
         &mut self,
         target_layer: usize,
@@ -388,7 +421,8 @@ impl PrefetchState {
         pool: &rayon::ThreadPool,
         expert_files: &ExpertFiles,
     ) {
-        self.drain();
+        let set = target_layer % 2;
+        self.drain_set(set);
         let (tx, rx) = sync_channel::<Result<(), ExpertIoError>>(MAX_K);
         let efp = ExpertFilesPtr::from_ref(expert_files);
         // Capture the K disjoint slot pointers BEFORE spawning;
@@ -418,12 +452,29 @@ impl PrefetchState {
                 let _ = tx.send(r);
             });
         }
-        self.in_flight = Some(InFlight {
+        self.in_flight[set] = Some(InFlight {
             target_layer,
             loaded_indices: predicted,
             k,
             rx,
         });
+    }
+}
+
+/// Mask out (set to `-1`) the entries of `predicted` that are already
+/// resident in `hot` — they bind from RAM, so reading them would only
+/// spend SSD bandwidth.
+pub fn mask_hot(
+    hot: Option<&crate::riir::io::hot_tier::HotTier>,
+    layer_idx: usize,
+    predicted: &mut [i32],
+) {
+    if let Some(hot) = hot {
+        for e in predicted.iter_mut() {
+            if *e >= 0 && hot.contains(layer_idx, *e as usize) {
+                *e = -1;
+            }
+        }
     }
 }
 
@@ -451,6 +502,28 @@ mod tests {
         assert_eq!(st.predict_for(3), Some(actual));
         st.invalidate_all();
         assert_eq!(st.predict_for(3), None);
+    }
+
+    #[test]
+    fn in_flight_tracked_per_set() {
+        let mut st = PrefetchState::new(4, ExpertIoMode::Pread);
+        assert!(!st.in_flight_for(1));
+        let (tx, rx) = sync_channel(MAX_K);
+        tx.send(Ok(())).unwrap();
+        st.in_flight[1] = Some(InFlight {
+            target_layer: 1,
+            loaded_indices: [7; MAX_K],
+            k: 1,
+            rx,
+        });
+        assert!(st.in_flight_for(1));
+        assert!(!st.in_flight_for(3), "same set, other layer");
+        // Waiting for the other set's layer leaves set 1 running.
+        assert!(st.wait_for(2).is_none());
+        assert!(st.in_flight_for(1));
+        let got = st.wait_for(1).expect("prefetch for layer 1");
+        assert_eq!((got.k, got.loaded_indices[0]), (1, 7));
+        assert!(!st.in_flight_for(1));
     }
 
     #[test]

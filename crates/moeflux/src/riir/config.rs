@@ -89,6 +89,12 @@ pub struct OpenConfig {
     /// layer L+1 from layer L's residual. Bit-identical logits either
     /// way; only pread-mode GQA decode prefetches.
     pub prefetch_guess: PrefetchGuess,
+    /// Issue layer L+1's speculative prefetch while layer L's
+    /// attention runs on the GPU, instead of at the top of L+1 (plan
+    /// phase 6 overlap). Uses the two existing prefetch sets — no new
+    /// buffers. Needs `prefetch_guess = PrevToken` (a cross-layer
+    /// guess is only known after L's attention). Default `false`.
+    pub prefetch_lookahead: bool,
     /// Bytes of fixed buffers the embedding application holds next to
     /// the context — e.g. `moeflux-net`'s frame buffers (plan phase 5).
     /// Counted in the budget plan as `host_buffers`, so the cap covers
@@ -112,6 +118,7 @@ impl Default for OpenConfig {
             layer_range: None,
             max_requests: 1,
             prefetch_guess: PrefetchGuess::PrevToken,
+            prefetch_lookahead: false,
             host_buffers: 0,
         }
     }
@@ -137,6 +144,13 @@ impl OpenConfig {
         }
         if self.io_bytes_per_sec == Some(0) {
             return Err("io_bytes_per_sec must be ≥ 1".into());
+        }
+        if self.prefetch_lookahead && self.prefetch_guess != PrefetchGuess::PrevToken {
+            return Err(
+                "prefetch_lookahead needs prefetch_guess = PrevToken (a cross-layer \
+                 guess is only known after the previous layer's attention)"
+                    .into(),
+            );
         }
         if self.hot_tier_bytes.is_some_and(|b| b > 0) && self.expert_io == Some(ExpertIoMode::Mmap)
         {
@@ -196,6 +210,10 @@ mod tests {
             ..OpenConfig::default()
         };
         assert!(bounded.validate().is_ok());
+        let ahead = OpenConfig { prefetch_lookahead: true, ..OpenConfig::default() };
+        assert!(ahead.validate().is_ok());
+        let ahead_cross = OpenConfig { prefetch_guess: PrefetchGuess::CrossLayer, ..ahead };
+        assert!(ahead_cross.validate().is_err());
     }
 
     #[test]

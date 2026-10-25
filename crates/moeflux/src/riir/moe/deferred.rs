@@ -110,6 +110,16 @@ impl DeferredRing {
         Ok(())
     }
 
+    /// Wait for every in-flight dispatch to finish on the GPU without
+    /// removing it (its completion/readback still happens through the
+    /// normal drain). Lookahead prefetch (plan phase 6) uses this
+    /// before writing a prefetch set an earlier layer's dispatch read.
+    pub fn wait_in_place(&self) {
+        for s in &self.states {
+            s.cmd_buffer.wait_until_completed();
+        }
+    }
+
     /// Remove and return the oldest in-flight dispatch (FIFO). Caller
     /// is responsible for `wait_until_completed` + readback as needed.
     pub(crate) fn pop_oldest(&mut self) -> Option<DeferredState> {

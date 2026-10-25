@@ -1363,6 +1363,21 @@ pub(in crate::riir) fn post_attention_tail(
         buffer_pool,
         ..
     } = *gpu;
+    // Plan phase 6 overlap: with lookahead on, the next layer's
+    // prefetch is issued while this layer's CMD2+3 runs.
+    let want_ahead = prefetch.lookahead() && chain_next_norm_off.is_some();
+    let mut ahead = || {
+        lookahead_prefetch(
+            prefetch,
+            moe,
+            buffer_pool,
+            deferred,
+            pool,
+            expert_files,
+            layer_idx + 1,
+            k_active,
+        )
+    };
     let intermediates = post_attention_pre_moe(
         metal,
         cmdbuf,
@@ -1371,6 +1386,7 @@ pub(in crate::riir) fn post_attention_tail(
         k_active,
         o_proj,
         gpu_attn_args,
+        want_ahead.then_some(&mut ahead as &mut dyn FnMut()),
     )?;
     moe_dispatch_per_token(
         metal,
@@ -1388,6 +1404,44 @@ pub(in crate::riir) fn post_attention_tail(
         gpu_combine,
         chain_next_norm_off,
     )
+}
+
+/// Lookahead prefetch (plan phase 6 overlap): issue `next_layer`'s
+/// speculative reads now — while the current layer's GPU work runs —
+/// instead of at the top of `next_layer`. Uses the previous-token
+/// guess (the cross-layer guess isn't known until this layer's
+/// attention finishes). No-op unless pread mode, a prediction exists
+/// and nothing is in flight for `next_layer` yet.
+///
+/// `next_layer` writes prefetch set `next_layer % 2`, which the expert
+/// dispatch of `next_layer - 2` read; that dispatch is the newest in
+/// `deferred` here, so wait for it first. The CPU would block on the
+/// current layer's command buffer (queued behind it) anyway.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::riir) fn lookahead_prefetch(
+    prefetch: &mut crate::riir::io::prefetch::PrefetchState,
+    moe: &MoeBuffers,
+    buffer_pool: &MetalBufferPool,
+    deferred: &crate::riir::moe::deferred::DeferredRing,
+    pool: &rayon::ThreadPool,
+    expert_files: &ExpertFiles,
+    next_layer: usize,
+    k_active: usize,
+) {
+    if !prefetch.mode().is_pread() || prefetch.in_flight_for(next_layer) {
+        return;
+    }
+    let Some(mut predicted) = prefetch.predict_for(next_layer) else {
+        return;
+    };
+    crate::riir::io::prefetch::mask_hot(
+        expert_files.hot_tier(),
+        next_layer,
+        &mut predicted[..k_active],
+    );
+    deferred.wait_in_place();
+    let data_prefetch = moe.data_prefetch_slots_mut_array(buffer_pool, next_layer % 2);
+    prefetch.dispatch(next_layer, predicted, k_active, data_prefetch, pool, expert_files);
 }
 
 /// First half of [`post_attention_tail`]: encode CMD2+3 (o_proj →
@@ -1415,6 +1469,9 @@ pub(in crate::riir) fn post_attention_pre_moe(
     k_active: usize,
     o_proj: OProj,
     gpu_attn_args: Option<GpuAttnEncodeArgs>,
+    // Plan phase 6: run on the CPU between committing CMD2+3 and
+    // waiting for it (lookahead prefetch of the next layer).
+    before_wait: Option<&mut dyn FnMut()>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
     let GpuLayerCtx {
         wf,
@@ -1697,7 +1754,11 @@ pub(in crate::riir) fn post_attention_pre_moe(
             },
         );
 
-        metal.commit_and_wait_labeled(cmdbuf, "post_attn_tail.cmd2_3");
+        metal.commit_and_wait_labeled_with(cmdbuf, "post_attn_tail.cmd2_3", || {
+            if let Some(f) = before_wait {
+                f()
+            }
+        });
     }
 
     // ── CPU: MoE router on the gate logits ───────────────────────

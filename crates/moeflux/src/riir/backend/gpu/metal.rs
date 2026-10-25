@@ -336,8 +336,22 @@ impl MetalContext {
     /// with no hint of where it began. Rerun under `MTL_DEBUG_LAYER=1`
     /// `MTL_SHADER_VALIDATION=1` for the precise fault.
     pub fn commit_and_wait_labeled(&self, cmdbuf: &CommandBufferRef, label: &'static str) {
-        let t0 = std::time::Instant::now();
+        self.commit_and_wait_labeled_with(cmdbuf, label, || {});
+    }
+
+    /// [`Self::commit_and_wait_labeled`] that runs `between` on the CPU
+    /// after the commit and before the wait, overlapping it with the
+    /// GPU work (plan phase 6: lookahead prefetch). The recorded wait
+    /// time starts after `between` returns.
+    pub fn commit_and_wait_labeled_with(
+        &self,
+        cmdbuf: &CommandBufferRef,
+        label: &'static str,
+        between: impl FnOnce(),
+    ) {
         cmdbuf.commit();
+        between();
+        let t0 = std::time::Instant::now();
         cmdbuf.wait_until_completed();
         let cpu_wait_ns = t0.elapsed().as_nanos() as u64;
 

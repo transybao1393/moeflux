@@ -220,6 +220,9 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     kv_state: &mut KvCache,
     // Slice 5d-8: see `linear_attn_layer_forward` for the contract.
     prev_layer_chained: bool,
+    // Plan phase 6: run on the CPU between committing CMD1 and
+    // waiting for it (lookahead prefetch of the next layer).
+    before_wait: Option<&mut dyn FnMut()>,
 ) -> Result<PostAttnIntermediates, LayerForwardError> {
     let GpuLayerCtx {
         wf,
@@ -360,7 +363,11 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             encode_matvec(cmdbuf, &mv, wf_buf, s);
         }
 
-        metal.commit_and_wait_labeled(cmdbuf, "full_attn.cmd1");
+        metal.commit_and_wait_labeled_with(cmdbuf, "full_attn.cmd1", || {
+            if let Some(f) = before_wait {
+                f()
+            }
+        });
     }
 
     // ── Read q_proj_out, k, v back to host ───────────────────────
@@ -532,6 +539,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             in_dim: q_dim as u32,
         },
         gpu_attn_args,
+        None,
     )?;
     Ok(intermediates)
 }
@@ -571,6 +579,21 @@ pub(in crate::riir) fn full_attn_layer_forward(
         buffer_pool,
         ..
     } = *gpu;
+    // Plan phase 6 overlap: with lookahead on, the next layer's
+    // prefetch is issued while this layer's CMD1 runs.
+    let want_ahead = prefetch.lookahead() && chain_next_norm_off.is_some();
+    let mut ahead = || {
+        crate::riir::attn::linear_attn_forward::lookahead_prefetch(
+            prefetch,
+            moe,
+            buffer_pool,
+            deferred,
+            pool,
+            expert_files,
+            layer_idx + 1,
+            k_active,
+        )
+    };
     let intermediates = full_attn_pre_moe_layer_forward(
         metal,
         gpu,
@@ -579,6 +602,7 @@ pub(in crate::riir) fn full_attn_layer_forward(
         k_active,
         kv_state,
         prev_layer_chained,
+        want_ahead.then_some(&mut ahead as &mut dyn FnMut()),
     )?;
     moe_dispatch_per_token(
         metal,

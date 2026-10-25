@@ -163,3 +163,31 @@ fn cross_layer_guess_matches_and_reports_accuracy() {
     let v = moeflux::riir::VARIANT;
     assert_eq!(st.guess_cross.layers, DECODE as u64 * (v.num_layers as u64 - 1), "{st:?}");
 }
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn lookahead_prefetch_matches() {
+    let base = run(&mut open(&base_cfg()));
+    let mut ctx = open(&OpenConfig { prefetch_lookahead: true, ..base_cfg() });
+    ctx.reset_expert_io_stats();
+    let got = run(&mut ctx);
+    let st = ctx.expert_io_stats();
+    print_stats("lookahead", &st);
+    assert_same("lookahead prefetch", &base, &got);
+    assert!(st.prefetch.reads > 0, "{st:?}");
+}
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn lookahead_with_bounded_io_and_no_hot_tier_matches() {
+    // The hardest timing case: every pick streams, reads are throttled
+    // to one at a time, prefetches overlap the previous layer.
+    let base = run(&mut open(&OpenConfig { hot_tier_bytes: Some(0), ..base_cfg() }));
+    let got = run(&mut open(&OpenConfig {
+        hot_tier_bytes: Some(0),
+        prefetch_lookahead: true,
+        io_queue_depth: Some(1),
+        ..base_cfg()
+    }));
+    assert_same("lookahead + depth 1", &base, &got);
+}
