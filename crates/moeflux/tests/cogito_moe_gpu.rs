@@ -25,6 +25,7 @@ use moeflux::riir::MetalContext;
 use moeflux::riir::MoeBuffers;
 use moeflux::riir::MtlWeightBuf;
 use moeflux::riir::WeightFile;
+use moeflux::riir::backend::gpu::MetalBufferPool;
 use moeflux::riir::backend::gpu::dense_mlp_gpu::DenseMlpPipelines;
 use moeflux::riir::backend::gpu::gpu_matvec::BfMatvecPipelines;
 use moeflux::riir::moe::cogito_moe_gpu::{SharedExpertBuffers, cogito_moe_layer_forward_gpu};
@@ -50,7 +51,8 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     let ef = ExpertFiles::open(&experts_dir).expect("open experts");
     let mut metal = MetalContext::new().expect("open Metal");
     let device = metal.device().clone();
-    let mut bufs = MoeBuffers::new(&device);
+    let mut buffer_pool = MetalBufferPool::new(device.clone());
+    let mut bufs = MoeBuffers::new(&mut buffer_pool);
     let shared_bufs = SharedExpertBuffers::new(&device);
     let dense_pipes = DenseMlpPipelines::fetch(&mut metal).expect("fetch DenseMlpPipelines");
     let bf_pipes = BfMatvecPipelines::fetch(&mut metal).expect("fetch BfMatvecPipelines");
@@ -85,6 +87,7 @@ fn cogito_moe_layer3_gpu_matches_cpu() {
     cogito_moe_layer_forward_gpu(
         &mut metal,
         &mut bufs,
+        &buffer_pool,
         &shared_bufs,
         &dense_pipes,
         &bf_pipes,
