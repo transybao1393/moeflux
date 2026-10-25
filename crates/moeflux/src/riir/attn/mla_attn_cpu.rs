@@ -75,7 +75,7 @@ use crate::riir::backend::cpu::cpu_matvec::{CpuMatvecError, project_4bit_cpu};
 use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_router::softmax;
 use crate::riir::snapshot::state::MlaKvCacheGpu;
-use crate::riir::variants::{MAX_SEQ_LEN, VARIANT};
+use crate::riir::variants::VARIANT;
 
 /// Errors specific to the MLA CPU forward.
 #[derive(Debug, thiserror::Error)]
@@ -90,7 +90,7 @@ pub enum MlaForwardError {
     OutLen { got: usize, expected: usize },
     #[error("position {pos} != kv_cache.len {cache_len} (single-step decode)")]
     PosMismatch { pos: i32, cache_len: i32 },
-    #[error("kv_cache.len {len} would exceed MAX_SEQ_LEN={max} after append")]
+    #[error("kv_cache.len {len} would exceed capacity (n_ctx) {max} after append")]
     CacheFull { len: i32, max: usize },
     #[error("matvec error in MLA: {0}")]
     Matvec(#[from] CpuMatvecError),
@@ -110,7 +110,7 @@ pub enum MlaForwardError {
 /// - `VARIANT.attn_kind == AttnKind::Mla`
 /// - `hidden.len() == VARIANT.hidden_dim`
 /// - `out.len() == VARIANT.hidden_dim`
-/// - `kv_cache.len < MAX_SEQ_LEN`
+/// - `kv_cache.len < kv_cache.capacity`
 /// - `pos == kv_cache.len` (single-step decode at the next position)
 ///
 /// Post-conditions:
@@ -161,10 +161,10 @@ pub fn mla_attn_layer_forward_cpu(
             cache_len: kv_cache.len,
         });
     }
-    if (kv_cache.len as usize) >= MAX_SEQ_LEN {
+    if (kv_cache.len as usize) >= kv_cache.capacity {
         return Err(MlaForwardError::CacheFull {
             len: kv_cache.len,
-            max: MAX_SEQ_LEN,
+            max: kv_cache.capacity,
         });
     }
 
@@ -391,7 +391,7 @@ mod tests {
         hidden[7] = 1.0;
         let device =
             metal::Device::system_default().expect("Metal device for MLA KV cache buffers");
-        let mut cache = MlaKvCacheGpu::new();
+        let mut cache = MlaKvCacheGpu::new(crate::riir::variants::MAX_SEQ_LEN);
         cache.ensure_buffers(&device);
         let mut out = vec![0.0f32; v.hidden_dim];
 

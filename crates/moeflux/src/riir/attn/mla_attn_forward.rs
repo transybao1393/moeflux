@@ -169,7 +169,7 @@ pub enum MlaForwardGpuError {
     NotMlaVariant {
         kind: crate::riir::variants::AttnKind,
     },
-    #[error("kv_cache.len {len} would exceed MAX_SEQ_LEN={max} after append")]
+    #[error("kv_cache.len {len} would exceed capacity (n_ctx) {max} after append")]
     CacheFull { len: i32, max: usize },
     #[error("pos {pos} != kv_cache.len {cache_len} (single-step decode)")]
     PosMismatch { pos: i32, cache_len: i32 },
@@ -217,10 +217,10 @@ pub fn mla_attn_layer_forward_gpu(
             cache_len: kv_cache.len,
         });
     }
-    if (kv_cache.len as usize) >= crate::riir::variants::MAX_SEQ_LEN {
+    if (kv_cache.len as usize) >= kv_cache.capacity {
         return Err(MlaForwardGpuError::CacheFull {
             len: kv_cache.len,
-            max: crate::riir::variants::MAX_SEQ_LEN,
+            max: kv_cache.capacity,
         });
     }
     let latent_buf = kv_cache

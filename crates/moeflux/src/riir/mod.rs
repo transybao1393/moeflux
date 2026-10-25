@@ -26,6 +26,8 @@ use ::metal::Buffer;
 
 pub mod attn;
 pub mod backend;
+pub mod budget;
+pub mod config;
 pub mod gpu_capture;
 pub mod io;
 pub mod moe;
@@ -73,6 +75,8 @@ pub use io::weight_file::{TensorInfo, WeightFile, WeightFileError};
 pub use snapshot::state::{
     KvCache, LayerState, LinearAttnState, alloc_layer_states, clear_all, pos_max, truncate,
 };
+pub use config::OpenConfig;
+pub use io::expert_io_mode::ExpertIoMode;
 pub use variants::{VARIANT, Variant};
 
 /// Default cap on stored snapshot checkpoints per [`RsCtx`]. Matches
@@ -336,6 +340,11 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// `moe_dispatch_per_token` (decode branch). Constant for the
     /// session.
     expert_io_mode: io::expert_io_mode::ExpertIoMode,
+    /// Context length every KV cache is sized to
+    /// ([`OpenConfig::n_ctx`]). Returned by [`Self::n_ctx`].
+    n_ctx: usize,
+    /// Hard memory cap ([`OpenConfig::mem_cap`]); `None` = uncapped.
+    mem_cap: Option<u64>,
     // Future phases populate: vocab.
 }
 
@@ -433,17 +442,66 @@ impl RsCtx<MetalBackend> {
     /// Phase 3: only the `weights` + `manifest` paths are consumed
     /// today. The remaining args are accepted for signature stability
     /// — they'll be wired into init as their consuming kernels land.
+    ///
+    /// Equivalent to [`Self::open_with`] with [`OpenConfig::default`].
     pub fn open(
+        weights: &Path,
+        manifest: &Path,
+        vocab: &Path,
+        experts_dir: &Path,
+        use_2bit: bool,
+    ) -> Result<Self, RsError> {
+        Self::open_with(
+            weights,
+            manifest,
+            vocab,
+            experts_dir,
+            use_2bit,
+            &OpenConfig::default(),
+        )
+    }
+
+    /// Open a model with runtime configuration — context length,
+    /// expert-IO path, IO thread count. See [`OpenConfig`].
+    pub fn open_with(
         weights: &Path,
         manifest: &Path,
         _vocab: &Path,
         experts_dir: &Path,
         _use_2bit: bool,
+        config: &OpenConfig,
     ) -> Result<Self, RsError> {
+        config
+            .validate()
+            .map_err(|detail| RsError::InvalidConfig { detail })?;
+        let n_ctx = config.n_ctx;
+        // Under a hard cap, experts are always pread-staged: mmap-direct
+        // pages are file-backed and invisible to the cap.
+        let expert_io_mode = if config.mem_cap.is_some() {
+            ExpertIoMode::Pread
+        } else {
+            io::expert_io_mode::select_with(config.expert_io)
+        };
+        if let Some(cap) = config.mem_cap {
+            let weights_bytes = std::fs::metadata(weights).map_err(|_| RsError::InitFailed)?.len();
+            let plan = budget::BudgetPlan::for_config(
+                n_ctx,
+                expert_io_mode,
+                weights_bytes,
+                config.runtime_overhead,
+            );
+            plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
+            eprintln!(
+                "[budget] cap {} — plan {} ({})",
+                budget::fmt_gib(cap),
+                budget::fmt_gib(plan.total()),
+                plan.breakdown()
+            );
+        }
         let wf = WeightFile::open(weights, manifest).map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
         let experts = ExpertFiles::open(experts_dir).map_err(|_| RsError::InitFailed)?;
-        let layer_states = alloc_layer_states();
+        let layer_states = alloc_layer_states(n_ctx);
         // Top-k is model shape, not a runtime knob — it comes solely
         // from the compiled variant. (A runtime `experts_per_tok`
         // parameter used to live here; it let callers disagree with the
@@ -452,13 +510,12 @@ impl RsCtx<MetalBackend> {
         // `VARIANT.num_experts_per_tok`: a3b=8, a17b=10.)
         let k_active = VARIANT.num_experts_per_tok;
         let io_pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(8)
+            .num_threads(config.io_threads)
             .thread_name(|i| format!("moeflux-io-{}", i))
             .build()
             .map_err(|_| RsError::InitFailed)?;
-        let expert_io_mode = io::expert_io_mode::select();
         let prefetch = PrefetchState::new(VARIANT.num_layers, expert_io_mode);
-        Ok(Self {
+        let mut ctx = Self {
             wf,
             backend: None,
             moe_buffers: None,
@@ -490,7 +547,70 @@ impl RsCtx<MetalBackend> {
             mla_norm_pipes: None,
             residual_add_pipe: None,
             expert_io_mode,
-        })
+            n_ctx,
+            mem_cap: config.mem_cap,
+        };
+        if let Some(cap) = ctx.mem_cap {
+            ctx.reserve_at_open(cap)?;
+        }
+        Ok(ctx)
+    }
+
+
+    /// Hard-cap open path: build every resource now and touch the KV
+    /// caches, so the context reaches its steady-state footprint
+    /// before `open` returns, then check the measured footprint.
+    fn reserve_at_open(&mut self, cap: u64) -> Result<(), RsError> {
+        match VARIANT.attn_kind {
+            variants::AttnKind::Gqa => self.ensure_linear_resources()?,
+            variants::AttnKind::Mla => {
+                self.ensure_mla_resources()?;
+                let device = self.metal_mut()?.device().to_owned();
+                for layer in self.layer_states.iter_mut() {
+                    if let LayerState::Mla(mla) = layer {
+                        mla.ensure_buffers(&device);
+                    }
+                }
+            }
+        }
+        if let Some(backend) = self.backend.as_ref() {
+            let pool = backend.pool();
+            for layer in self.layer_states.iter() {
+                match layer {
+                    LayerState::FullAttn(kv) => kv.touch(pool),
+                    LayerState::Mla(mla) => mla.touch(),
+                    LayerState::LinearAttn(_) => {}
+                }
+            }
+        }
+        let fp = budget::check_footprint(cap, "open")
+            .map_err(|detail| RsError::OverBudget { detail })?;
+        eprintln!(
+            "[budget] open footprint {} of cap {}",
+            budget::fmt_gib(fp.current),
+            budget::fmt_gib(cap)
+        );
+        Ok(())
+    }
+
+    /// Re-check the footprint against the cap (no-op without one).
+    fn check_cap(&self, when: &str) -> Result<(), RsError> {
+        match self.mem_cap {
+            Some(cap) => budget::check_footprint(cap, when)
+                .map(|_| ())
+                .map_err(|detail| RsError::OverBudget { detail }),
+            None => Ok(()),
+        }
+    }
+
+    /// The hard memory cap this context was opened with, if any.
+    pub fn mem_cap(&self) -> Option<u64> {
+        self.mem_cap
+    }
+
+    /// Current and peak process `phys_footprint`.
+    pub fn footprint(&self) -> Option<budget::Footprint> {
+        budget::footprint()
     }
 
     /// Build (or return) the Metal backend on demand. CPU-only kernels
@@ -544,7 +664,7 @@ impl RsCtx<MetalBackend> {
     }
 
     pub fn n_ctx(&self) -> usize {
-        variants::MAX_SEQ_LEN
+        self.n_ctx
     }
 
     pub fn eos(&self) -> i32 {
@@ -1448,7 +1568,8 @@ impl RsCtx<MetalBackend> {
         if tokens.is_empty() {
             return Ok(());
         }
-        self.step_internal(tokens, start_pos as i32, Some(&mut logits[..]))
+        self.step_internal(tokens, start_pos as i32, Some(&mut logits[..]))?;
+        self.check_cap("eval_prompt")
     }
 
     /// Decode-style single-token step. Always emits logits. Mirrors C
@@ -1480,10 +1601,11 @@ impl RsCtx<MetalBackend> {
         }
         match eval_token_mode() {
             EvalTokenMode::Oracle => {
-                self.step_internal_per_token_oracle(token, pos as i32, Some(logits))
+                self.step_internal_per_token_oracle(token, pos as i32, Some(logits))?
             }
-            EvalTokenMode::Batched => self.step_internal(&[token], pos as i32, Some(logits)),
+            EvalTokenMode::Batched => self.step_internal(&[token], pos as i32, Some(logits))?,
         }
+        self.check_cap("eval_token")
     }
 
     /// Canonical multi-token forward orchestrator. Processes
@@ -2880,6 +3002,19 @@ pub enum RsError {
     PathHasNul,
     #[error("init failed (file missing, mmap, vocab, Metal)")]
     InitFailed,
+    /// The hard memory cap ([`OpenConfig::mem_cap`]) would be or was
+    /// exceeded. `detail` names the accounts or measured footprint.
+    #[error("over memory budget: {detail}")]
+    OverBudget {
+        /// Plan breakdown or measured footprint vs cap.
+        detail: String,
+    },
+    /// An [`OpenConfig`] field is out of range.
+    #[error("invalid open config: {detail}")]
+    InvalidConfig {
+        /// Which field, and why.
+        detail: String,
+    },
     #[error("eval call failed")]
     EvalFailed,
     #[error("state save/load failed")]

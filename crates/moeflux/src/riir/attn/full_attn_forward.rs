@@ -397,7 +397,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
 
     // ── KV append: canonical pool KV ─────────────────────────────
     let cache_pos = kv_state.len as usize;
-    if cache_pos + 1 > crate::riir::variants::MAX_SEQ_LEN {
+    if cache_pos + 1 > kv_state.capacity {
         return Err(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "kv cache overflow",
@@ -677,7 +677,7 @@ where
         .expect("kv cache registered by ensure_linear_resources");
 
     let kv_start = kv_state.len;
-    if (kv_start as usize) + n_tokens > crate::riir::variants::MAX_SEQ_LEN {
+    if (kv_start as usize) + n_tokens > kv_state.capacity {
         return Err(LayerForwardError::MissingTensor {
             layer: layer_idx,
             tensor: "kv cache overflow",

@@ -44,7 +44,7 @@ use metal::{Buffer, Device};
 use crate::riir::attn::linear_attn_forward::{LayerForwardBuffers, linear_layer_idx_for};
 use crate::riir::moe::deferred;
 use crate::riir::snapshot::state::{LayerState, MlaKvCacheGpu};
-use crate::riir::variants::{AttnKind, LayerKind, MAX_SEQ_LEN, VARIANT, Variant};
+use crate::riir::variants::{AttnKind, LayerKind, VARIANT, Variant};
 
 /// `'MFLX'` little-endian. Wire-compatible with the C side's
 /// `MF_SNAPSHOT_MAGIC` (infer.m:8487).
@@ -91,7 +91,7 @@ pub enum StateSnapshotError {
     #[error("snapshot layer {layer} has negative KV length {len}")]
     NegativeLen { layer: usize, len: i32 },
     /// Per-layer length exceeds the architectural maximum.
-    #[error("snapshot layer {layer} KV length {len} exceeds MAX_SEQ_LEN={max}")]
+    #[error("snapshot layer {layer} KV length {len} exceeds this context's n_ctx={max}")]
     LenOverflow { layer: usize, len: i32, max: usize },
     /// Truncated payload (preflight failure during load).
     #[error("snapshot truncated at layer {layer}: need {need} more bytes, got {got}")]
@@ -437,11 +437,12 @@ pub fn state_load(
                     if len < 0 {
                         return Err(StateSnapshotError::NegativeLen { layer: i, len });
                     }
-                    if (len as usize) > MAX_SEQ_LEN {
+                    let cap = layer_states[i].kv_capacity().unwrap_or(0);
+                    if (len as usize) > cap {
                         return Err(StateSnapshotError::LenOverflow {
                             layer: i,
                             len,
-                            max: MAX_SEQ_LEN,
+                            max: cap,
                         });
                     }
                     let bytes = match v.attn_kind {
@@ -532,7 +533,7 @@ pub fn state_load(
                 // pool — registered by `ensure_linear_resources`,
                 // which `state_load` runs before reaching here. Write
                 // the restored prefix straight into the shared-storage
-                // buffers. The `[len, MAX_SEQ_LEN)` tail is not zeroed
+                // buffers. The `[len, capacity)` tail is not zeroed
                 // — SDPA reads are bounded by `len` and every appended
                 // row is overwritten before it is read (mirrors the
                 // MLA branch + `MlaKvCacheGpu`).

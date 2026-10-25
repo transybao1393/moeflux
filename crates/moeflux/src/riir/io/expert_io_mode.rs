@@ -88,6 +88,17 @@ fn physical_ram_bytes() -> u64 {
 /// applies the `expert_bytes > 0.75 * physical_ram` gate. Logs the
 /// decision once on stderr.
 pub fn select() -> ExpertIoMode {
+    select_with(None)
+}
+
+/// [`select`] with an explicit caller choice
+/// ([`crate::riir::OpenConfig::expert_io`]). `Some(mode)` wins over
+/// `MOEFLUX_EXPERT_IO` and the RAM gate.
+pub fn select_with(configured: Option<ExpertIoMode>) -> ExpertIoMode {
+    if let Some(mode) = configured {
+        eprintln!("[expert_io] {mode:?} (set by OpenConfig::expert_io)");
+        return mode;
+    }
     let v = VARIANT;
     let expert_bytes = total_expert_bytes(v);
     let ram_bytes = physical_ram_bytes();

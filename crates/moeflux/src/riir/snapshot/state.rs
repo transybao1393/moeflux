@@ -30,10 +30,19 @@ use crate::riir::backend::gpu::MetalBufferPool;
 use crate::riir::backend::{BufId, BufferPool};
 use crate::riir::variants::{MAX_SEQ_LEN, VARIANT, Variant};
 
+/// Clamp a requested context length to `[1, MAX_SEQ_LEN]`. Every KV
+/// cache is sized to the runtime `n_ctx` (see
+/// [`crate::riir::OpenConfig::n_ctx`]); `MAX_SEQ_LEN` stays the
+/// ceiling the RoPE configuration supports.
+pub fn clamp_n_ctx(n_ctx: usize) -> usize {
+    n_ctx.clamp(1, MAX_SEQ_LEN)
+}
+
 /// Full-attention key/value cache for one layer. **GPU-resident**:
 /// `k_id` and `v_id` are pool [`BufId`]s for `MTLResourceStorageMode
-/// Shared` Metal buffers of shape `[MAX_SEQ_LEN, num_kv_heads *
-/// head_dim]` row-major f32. Shared storage means the CPU full-attn
+/// Shared` Metal buffers of shape `[capacity, num_kv_heads *
+/// head_dim]` row-major f32, where `capacity` is the context's
+/// runtime `n_ctx`. Shared storage means the CPU full-attn
 /// path reads/writes the same bytes via `contents()` while the GPU
 /// SDPA path reads them directly — no host mirror, no per-layer
 /// re-upload (the prefill arc's Phase 0: the prior `Box<[f32]>` host
@@ -55,27 +64,36 @@ use crate::riir::variants::{MAX_SEQ_LEN, VARIANT, Variant};
 /// `ensure_linear_resources` (the one site holding `&mut pool`).
 #[derive(Debug)]
 pub struct KvCache {
-    /// Pool `BufId` for the `[MAX_SEQ_LEN, num_kv_heads * head_dim]`
+    /// Pool `BufId` for the `[capacity, num_kv_heads * head_dim]`
     /// row-major f32 K cache. `None` until [`Self::ensure_buffers`].
     pub k_id: Option<BufId<KvCacheKBuf>>,
     pub v_id: Option<BufId<KvCacheVBuf>>,
     pub len: i32,
+    /// Maximum number of positions the buffers hold (the context's
+    /// `n_ctx`). Appends past it fail with a cache-overflow error.
+    pub capacity: usize,
 }
 
 impl KvCache {
     /// Construct an empty cache without GPU buffers. Buffers are
     /// allocated lazily by [`Self::ensure_buffers`] once the pool
     /// exists.
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             k_id: None,
             v_id: None,
             len: 0,
+            capacity: clamp_n_ctx(capacity),
         }
     }
 
+    /// Bytes per side (K or V) at this cache's capacity.
+    pub fn bytes_per_side(&self) -> usize {
+        self.capacity * VARIANT.num_kv_heads * VARIANT.head_dim * std::mem::size_of::<f32>()
+    }
+
     /// Register the shared-storage K/V buffers into `pool` if not
-    /// already present. Idempotent. Sized `MAX_SEQ_LEN * num_kv_heads
+    /// already present. Idempotent. Sized `capacity * num_kv_heads
     /// * head_dim` f32 per side — virtual reservations until pages are
     /// touched. Allocated via `device.new_buffer` + `register_borrowed`
     /// (NOT `pool.alloc`, which would zero-fill the whole multi-GB
@@ -84,8 +102,7 @@ impl KvCache {
     /// the `MlaKvCacheGpu::ensure_buffers` note. `persistent = true`
     /// keeps the buffers out of `commit_plan` lifetime coloring.
     pub fn ensure_buffers(&mut self, pool: &mut MetalBufferPool) {
-        let entries = MAX_SEQ_LEN * VARIANT.num_kv_heads * VARIANT.head_dim;
-        let bytes = entries * std::mem::size_of::<f32>();
+        let bytes = self.bytes_per_side();
         let device = pool.device().clone();
         if self.k_id.is_none() {
             let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
@@ -109,6 +126,23 @@ impl KvCache {
                 "kv.v_cache allocation failed: {bytes} bytes (out of device memory?)"
             );
             self.v_id = Some(pool.register_borrowed(buf, bytes, "kv.v_cache", true));
+        }
+    }
+
+    /// Commit every page of both buffers by writing zeros, so the
+    /// cache's full `capacity` is resident now rather than growing
+    /// with the sequence. Used under a hard memory cap
+    /// ([`crate::riir::OpenConfig::mem_cap`]). No-op before
+    /// [`Self::ensure_buffers`]. Call only with no GPU work in flight.
+    pub fn touch(&self, pool: &MetalBufferPool) {
+        let bytes = self.bytes_per_side();
+        for id in [self.k_id.map(|i| pool.handle(i)), self.v_id.map(|i| pool.handle(i))]
+            .into_iter()
+            .flatten()
+        {
+            // SAFETY: shared-storage buffer of `bytes` length, allocated
+            // in `ensure_buffers`; caller guarantees no in-flight GPU use.
+            unsafe { std::ptr::write_bytes(id.contents() as *mut u8, 0, bytes) };
         }
     }
 
@@ -214,7 +248,7 @@ impl KvCache {
 /// directly.
 ///
 /// Storage is GPU-resident: `MTLResourceStorageModeShared` Metal
-/// buffers, sized to `MAX_SEQ_LEN` rows. Shared storage means the
+/// buffers, sized to `capacity` (the context's `n_ctx`) rows. Shared storage means the
 /// CPU MLA path can read/write the same bytes via `contents()`
 /// without a host-side mirror. macOS lazy-commits the virtual
 /// reservation, so non-touched rows don't consume physical RAM.
@@ -227,27 +261,31 @@ impl KvCache {
 #[derive(Debug)]
 pub struct MlaKvCacheGpu {
     /// `kv_a_layernorm`-output cache: post-down-projection,
-    /// post-norm latent. Shape `[MAX_SEQ_LEN, kv_lora_rank]`
+    /// post-norm latent. Shape `[capacity, kv_lora_rank]`
     /// row-major. `None` until populated by
     /// `ensure_mla_gpu_resources` on first eval.
     pub latent_cache: Option<Buffer>,
     /// Pre-RoPE'd rope-K cache (already RoPE-applied at the position
     /// it was stored at — broadcast across all heads at use time).
-    /// Shape `[MAX_SEQ_LEN, qk_rope_head_dim]`.
+    /// Shape `[capacity, qk_rope_head_dim]`.
     pub rope_k_cache: Option<Buffer>,
     /// Number of populated positions.
     pub len: i32,
+    /// Maximum number of positions the buffers hold (the context's
+    /// `n_ctx`).
+    pub capacity: usize,
 }
 
 impl MlaKvCacheGpu {
     /// Construct an empty cache without any GPU buffers. Buffers are
     /// allocated lazily by [`Self::ensure_buffers`] once a Metal
     /// device is available.
-    pub fn new() -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
             latent_cache: None,
             rope_k_cache: None,
             len: 0,
+            capacity: clamp_n_ctx(capacity),
         }
     }
 
@@ -273,7 +311,7 @@ impl MlaKvCacheGpu {
         // pages, matching the explicit-memset behavior bit-for-bit).
         if self.latent_cache.is_none() {
             let bytes =
-                (MAX_SEQ_LEN * VARIANT.kv_lora_rank * std::mem::size_of::<f32>()) as NSUInteger;
+                (self.capacity * VARIANT.kv_lora_rank * std::mem::size_of::<f32>()) as NSUInteger;
             let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
             // See the Gqa KV note above: guard the infallible alloc so a
             // nil buffer fails attributably instead of a later SIGSEGV.
@@ -285,13 +323,24 @@ impl MlaKvCacheGpu {
         }
         if self.rope_k_cache.is_none() {
             let bytes =
-                (MAX_SEQ_LEN * VARIANT.qk_rope_head_dim * std::mem::size_of::<f32>()) as NSUInteger;
+                (self.capacity * VARIANT.qk_rope_head_dim * std::mem::size_of::<f32>()) as NSUInteger;
             let buf = device.new_buffer(bytes, MTLResourceOptions::StorageModeShared);
             assert!(
                 !buf.contents().is_null(),
                 "mla.rope_k_cache allocation failed: {bytes} bytes (out of device memory?)"
             );
             self.rope_k_cache = Some(buf);
+        }
+    }
+
+    /// Commit every page of both buffers by writing zeros (see
+    /// [`KvCache::touch`]). No-op before [`Self::ensure_buffers`].
+    pub fn touch(&self) {
+        for buf in [&self.latent_cache, &self.rope_k_cache].into_iter().flatten() {
+            // SAFETY: shared-storage buffer allocated by
+            // `ensure_buffers`; `length()` is its byte size; caller
+            // guarantees no in-flight GPU use.
+            unsafe { std::ptr::write_bytes(buf.contents() as *mut u8, 0, buf.length() as usize) };
         }
     }
 
@@ -411,8 +460,9 @@ impl MlaKvCacheGpu {
 }
 
 impl Default for MlaKvCacheGpu {
+    /// Full `MAX_SEQ_LEN` capacity — the pre-`OpenConfig` behavior.
     fn default() -> Self {
-        Self::new()
+        Self::new(MAX_SEQ_LEN)
     }
 }
 
@@ -470,6 +520,16 @@ impl LayerState {
     pub fn is_full(&self) -> bool {
         matches!(self, Self::FullAttn(_) | Self::Mla(_))
     }
+
+    /// KV capacity in positions for full-attn flavors; `None` for
+    /// linear-attn layers (constant-size state).
+    pub fn kv_capacity(&self) -> Option<usize> {
+        match self {
+            Self::FullAttn(kv) => Some(kv.capacity),
+            Self::Mla(mla) => Some(mla.capacity),
+            Self::LinearAttn(_) => None,
+        }
+    }
 }
 
 /// Allocate the per-layer state vector for the active variant.
@@ -479,17 +539,19 @@ impl LayerState {
 /// of full-attn (GQA vs MLA) is selected by [`Variant::attn_kind`]:
 /// GQA gets a [`KvCache`], MLA gets a compressed [`MlaKvCache`].
 /// This matters at allocation because [`KvCache::new`] would reserve
-/// `num_kv_heads * head_dim * MAX_SEQ_LEN * 2 * 4` bytes — for
+/// `num_kv_heads * head_dim * n_ctx * 2 * 4` bytes — for
 /// Cogito-V2 that's a ~196 GB virtual reservation per layer, all of
 /// it lazy-committed but still wasted address space we never touch.
 /// Mirrors the C-side allocation in `mf_init_model` (infer.m:7511+).
-pub fn alloc_layer_states() -> Vec<LayerState> {
+///
+/// `n_ctx` sizes every KV cache (clamped to `[1, MAX_SEQ_LEN]`).
+pub fn alloc_layer_states(n_ctx: usize) -> Vec<LayerState> {
     use crate::riir::variants::{AttnKind, LayerKind};
     (0..VARIANT.num_layers)
         .map(|i| match VARIANT.layer_kind(i) {
             LayerKind::FullAttn => match VARIANT.attn_kind {
-                AttnKind::Gqa => LayerState::FullAttn(KvCache::new()),
-                AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new()),
+                AttnKind::Gqa => LayerState::FullAttn(KvCache::new(n_ctx)),
+                AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new(n_ctx)),
             },
             LayerKind::LinearAttn => LayerState::LinearAttn(LinearAttnState::new()),
         })
@@ -558,13 +620,40 @@ pub fn pos_max(layers: &[LayerState]) -> i32 {
 mod tests {
     use super::*;
 
+    /// Every full-attn layer is sized to the requested `n_ctx`;
+    /// linear-attn layers carry no KV capacity.
+    #[test]
+    fn layer_states_sized_to_n_ctx() {
+        let layers = alloc_layer_states(4096);
+        for l in &layers {
+            match l.kv_capacity() {
+                Some(cap) => assert_eq!(cap, 4096),
+                None => assert!(!l.is_full()),
+            }
+        }
+        assert!(layers.iter().any(|l| l.is_full()));
+    }
+
+    /// `n_ctx` is clamped to `[1, MAX_SEQ_LEN]`, and the GQA cache's
+    /// byte size scales with it (no `MAX_SEQ_LEN` reservation).
+    #[test]
+    fn kv_capacity_clamped_and_bytes_scale() {
+        assert_eq!(KvCache::new(0).capacity, 1);
+        assert_eq!(KvCache::new(MAX_SEQ_LEN + 7).capacity, MAX_SEQ_LEN);
+        assert_eq!(MlaKvCacheGpu::new(0).capacity, 1);
+        let small = KvCache::new(1024);
+        let row = VARIANT.num_kv_heads * VARIANT.head_dim * std::mem::size_of::<f32>();
+        assert_eq!(small.bytes_per_side(), 1024 * row);
+        assert_eq!(KvCache::new(2048).bytes_per_side(), 2 * small.bytes_per_side());
+    }
+
     /// Empty state on a fresh allocation: pos_max returns 0 (the
     /// largest occupied position across full-attn layers, all of which
     /// start at len=0). The `-1` sentinel only fires when no full-attn
     /// layer exists at all — not the case for any supported variant.
     #[test]
     fn empty_state_pos_max_is_zero() {
-        let mut layers = alloc_layer_states();
+        let mut layers = alloc_layer_states(MAX_SEQ_LEN);
         assert_eq!(pos_max(&layers), 0);
         clear_all(&mut layers);
         assert_eq!(pos_max(&layers), 0);
@@ -574,7 +663,7 @@ mod tests {
     /// regardless of arguments.
     #[test]
     fn truncate_empty_is_noop() {
-        let mut layers = alloc_layer_states();
+        let mut layers = alloc_layer_states(MAX_SEQ_LEN);
         truncate(&mut layers, 0, -1);
         assert_eq!(pos_max(&layers), 0);
         truncate(&mut layers, 5, 10);
@@ -590,7 +679,7 @@ mod tests {
     /// either side of the dispatch.
     #[test]
     fn truncate_drops_full_attn_len() {
-        let mut layers = alloc_layer_states();
+        let mut layers = alloc_layer_states(MAX_SEQ_LEN);
         let injected = layers.iter_mut().find_map(|l| match l {
             LayerState::FullAttn(kv) => {
                 kv.len = 7;
