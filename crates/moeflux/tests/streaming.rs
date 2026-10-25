@@ -117,3 +117,26 @@ fn bounded_io_matches_and_respects_rate() {
         st.disk_bytes
     );
 }
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn prefill_reads_each_expert_once_per_layer() {
+    let v = moeflux::riir::VARIANT;
+    // No hot tier: every staged expert comes from disk.
+    let mut ctx = open(&OpenConfig { hot_tier_bytes: Some(0), ..base_cfg() });
+    let prompt: Vec<i32> = (0..64).map(|i| 1000 + 7 * i).collect();
+    let mut logits = vec![0f32; ctx.n_vocab()];
+    ctx.eval_prompt(&prompt, 0, 0, &mut logits).expect("prefill");
+    let st = ctx.expert_io_stats();
+    print_stats("prefill", &st);
+    // One chunk: each distinct routed expert of a layer is read once.
+    let counts = ctx.routing_counts();
+    for (l, row) in st.per_layer.iter().enumerate() {
+        let distinct = counts[l * v.num_experts..(l + 1) * v.num_experts]
+            .iter()
+            .filter(|&&c| c > 0)
+            .count() as u64;
+        assert_eq!(row.prefill_reads, distinct, "layer {l}: {row:?}");
+    }
+    assert_eq!(st.prefill.bytes, st.prefill.reads * v.expert_size_4bit() as u64);
+}

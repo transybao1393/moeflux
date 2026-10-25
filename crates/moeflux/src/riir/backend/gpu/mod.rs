@@ -267,6 +267,26 @@ impl BufferPool for MetalBufferPool {
         Ok(())
     }
 
+    fn with_bytes_mut<B: Buf, R>(
+        &mut self,
+        id: BufId<B>,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, GraphError> {
+        let idx = id.raw() as usize;
+        if idx >= self.labels.len() {
+            return Err(GraphError::BadBufId(id.raw()));
+        }
+        let len = self.byte_sizes[idx];
+        let physical = self.bufid_to_physical[idx] as usize;
+        let buf = &self.buffers[physical];
+        // SAFETY: shared-storage buffer of at least `len` bytes (the
+        // physical buffer is sized for every BufId it backs); `&mut
+        // self` excludes other host views through the pool, and the
+        // caller guarantees no in-flight GPU access (trait contract).
+        let bytes = unsafe { std::slice::from_raw_parts_mut(buf.contents() as *mut u8, len) };
+        Ok(f(bytes))
+    }
+
     fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;

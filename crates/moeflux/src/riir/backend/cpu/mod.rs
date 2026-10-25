@@ -141,6 +141,21 @@ impl BufferPool for CpuBufferPool {
         Ok(())
     }
 
+    fn with_bytes_mut<B: Buf, R>(
+        &mut self,
+        id: BufId<B>,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, GraphError> {
+        let idx = id.raw() as usize;
+        if idx >= self.labels.len() {
+            return Err(GraphError::BadBufId(id.raw()));
+        }
+        let len = self.byte_sizes[idx];
+        let physical = self.bufid_to_physical[idx] as usize;
+        let mut buf_mut = self.buffers[physical].borrow_mut();
+        Ok(f(&mut buf_mut[..len]))
+    }
+
     fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), GraphError> {
         let idx = id.raw() as usize;
         let label = *self.labels.get(idx).ok_or(GraphError::BadBufId(id.raw()))?;

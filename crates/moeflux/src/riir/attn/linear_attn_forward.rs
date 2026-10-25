@@ -2330,6 +2330,7 @@ pub(in crate::riir) fn batched_linear_attn_layer_forward<B>(
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    io_pool: &rayon::ThreadPool,
     moe_buffers: &mut crate::riir::moe::expert_forward::MoeBuffers,
     _layer_state: &mut LinearAttnState,
     // Session-5 Phase 3: when `Some`, the caller has fired
@@ -2733,6 +2734,7 @@ where
         n_tokens,
         k_active,
         expert_files,
+        io_pool,
         moe_buffers,
         prefetch,
         hidden_out_id,
@@ -2760,6 +2762,7 @@ pub(in crate::riir) fn moe_block_forward<B>(
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    io_pool: &rayon::ThreadPool,
     moe_buffers: &mut crate::riir::moe::expert_forward::MoeBuffers,
     mut prefetch: Option<PrefetchEnv<'_>>,
     hidden_out_id: BufId<HiddenBuf>,
@@ -2893,21 +2896,17 @@ where
                 .0
         }
         Some(base_id) => {
-            let expert_size = v.expert_size_4bit();
-            let mut blob_scratch = vec![0u8; expert_size];
-            let pool = backend.pool_mut();
-            for &expert_id in buckets.expert_ids.iter() {
-                // Hot-tier hit → memcpy from RAM; miss → disk read,
-                // offered to the hot tier for admission.
-                expert_files.read_expert_as(
-                    crate::riir::io::io_stats::ReadKind::Prefill,
-                    layer_idx,
-                    expert_id as usize,
-                    &mut blob_scratch,
-                )?;
-                let off = expert_id as usize * expert_size;
-                pool.upload_at(base_id, off, &blob_scratch)?;
-            }
+            // Plan phase 6: each bucketed expert lands directly at
+            // its `expert_id * expert_size` slot of the staging
+            // buffer — hot-tier hits by a RAM copy, the rest by
+            // sorted, coalesced, parallel reads on the I/O pool. No
+            // host bounce buffer; each expert is read at most once per
+            // layer chunk.
+            let t0 = std::time::Instant::now();
+            backend.pool_mut().with_bytes_mut(base_id, |staging| {
+                expert_files.stage_layer(io_pool, layer_idx, &buckets.expert_ids, staging)
+            })??;
+            expert_files.counters().record_prefill_io(t0.elapsed().as_nanos() as u64);
             base_id
         }
     };

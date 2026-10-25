@@ -629,6 +629,7 @@ pub(in crate::riir) fn batched_full_attn_layer_forward<B>(
     n_tokens: usize,
     k_active: usize,
     expert_files: &ExpertFiles,
+    io_pool: &rayon::ThreadPool,
     moe_buffers: &mut MoeBuffers,
     kv_state: &mut KvCache,
     // Session-5 Phase 3: prefetch env when caller has fired async
@@ -975,6 +976,7 @@ where
         n_tokens,
         k_active,
         expert_files,
+        io_pool,
         moe_buffers,
         prefetch,
         hidden_out_id,

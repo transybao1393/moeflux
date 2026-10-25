@@ -2140,8 +2140,12 @@ impl RsCtx<MetalBackend> {
             head_tail_scratch,
             deferred,
             prefetch,
+            io_pool,
             ..
         } = self;
+        // Plan phase 6: prefill expert staging reads run on the I/O
+        // pool (pread mode only).
+        let io_pool: &rayon::ThreadPool = &*io_pool;
         let backend = backend.as_mut().expect("ensure_linear_resources");
         // S10b-1a-ii: parts_mut destructure is now scoped per-branch
         // (full-attn branch inside the layer loop, post-loop block).
@@ -2278,6 +2282,7 @@ impl RsCtx<MetalBackend> {
                     n,
                     k_active,
                     experts,
+                    io_pool,
                     &mut *moe_buffers,
                     kv_state,
                     prefetch_env,
@@ -2318,6 +2323,7 @@ impl RsCtx<MetalBackend> {
                     n,
                     k_active,
                     experts,
+                    io_pool,
                     &mut *moe_buffers,
                     layer_state,
                     prefetch_env,

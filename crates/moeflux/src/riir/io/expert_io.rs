@@ -534,6 +534,124 @@ impl ExpertFiles {
         Ok(())
     }
 
+    /// Read experts `first..first + n` of `layer_idx` from disk in one
+    /// call into `out` (`n * expert_size` bytes; the file stores a
+    /// layer's experts contiguously, so a run of ids is one range),
+    /// then offer each to the hot tier. Counted as `n` reads of
+    /// `kind`, and as one read against the queue-depth gate.
+    pub fn read_run_disk(
+        &self,
+        kind: ReadKind,
+        layer_idx: usize,
+        first: usize,
+        n: usize,
+        out: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        let es = self.expert_size;
+        if n == 0 || out.len() != n * es {
+            return Err(ExpertIoError::BadOutLen {
+                expected: n * es,
+                actual: out.len(),
+            });
+        }
+        self.read_expert_checks(layer_idx, first + n - 1, &out[..es])?;
+        let Some(file) = self.layers[layer_idx].as_ref() else {
+            return Err(ExpertIoError::LayerFileMissing { layer: layer_idx });
+        };
+        let off = (first as u64) * (es as u64);
+        let permit = self.limits.admit(out.len() as u64);
+        let mut done = 0usize;
+        while done < out.len() {
+            let got = file
+                .read_at(&mut out[done..], off + done as u64)
+                .map_err(|e| ExpertIoError::Io {
+                    layer: layer_idx,
+                    source: e,
+                })?;
+            if got == 0 {
+                return Err(ExpertIoError::ShortRead {
+                    layer: layer_idx,
+                    expert: first + done / es,
+                    expected: out.len(),
+                    actual: done,
+                });
+            }
+            done += got;
+        }
+        drop(permit);
+        self.counters.record_read(kind, layer_idx, n as u64, out.len() as u64, false);
+        if let Some(hot) = &self.hot {
+            for (i, blob) in out.chunks_exact(es).enumerate() {
+                hot.offer(layer_idx, first + i, blob);
+            }
+        }
+        Ok(())
+    }
+
+    /// Prefill staging for one layer (plan phase 6): put every expert
+    /// in `expert_ids` at its `expert_id * expert_size` slot of
+    /// `staging` (the pread-mode `expert_base`). Hot-tier experts are
+    /// copied from RAM; the rest are read once each, sorted by file
+    /// offset and coalesced into runs of up to [`PREFILL_MAX_RUN`]
+    /// consecutive experts, in parallel on `pool`. Bytes outside the
+    /// listed slots are left untouched.
+    pub fn stage_layer(
+        &self,
+        pool: &rayon::ThreadPool,
+        layer_idx: usize,
+        expert_ids: &[i32],
+        staging: &mut [u8],
+    ) -> Result<(), ExpertIoError> {
+        use rayon::prelude::*;
+        let es = self.expert_size;
+        let num_experts = VARIANT.num_experts;
+        if staging.len() < num_experts * es {
+            return Err(ExpertIoError::BadOutLen {
+                expected: num_experts * es,
+                actual: staging.len(),
+            });
+        }
+        for &e in expert_ids {
+            if e < 0 || e as usize >= num_experts {
+                return Err(ExpertIoError::BadExpertIdx {
+                    expert: e,
+                    num_experts,
+                });
+            }
+        }
+        let hot = self.hot.as_ref();
+        let tasks = plan_staging(
+            expert_ids,
+            |e| hot.is_some_and(|h| h.contains(layer_idx, e)),
+            PREFILL_MAX_RUN,
+        );
+        // Disjoint destination slices, in ascending offset order.
+        let mut work: Vec<(StageTask, &mut [u8])> = Vec::with_capacity(tasks.len());
+        let mut rest: &mut [u8] = staging;
+        let mut base = 0usize;
+        for t in tasks {
+            let start = t.first as usize * es;
+            let tail = std::mem::take(&mut rest).split_at_mut(start - base).1;
+            let (dst, tail) = tail.split_at_mut(t.n as usize * es);
+            work.push((t, dst));
+            rest = tail;
+            base = start + t.n as usize * es;
+        }
+        pool.install(|| {
+            work.par_iter_mut().try_for_each(|(t, dst)| {
+                let first = t.first as usize;
+                if t.hot {
+                    if hot.is_some_and(|h| h.copy_out(layer_idx, first, dst)) {
+                        self.counters.record_prefill_hot(layer_idx, 1);
+                        return Ok(());
+                    }
+                    // Evicted since planning: read it instead.
+                }
+                self.read_run_disk(ReadKind::Prefill, layer_idx, first, t.n as usize, dst)
+            })
+        })
+    }
+
     /// Argument validation shared by the read paths; returns the
     /// error for the first failing check (`Ok` only if all pass).
     fn read_expert_checks(
@@ -635,6 +753,79 @@ impl ExpertFiles {
             .get(layer_idx)
             .map(Option::is_some)
             .unwrap_or(false)
+    }
+}
+
+/// Longest run of consecutive experts one prefill read covers
+/// (~14 MB for a3b). Long enough to amortize syscall and SSD command
+/// overhead, short enough to spread a layer over the I/O threads.
+pub const PREFILL_MAX_RUN: usize = 8;
+
+/// One unit of prefill staging: experts `first..first + n` of a
+/// layer, copied from the hot tier (`hot`, then `n == 1`) or read
+/// from disk in one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageTask {
+    /// First expert id.
+    pub first: u32,
+    /// Experts covered.
+    pub n: u32,
+    /// Copy from the hot tier instead of reading.
+    pub hot: bool,
+}
+
+/// Plan prefill staging for `expert_ids` (any order, duplicates
+/// allowed): each distinct expert appears in exactly one task, tasks
+/// ascend by expert id (= file offset), hot experts get their own
+/// copy task, and consecutive non-hot experts merge into disk runs of
+/// at most `max_run`. Pure, so it is unit-testable without files.
+pub fn plan_staging(
+    expert_ids: &[i32],
+    is_hot: impl Fn(usize) -> bool,
+    max_run: usize,
+) -> Vec<StageTask> {
+    let mut ids: Vec<u32> = expert_ids.iter().filter(|&&e| e >= 0).map(|&e| e as u32).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let max_run = max_run.max(1) as u32;
+    let mut tasks: Vec<StageTask> = Vec::new();
+    for e in ids {
+        if is_hot(e as usize) {
+            tasks.push(StageTask { first: e, n: 1, hot: true });
+            continue;
+        }
+        match tasks.last_mut() {
+            Some(t) if !t.hot && t.first + t.n == e && t.n < max_run => t.n += 1,
+            _ => tasks.push(StageTask { first: e, n: 1, hot: false }),
+        }
+    }
+    tasks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_staging_sorts_dedupes_and_coalesces() {
+        let ids = [7, 3, 4, 5, 3, 9, 6, 20, 21];
+        let tasks = plan_staging(&ids, |_| false, 8);
+        let t = |first, n| StageTask { first, n, hot: false };
+        assert_eq!(tasks, vec![t(3, 5), t(9, 1), t(20, 2)]);
+    }
+
+    #[test]
+    fn plan_staging_splits_runs_at_hot_experts_and_max_run() {
+        let ids: Vec<i32> = (0..12).collect();
+        let tasks = plan_staging(&ids, |e| e == 4, 3);
+        let d = |first, n| StageTask { first, n, hot: false };
+        let h = |first| StageTask { first, n: 1, hot: true };
+        assert_eq!(tasks, vec![d(0, 3), d(3, 1), h(4), d(5, 3), d(8, 3), d(11, 1)]);
+        // Every expert exactly once.
+        let covered: u32 = tasks.iter().map(|t| t.n).sum();
+        assert_eq!(covered, 12);
+        assert!(plan_staging(&[], |_| false, 8).is_empty());
+        assert!(plan_staging(&[-1], |_| false, 8).is_empty());
     }
 }
 

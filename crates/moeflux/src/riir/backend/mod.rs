@@ -149,6 +149,17 @@ pub trait BufferPool {
     /// semantics mirror [`Self::upload`].
     fn download<B: Buf>(&self, id: BufId<B>, host: &mut [u8]) -> Result<(), Self::Error>;
 
+    /// Run `f` over the whole buffer at `id` in place, so a producer
+    /// can fill it without a host staging copy (plan phase 6: prefill
+    /// expert reads land directly in the staging buffer). The caller
+    /// must ensure no GPU work touching the buffer is in flight, the
+    /// same rule as [`Self::upload_at`].
+    fn with_bytes_mut<B: Buf, R>(
+        &mut self,
+        id: BufId<B>,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, Self::Error>;
+
     /// Release all non-persistent allocations. Persistent buffers
     /// keep their `BufId`s; transient ones are eligible to be
     /// recycled or dropped on the next [`Self::alloc`].
