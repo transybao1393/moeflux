@@ -104,8 +104,8 @@ Details — memory accounts, the per-token data path, phases — are in
 | Engine, Metal kernels, Qwen3.5-A17B / Qwen3.6-35B-A3B / Cogito-V2 variants | Exists |
 | Expert streaming: mmap mode, pread + speculative prefetch, slot ring | Exists |
 | Differential oracles (CPU vs Metal, batched vs per-token, MLX) | Exists |
-| `OpenConfig`, `n_ctx`-sized KV, ledger, watchdog | Planned — Phase 1 |
-| `F_NOCACHE` reads, fixed hot tier | Planned — Phase 2 |
+| `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; model-level tests pending |
+| `F_NOCACHE` reads, fixed hot tier, routing profiles, expert-IO counters | Implemented — Phase 2; model-level tests pending |
 | Layer-range execution | Planned — Phase 3 |
 | Per-request state | Planned — Phase 4 |
 | `moeflux-net`, coordinator, planner | Planned — Phase 5 |

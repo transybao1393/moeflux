@@ -151,6 +151,20 @@ exercised everywhere.
 
 Each phase ends with a measurement; the next phase is decided on numbers.
 
+### Progress (Oct 25, 2026)
+
+| Phase | State | Notes |
+| --- | --- | --- |
+| 0 | Partly done | `scripts/check_test_host.sh`; `RsCtx::expert_io_stats()` (disk reads/bytes, hot-tier hits/misses/admissions/evictions); `routing_counts()` / `save_routing_profile()`. Baselines need the M4 / M1 and the model. |
+| 1 | Implemented | `OpenConfig` + `RsCtx::open_with` (`n_ctx`, `expert_io`, `io_threads`, `mem_cap`, `runtime_overhead`); KV sized from `n_ctx`; `budget.rs` plan, reserve-and-touch at open, `phys_footprint` check at open and after every `eval_*`; mmap refused under a cap. `layer_range` moves to Phase 3. |
+| 2 | Implemented | Under a cap: weights read with `F_NOCACHE` into owned page-aligned memory, expert fds `F_NOCACHE` and not mmapped. `io/hot_tier.rs`: fixed-size, frequency-admitted, epoch-protected; decode binds hits zero-copy, prefetch skips hot experts, prefill copies hits. Seeding from a routing profile. |
+| 3–8 | Not started | Waiting on model-level verification of 1–2. |
+
+Not yet verified on a model (this dev box has no weights and 18 GB):
+`tests/budget_cap.rs` model group and `tests/expert_source_equivalence.rs`
+are `#[ignore]` until run on a capable host. The cogito (MLA) decode
+path does not use the hot tier yet.
+
 | # | Phase | Work | Exit criteria |
 | --- | --- | --- | --- |
 | 0 | Baseline + telemetry | Run a3b on M4 (mmap and pread, with/without `purge`) and one M1. Add streaming counters: bytes read per token/tier, hits per layer, I/O wait vs GPU time, guess accuracy; CSV output from `profile_smoke.sh`. Routing profile pass. Measure runtime overhead, SSD bandwidth (internal and external), 4 KB / 8 KB frame round-trip M4↔M1 | Baseline CSV; overhead number; expert popularity curve |
