@@ -70,6 +70,14 @@ pub struct OpenConfig {
     /// [`crate::riir::RsCtx::save_routing_profile`]). Most-picked
     /// experts are loaded first.
     pub hot_tier_profile: Option<std::path::PathBuf>,
+    /// Optional fast tier for expert files (plan phase 6, "disk
+    /// tier"): any `packed_experts/layer_NN.bin` found under this
+    /// directory — e.g. a copy of the hottest layers on the internal
+    /// SSD — is read from there instead of `experts_dir`. Same format,
+    /// per-layer granularity; costs disk, not RAM. A copy whose size
+    /// differs from the primary file fails `open`. `None` (default):
+    /// everything from `experts_dir`.
+    pub fast_experts_dir: Option<std::path::PathBuf>,
     /// Contiguous layer range this context runs (plan phase 3, mode B).
     /// `None` (default) = the whole model. `Some(a..b)` loads, plans and
     /// runs only layers `a..b`; the embedding exists only when `a == 0`
@@ -115,6 +123,7 @@ impl Default for OpenConfig {
             runtime_overhead: DEFAULT_RUNTIME_OVERHEAD,
             hot_tier_bytes: None,
             hot_tier_profile: None,
+            fast_experts_dir: None,
             layer_range: None,
             max_requests: 1,
             prefetch_guess: PrefetchGuess::PrevToken,

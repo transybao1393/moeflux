@@ -121,6 +121,11 @@ pub enum ExpertIoError {
     },
     #[error("out buffer must be EXPERT_SIZE={expected} bytes, got {actual}")]
     BadOutLen { expected: usize, actual: usize },
+    #[error(
+        "fast-dir copy of layer {layer} is {fast} bytes but the primary file is \
+         {primary} bytes (stale or partial copy?)"
+    )]
+    FastCopyMismatch { layer: usize, fast: u64, primary: u64 },
     #[error("I/O error reading layer {layer}: {source}")]
     Io {
         layer: usize,
@@ -201,6 +206,9 @@ pub struct ExpertFiles {
     /// Queue-depth and bytes/s limits every disk read passes through
     /// ([`Self::set_io_limits`]).
     limits: IoLimits,
+    /// Per layer: `true` if the file was opened from the fast dir
+    /// ([`Self::open_range_tiered`]).
+    fast: Vec<bool>,
 }
 
 pub use super::io_stats::ExpertIoStats;
@@ -244,16 +252,50 @@ impl ExpertFiles {
         nocache: bool,
         range: std::ops::Range<usize>,
     ) -> Result<Self, ExpertIoError> {
+        Self::open_range_tiered(experts_dir, None, mmap, nocache, range)
+    }
+
+    /// [`Self::open_range`] with an optional fast tier (plan phase 6,
+    /// "disk tier"): a layer file present under
+    /// `fast_dir/packed_experts/` (e.g. a copy on the internal SSD) is
+    /// opened from there instead of `experts_dir`. Same file format,
+    /// per-layer granularity. A fast copy whose size differs from the
+    /// primary file is rejected ([`ExpertIoError::FastCopyMismatch`]).
+    pub fn open_range_tiered(
+        experts_dir: &Path,
+        fast_dir: Option<&Path>,
+        mmap: bool,
+        nocache: bool,
+        range: std::ops::Range<usize>,
+    ) -> Result<Self, ExpertIoError> {
         let v: Variant = VARIANT;
         let subdir = experts_dir.join("packed_experts");
+        let fast_subdir = fast_dir.map(|d| d.join("packed_experts"));
         let mut layers = Vec::with_capacity(v.num_layers);
+        let mut fast = vec![false; v.num_layers];
         let mut mmap_layers: Vec<Option<Mmap>> = (0..v.num_layers).map(|_| None).collect();
         for i in 0..v.num_layers {
             if !range.contains(&i) {
                 layers.push(None);
                 continue;
             }
-            let path = subdir.join(format!("layer_{i:02}.bin"));
+            let name = format!("layer_{i:02}.bin");
+            let mut path = subdir.join(&name);
+            if let Some(fast_path) = fast_subdir.as_ref().map(|d| d.join(&name)) {
+                if let Ok(fm) = std::fs::metadata(&fast_path) {
+                    if let Ok(pm) = std::fs::metadata(&path) {
+                        if pm.len() != fm.len() {
+                            return Err(ExpertIoError::FastCopyMismatch {
+                                layer: i,
+                                fast: fm.len(),
+                                primary: pm.len(),
+                            });
+                        }
+                    }
+                    path = fast_path;
+                    fast[i] = true;
+                }
+            }
             match File::open(&path) {
                 Ok(f) => {
                     disable_readahead(&f);
@@ -289,9 +331,10 @@ impl ExpertFiles {
         let mmap_buffers = (0..v.num_layers).map(|_| None).collect();
         let mmap_buf_ids = (0..v.num_layers).map(|_| None).collect();
         eprintln!(
-            "[experts] {} layer(s) opened, {} mmap'd{} \
+            "[experts] {} layer(s) opened ({} from the fast dir), {} mmap'd{} \
              (Metal buffers built on first batched call)",
             layers.iter().filter(|f| f.is_some()).count(),
+            fast.iter().filter(|&&f| f).count(),
             mmap_layers.iter().filter(|m| m.is_some()).count(),
             if nocache { ", F_NOCACHE" } else { "" }
         );
@@ -307,6 +350,7 @@ impl ExpertFiles {
             picks: (0..v.num_layers * v.num_experts).map(|_| AtomicU32::new(0)).collect(),
             counters: IoCounters::new(v.num_layers),
             limits: IoLimits::default(),
+            fast,
         })
     }
 
@@ -527,7 +571,7 @@ impl ExpertFiles {
                 actual: n,
             });
         }
-        self.counters.record_read(kind, layer_idx, 1, n as u64, false);
+        self.counters.record_read(kind, layer_idx, 1, n as u64, self.fast[layer_idx]);
         if let Some(hot) = &self.hot {
             hot.offer(layer_idx, expert_idx, out);
         }
@@ -579,7 +623,8 @@ impl ExpertFiles {
             done += got;
         }
         drop(permit);
-        self.counters.record_read(kind, layer_idx, n as u64, out.len() as u64, false);
+        self.counters
+            .record_read(kind, layer_idx, n as u64, out.len() as u64, self.fast[layer_idx]);
         if let Some(hot) = &self.hot {
             for (i, blob) in out.chunks_exact(es).enumerate() {
                 hot.offer(layer_idx, first + i, blob);
@@ -747,6 +792,11 @@ impl ExpertFiles {
         self.layers.len()
     }
 
+    /// `true` iff `layer_idx`'s file was opened from the fast dir.
+    pub fn is_fast_layer(&self, layer_idx: usize) -> bool {
+        self.fast.get(layer_idx).copied().unwrap_or(false)
+    }
+
     /// `true` iff the file for `layer_idx` opened successfully.
     pub fn has_layer(&self, layer_idx: usize) -> bool {
         self.layers
@@ -805,6 +855,61 @@ pub fn plan_staging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dirs(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("moeflux-tier-{tag}-{}", std::process::id()));
+        let (p, f) = (root.join("primary"), root.join("fast"));
+        for d in [&p, &f] {
+            std::fs::create_dir_all(d.join("packed_experts")).unwrap();
+        }
+        (p, f)
+    }
+
+    fn sparse_layer(dir: &Path, layer: usize, len: u64) {
+        let path = dir.join("packed_experts").join(format!("layer_{layer:02}.bin"));
+        // Sparse: set_len reserves no disk blocks.
+        File::create(path).unwrap().set_len(len).unwrap();
+    }
+
+    #[test]
+    fn fast_dir_overrides_per_layer() {
+        let v = VARIANT;
+        let full = (v.num_experts * v.expert_size_4bit()) as u64;
+        let (primary, fast) = scratch_dirs("ok");
+        sparse_layer(&primary, 0, full);
+        sparse_layer(&primary, 1, full);
+        sparse_layer(&fast, 1, full);
+        // A fast copy alone (no primary) is used too.
+        sparse_layer(&fast, 2, full);
+        let ef = ExpertFiles::open_range_tiered(&primary, Some(&fast), false, false, 0..3).unwrap();
+        assert!(ef.has_layer(0) && ef.has_layer(1) && ef.has_layer(2));
+        assert_eq!(
+            (ef.is_fast_layer(0), ef.is_fast_layer(1), ef.is_fast_layer(2)),
+            (false, true, true)
+        );
+        let mut buf = vec![1u8; v.expert_size_4bit()];
+        ef.read_expert_disk(1, 3, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0));
+        ef.read_expert_disk(0, 3, &mut buf).unwrap();
+        let st = ef.io_stats();
+        assert_eq!(st.demand.reads, 2);
+        assert_eq!(st.fast_dir_bytes, v.expert_size_4bit() as u64);
+        let _ = std::fs::remove_dir_all(primary.parent().unwrap());
+    }
+
+    #[test]
+    fn fast_dir_size_mismatch_rejected() {
+        let v = VARIANT;
+        let full = (v.num_experts * v.expert_size_4bit()) as u64;
+        let (primary, fast) = scratch_dirs("bad");
+        sparse_layer(&primary, 0, full);
+        sparse_layer(&fast, 0, full / 2);
+        let err = ExpertFiles::open_range_tiered(&primary, Some(&fast), false, false, 0..1)
+            .err()
+            .expect("must fail");
+        assert!(matches!(err, ExpertIoError::FastCopyMismatch { layer: 0, .. }), "{err}");
+        let _ = std::fs::remove_dir_all(primary.parent().unwrap());
+    }
 
     #[test]
     fn plan_staging_sorts_dedupes_and_coalesces() {

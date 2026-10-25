@@ -107,8 +107,9 @@ pub struct ExpertIoStats {
     pub prefill: ReadStats,
     /// Hot-tier seed reads at open.
     pub seed: ReadStats,
-    /// Of the bytes above, those read from the fast (overlay) experts
-    /// directory ([`crate::riir::OpenConfig::fast_experts_dir`]).
+    /// Of the bytes above, those read from layer files opened from the
+    /// fast experts directory
+    /// ([`crate::riir::OpenConfig::fast_experts_dir`]).
     pub fast_dir_bytes: u64,
     /// Decode picks served from a prefetch slot. `prefetch.reads -
     /// prefetch_hits` is speculative I/O that was not used.

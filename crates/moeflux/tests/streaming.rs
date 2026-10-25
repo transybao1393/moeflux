@@ -191,3 +191,34 @@ fn lookahead_with_bounded_io_and_no_hot_tier_matches() {
     }));
     assert_same("lookahead + depth 1", &base, &got);
 }
+
+#[test]
+#[ignore = "needs a3b weights; run scripts/check_test_host.sh first"]
+fn fast_experts_dir_matches_and_is_used() {
+    let base = run(&mut open(&base_cfg()));
+    // A "fast tier" holding layers 0 and 1 (symlinks: same bytes, no
+    // copy; a real deployment copies them to the internal SSD).
+    let p = default_a3b_paths();
+    let fast = std::env::temp_dir().join(format!("moeflux-fast-{}", std::process::id()));
+    let sub = fast.join("packed_experts");
+    std::fs::create_dir_all(&sub).unwrap();
+    for l in 0..2 {
+        let name = format!("layer_{l:02}.bin");
+        let _ = std::fs::remove_file(sub.join(&name));
+        std::os::unix::fs::symlink(p.root.join("packed_experts").join(&name), sub.join(&name))
+            .unwrap();
+    }
+    let mut ctx = open(&OpenConfig { fast_experts_dir: Some(fast.clone()), ..base_cfg() });
+    ctx.reset_expert_io_stats();
+    let got = run(&mut ctx);
+    let st = ctx.expert_io_stats();
+    print_stats("fast_dir", &st);
+    assert_same("fast experts dir", &base, &got);
+    assert!(st.fast_dir_bytes > 0, "{st:?}");
+    assert_eq!(
+        st.fast_dir_bytes,
+        st.per_layer[0].disk_bytes + st.per_layer[1].disk_bytes,
+        "{st:?}"
+    );
+    let _ = std::fs::remove_dir_all(&fast);
+}

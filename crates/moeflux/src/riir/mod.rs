@@ -607,8 +607,19 @@ impl RsCtx<MetalBackend> {
         let wf = WeightFile::open_filtered(weights, manifest, load, keep)
             .map_err(|_| RsError::InitFailed)?;
         probe_variant_match(&wf)?;
-        let mut experts = ExpertFiles::open_range(experts_dir, !capped, capped, layer_range.clone())
-            .map_err(|_| RsError::InitFailed)?;
+        let mut experts = ExpertFiles::open_range_tiered(
+            experts_dir,
+            config.fast_experts_dir.as_deref(),
+            !capped,
+            capped,
+            layer_range.clone(),
+        )
+        .map_err(|e| match e {
+            ExpertIoError::FastCopyMismatch { .. } => RsError::InvalidConfig {
+                detail: e.to_string(),
+            },
+            _ => RsError::InitFailed,
+        })?;
         experts.set_io_limits(io::io_limit::IoLimits::new(
             config.io_queue_depth,
             config.io_bytes_per_sec,
