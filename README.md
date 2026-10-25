@@ -47,9 +47,9 @@ sit in a fixed-size hot tier in RAM, and the rest stream in on demand.
 flowchart LR
     subgraph A["Mode A · one Mac mini M4 · 10 GB cap"]
         direction LR
-        APP["<b>Application</b>"] --> ENGINE["<b>Engine</b><br/>all layers"]
-        ENGINE --> HOT["<b>Hot tier</b><br/>most-used experts<br/>in RAM"]
-        HOT -- "miss" --> SSD["<b>SSD</b><br/>all experts"]
+        SSD["<b>SSD</b><br/>all experts<br/>read-only"] -- "load on miss" --> HOT["<b>Hot tier</b><br/>most-used experts<br/>in RAM"]
+        HOT -- "experts" --> ENGINE["<b>Engine</b><br/>all layers"]
+        ENGINE -- "tokens" --> APP["<b>Application</b>"]
     end
 ```
 
@@ -63,7 +63,8 @@ node to node; the next token returns to the first node.
 flowchart LR
     subgraph B["Mode B · three Mac minis · 10 GB cap each"]
         direction LR
-        N1["<b>Node 1 · M4</b><br/>embed + first layers"] --> N2["<b>Node 2 · M1</b><br/>middle layers"] --> N3["<b>Node 3 · M1</b><br/>last layers + head"]
+        N1["<b>Node 1 · M4</b><br/>embed + first layers"] -- "hidden state" --> N2["<b>Node 2 · M1</b><br/>middle layers"]
+        N2 -- "hidden state" --> N3["<b>Node 3 · M1</b><br/>last layers + head"]
         N3 -- "next token" --> N1
     end
 ```

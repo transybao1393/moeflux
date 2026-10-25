@@ -93,12 +93,12 @@ tripwire.
 
 ```
 GPU  CMD1: attention + router logits ─────────┐
-I/O  prefetch guessed experts NOT in hot tier  │  (F_NOCACHE pread → prefetch slots)
+I/O  prefetch guessed experts NOT in hot tier  │  (SSD → prefetch slots, F_NOCACHE pread)
 CPU  read logits → top-8 (moe_router_cpu) ◄────┘
      for each of the 8 picks:
        hot tier hit   → bind hot buffer        (zero copy, zero I/O)
        prefetch hit   → bind prefetch slot
-       miss           → parallel F_NOCACHE pread → synced slot
+       miss           → read SSD → synced slot (parallel F_NOCACHE pread)
 GPU  batched expert matvec (existing chunked dispatch)
 CPU  off critical path: update frequency counts; maybe promote
      slot → hot tier, evicting the coldest (fixed size)
