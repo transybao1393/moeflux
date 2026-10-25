@@ -36,33 +36,39 @@ user-set memory cap, on one Mac or across a small cluster of Macs.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    APP["<b>Application</b><br/>drama_llama · coordinator"]
-    ENGINE["<b>Engine</b><br/>attention · router · experts<br/>on Metal"]
-    CAP["<b>Memory cap</b><br/>everything reserved at open"]
-    STREAM["<b>Expert streaming</b><br/>hot tier · prefetch"]
-    SSD["<b>SSD</b><br/>all experts"]
+The same engine runs in both modes, always inside a hard memory cap.
 
-    APP --> ENGINE
-    ENGINE --> STREAM
-    STREAM -- "miss" --> SSD
-    CAP -.- ENGINE
-    CAP -.- STREAM
-```
+### Mode A — single node, streaming
 
-The same engine runs in both modes. In mode A it streams experts
-from the SSD inside the cap. In mode B each node runs a slice of the
-layers, its experts fit in the hot tier, and hidden states flow
-between nodes:
+One Mac runs every layer. Experts live on the SSD; the most-used ones
+sit in a fixed-size hot tier in RAM, and the rest stream in on demand.
 
 ```mermaid
 flowchart LR
-    N1["<b>Node 1</b><br/>embed + first layers"] --> N2["<b>Node 2</b><br/>middle layers"] --> N3["<b>Node 3</b><br/>last layers + head"]
-    N3 -- "next token" --> N1
+    subgraph A["Mode A · one Mac mini M4 · 10 GB cap"]
+        direction LR
+        APP["<b>Application</b>"] --> ENGINE["<b>Engine</b><br/>all layers"]
+        ENGINE --> HOT["<b>Hot tier</b><br/>most-used experts<br/>in RAM"]
+        HOT -- "miss" --> SSD["<b>SSD</b><br/>all experts"]
+    end
 ```
 
-Details — accounts, the per-token data path, phases — are in
+### Mode B — three-node pipeline
+
+Each Mac runs a slice of the layers and holds all of that slice's
+experts in RAM, so nothing streams from disk. Hidden states flow from
+node to node; the next token returns to the first node.
+
+```mermaid
+flowchart LR
+    subgraph B["Mode B · three Mac minis · 10 GB cap each"]
+        direction LR
+        N1["<b>Node 1 · M4</b><br/>embed + first layers"] --> N2["<b>Node 2 · M1</b><br/>middle layers"] --> N3["<b>Node 3 · M1</b><br/>last layers + head"]
+        N3 -- "next token" --> N1
+    end
+```
+
+Details — memory accounts, the per-token data path, phases — are in
 [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md).
 
 ### Repository layout
