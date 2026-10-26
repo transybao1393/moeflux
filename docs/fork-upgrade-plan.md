@@ -397,20 +397,20 @@ a larger machine, not the 18 GB dev box.
 
 ## 10. Known cap gaps (review of phases 3–5)
 
-- **Checkpoints are outside the plan.** `RsCtx::checkpoint_pos` allocates
-  a `state_size()` buffer per checkpoint at runtime (up to
-  `max_checkpoints`), and `restore_to` clones one more. Under `mem_cap`
-  this is runtime growth the plan never counted; only the after-eval
-  footprint check catches it. Fix: an `Account::Checkpoints` of
-  `max_checkpoints × state_size(n_ctx)` (+1 for the restore copy),
-  buffers allocated and touched at open, reused as a ring. drama_llama's
-  checkpoint path is the caller, so keep its API.
-- **Whole-model weights under a cap** are counted at the file's raw
-  length, while the owned copy is rounded up to a 16 KiB page (< 16 KiB
-  short; the range path's `filtered_bytes` already rounds).
-- **Parked slots' host `LinearAttnState`** is planned but not touched at
-  open, so the open-time footprint check doesn't see it (the cap still
-  holds; it is reserved, not committed).
+- **Checkpoints outside the plan — fixed.** `Account::Checkpoints` =
+  `OpenConfig::max_checkpoints` × `state_size_full` (every full-attn
+  layer at `n_ctx`); under a cap the buffers are allocated and touched
+  at open and reused by `checkpoint_pos` (overwrite → spare → LRU
+  victim, pos 0 protected), `restore_to` loads in place (no clone),
+  `forget_pos` / `memory_clear` return buffers to the spares.
+  drama_llama's API is unchanged; `set_max_checkpoints` is clamped to
+  the opened count under a cap, and a save with only protected
+  positions left returns `CheckpointsFull`. Uncapped behavior is
+  unchanged. `moeflux-node` opens with `max_checkpoints: 0`.
+- **Whole-model weights rounding — fixed:** counted at whole 16 KiB
+  pages, like the owned copy.
+- **Parked slots' host `LinearAttnState` — fixed:** touched at a
+  capped open.
 - **Prefill scratch outside the plan — fixed.** Every batched-prefill
   buffer (`fags.*`, `mgs.*`, `lags.*`, `hdb.*`, `hts.token_ids`) was
   sized for `BATCHED_CHUNK_SIZE = 8192` tokens whatever `n_ctx` or the

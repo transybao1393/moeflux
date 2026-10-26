@@ -182,6 +182,14 @@ pub struct OpenConfig {
     /// at long context it is a large share of decode time. Thread
     /// stacks are inside `runtime_overhead`.
     pub attn_threads: usize,
+    /// Snapshots `checkpoint_pos` keeps (LRU, pos 0 protected).
+    /// Under `mem_cap` this many buffers of the largest state at
+    /// `n_ctx` are planned (`checkpoints` account), allocated and
+    /// touched at open, and reused — checkpoints never allocate after
+    /// open. `set_max_checkpoints` can lower it later but not raise it
+    /// past this under a cap. Default
+    /// [`crate::riir::DEFAULT_MAX_CHECKPOINTS`].
+    pub max_checkpoints: usize,
 }
 
 impl Default for OpenConfig {
@@ -206,6 +214,7 @@ impl Default for OpenConfig {
             prefill_chunk: None,
             kv_format: KvFormat::F32,
             attn_threads: DEFAULT_ATTN_THREADS,
+            max_checkpoints: crate::riir::DEFAULT_MAX_CHECKPOINTS,
         }
     }
 }

@@ -179,7 +179,9 @@ pub fn filtered_bytes(
     keep: Option<TensorFilter<'_>>,
 ) -> Result<u64, WeightFileError> {
     let Some(keep) = keep else {
-        return Ok(std::fs::metadata(bin_path)?.len());
+        // The owned copy is rounded up to whole pages (`read_nocache`).
+        let len = std::fs::metadata(bin_path)?.len() as usize;
+        return Ok(len.div_ceil(PAGE).max(1) as u64 * PAGE as u64);
     };
     let mut tensors = parse_manifest(manifest_path)?;
     tensors.retain(|n, _| keep(n));
@@ -514,6 +516,9 @@ mod tests {
             ),
         )
         .unwrap();
+        // The budget counts the owned copy at whole pages, like the
+        // allocation (`len` is 123 B past a page boundary).
+        assert_eq!(filtered_bytes(&bin, &manifest, None).unwrap(), (PAGE * 4) as u64);
         let m = WeightFile::open_with(&bin, &manifest, WeightLoad::Mmap).unwrap();
         let o = WeightFile::open_with(&bin, &manifest, WeightLoad::ReadNoCache).unwrap();
         assert_eq!(m.file_size(), len);

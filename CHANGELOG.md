@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `OpenConfig::max_checkpoints` (default 4): checkpoint buffers planned
+  under a cap (`Account::Checkpoints`).
+
+### Fixed
+
+- Checkpoints allocated after open under a cap; now preallocated,
+  touched at open and reused, with `restore_to` loading in place.
+- Whole-model weights counted at raw length instead of whole pages.
+- Parked request slots' host linear-attn state not touched at open.
+- Intermittent `footprint_is_readable_and_nonzero` failure.
+
+### Changed
+
+- Under a cap, checkpoint buffers take cap memory at open (set
+  `max_checkpoints: 0` if unused); `set_max_checkpoints` cannot raise
+  the count past the opened value; `checkpoint_pos` can return
+  `StateSnapshotError::CheckpointsFull`. `moeflux-node` plans none.
+
 ## 0.2.0-alpha.1 — 2026-10-26
 
 First alpha of the fork revamp (`docs/fork-upgrade-plan.md`), on top

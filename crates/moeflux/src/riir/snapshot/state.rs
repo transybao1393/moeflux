@@ -574,6 +574,16 @@ impl LinearAttnState {
         }
     }
 
+    /// Commit every page of the host state by writing zeros (it is
+    /// lazily committed after `new`). Under a memory cap, so the
+    /// open-time footprint check sees it.
+    pub fn touch(&mut self) {
+        for b in [&mut self.conv_state, &mut self.ssm_state] {
+            // SAFETY: writes `len` f32 zeros into the slice's own storage.
+            unsafe { std::ptr::write_bytes(b.as_mut_ptr(), 0, b.len()) };
+        }
+    }
+
     /// Reset to the empty-sequence state. Lossy by construction — see
     /// the module docs. Mirrors `linear_attn_state_reset` at
     /// infer.m:2260.

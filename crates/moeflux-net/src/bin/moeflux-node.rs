@@ -36,7 +36,13 @@ fn run() -> Result<(), String> {
     let mut layers = None;
     let mut paths: [Option<PathBuf>; 4] = Default::default();
     let mut listen = "127.0.0.1:0".to_string();
-    let mut cfg = moeflux::OpenConfig { n_ctx: 4096, ..moeflux::OpenConfig::default() };
+    // A pipeline stage never takes checkpoints: plan no buffers for
+    // them, so the cap goes to the hot tier.
+    let mut cfg = moeflux::OpenConfig {
+        n_ctx: 4096,
+        max_checkpoints: 0,
+        ..moeflux::OpenConfig::default()
+    };
     let mut max_tokens = 128usize;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {

@@ -356,6 +356,16 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// [`Self::memory_clear`] and on every `restore_to(pos)` for keys
     /// `> pos` (their futures are invalidated).
     checkpoints: HashMap<i32, Vec<u8>>,
+    /// Under a memory cap: free checkpoint buffers, each with capacity
+    /// `checkpoint_slot_bytes`, allocated and touched at open. Empty
+    /// (and unused) uncapped, where buffers are allocated per call.
+    checkpoint_spare: Vec<Vec<u8>>,
+    /// Bytes of the largest snapshot at `n_ctx`
+    /// ([`snapshot::state_snapshot::state_size_full`]).
+    checkpoint_slot_bytes: usize,
+    /// Under a memory cap: how many checkpoint buffers the plan holds
+    /// ([`OpenConfig::max_checkpoints`]); `None` uncapped.
+    checkpoint_planned: Option<usize>,
     /// LRU order for `checkpoints`. Front = oldest, back = newest.
     /// When `checkpoints.len() > max_checkpoints`, evict from the
     /// front while skipping pos-0 (kept for repeat full-prefill
@@ -588,6 +598,10 @@ impl RsCtx<MetalBackend> {
                 detail: "a hot tier needs Pread expert IO; mmap mode was selected".into(),
             });
         }
+        // Host structs only (lazily committed); allocated here so the
+        // plan can size the checkpoint buffers from them.
+        let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format);
+        let checkpoint_slot_bytes = snapshot::state_snapshot::state_size_full(&layer_states);
         let mut planned_exact = None;
         if let Some(cap) = config.mem_cap {
             let weights_bytes = io::weight_file::filtered_bytes(weights, manifest, keep)
@@ -604,6 +618,10 @@ impl RsCtx<MetalBackend> {
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
             }
+            plan.set(
+                budget::Account::Checkpoints,
+                (config.max_checkpoints * checkpoint_slot_bytes) as u64,
+            );
             if config.kv_format != KvFormat::F32 {
                 let reqs = config.max_requests.max(1) as u64;
                 let kv = budget::kv_bytes_per_token_fmt(VARIANT, &layer_range, config.kv_format);
@@ -660,7 +678,6 @@ impl RsCtx<MetalBackend> {
             config.io_queue_depth,
             config.io_bytes_per_sec,
         ));
-        let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format);
         // The request pool: slot 0 (the default request) is live; the
         // others' host state is allocated now, their GPU buffers with
         // the rest of the GPU resources (at open under a cap).
@@ -731,8 +748,11 @@ impl RsCtx<MetalBackend> {
             attn_pool,
             prefetch,
             checkpoints: HashMap::new(),
+            checkpoint_spare: Vec::new(),
+            checkpoint_slot_bytes,
+            checkpoint_planned: config.mem_cap.map(|_| config.max_checkpoints),
             checkpoint_order: VecDeque::new(),
-            max_checkpoints: DEFAULT_MAX_CHECKPOINTS,
+            max_checkpoints: config.max_checkpoints,
             mla_buffers: None,
             mla_yarn: None,
             mla_pipes: None,
@@ -906,6 +926,25 @@ impl RsCtx<MetalBackend> {
                     }
                 }
             }
+        }
+        // Host linear-attn state, every slot (parked ones included):
+        // lazily committed since `new`.
+        let parked = self.parked.iter_mut().map(|s| &mut s.layer_states);
+        for states in std::iter::once(&mut self.layer_states).chain(parked) {
+            for layer in states.iter_mut() {
+                if let LayerState::LinearAttn(la) = layer {
+                    la.touch();
+                }
+            }
+        }
+        // Checkpoint buffers (`Account::Checkpoints`): allocated and
+        // committed now, reused by `checkpoint_pos` / `restore_to`.
+        let n = self.checkpoint_planned.unwrap_or(0);
+        while self.checkpoint_spare.len() + self.checkpoints.len() < n {
+            let mut buf = Vec::with_capacity(self.checkpoint_slot_bytes);
+            // `resize` writes the zeros, committing every page.
+            buf.resize(self.checkpoint_slot_bytes, 0u8);
+            self.checkpoint_spare.push(buf);
         }
         let fp = budget::footprint();
         // What the plan does not itemize — Metal/driver state, pipeline
@@ -3380,7 +3419,10 @@ impl RsCtx<MetalBackend> {
         self.prefetch.invalidate_all();
         // Phase 7: snapshot store is keyed by sequence position; a
         // full clear invalidates every key.
-        self.checkpoints.clear();
+        let bufs: Vec<Vec<u8>> = self.checkpoints.drain().map(|(_, b)| b).collect();
+        for b in bufs {
+            self.release_checkpoint(b);
+        }
         self.checkpoint_order.clear();
     }
 
@@ -3433,6 +3475,69 @@ impl RsCtx<MetalBackend> {
         &mut self,
         pos: i32,
     ) -> Result<(), snapshot::state_snapshot::StateSnapshotError> {
+        let Some(planned) = self.checkpoint_planned else {
+            return self.checkpoint_pos_uncapped(pos);
+        };
+        // Under a cap: save into a preallocated buffer — the one
+        // already at `pos`, a spare, or the LRU victim's (same rule as
+        // uncapped: oldest, skipping pos 0 and `pos`). Never allocates.
+        let max = self.max_checkpoints.min(planned);
+        let mut buf = if let Some(old) = self.checkpoints.remove(&pos) {
+            self.checkpoint_order.retain(|&p| p != pos);
+            old
+        } else {
+            while self.checkpoints.len() >= max.max(1) {
+                if !self.evict_one_checkpoint(pos) {
+                    break;
+                }
+            }
+            if self.checkpoints.len() >= max.max(1) || max == 0 {
+                return Err(snapshot::state_snapshot::StateSnapshotError::CheckpointsFull { max });
+            }
+            self.checkpoint_spare
+                .pop()
+                .ok_or(snapshot::state_snapshot::StateSnapshotError::CheckpointsFull { max })?
+        };
+        let need = self.state_size();
+        debug_assert!(need <= buf.capacity(), "checkpoint {need} B > slot {} B", buf.capacity());
+        buf.resize(need, 0);
+        if let Err(e) = self.state_save(&mut buf) {
+            self.checkpoint_spare.push(buf);
+            return Err(e);
+        }
+        self.checkpoints.insert(pos, buf);
+        self.checkpoint_order.push_back(pos);
+        Ok(())
+    }
+
+    /// Evict the oldest checkpoint other than pos 0 and `keep`; its
+    /// buffer goes back to the spares (capped) or is dropped. `false`
+    /// if only protected positions remain.
+    fn evict_one_checkpoint(&mut self, keep: i32) -> bool {
+        let Some(i) = self.checkpoint_order.iter().position(|&p| p != 0 && p != keep) else {
+            return false;
+        };
+        let victim = self.checkpoint_order.remove(i).expect("index in range");
+        if let Some(buf) = self.checkpoints.remove(&victim) {
+            self.release_checkpoint(buf);
+        }
+        true
+    }
+
+    /// Return a checkpoint buffer to the spares under a cap (it stays
+    /// committed and planned); uncapped, drop it.
+    fn release_checkpoint(&mut self, buf: Vec<u8>) {
+        if self.checkpoint_planned.is_some() {
+            self.checkpoint_spare.push(buf);
+        }
+    }
+
+    /// The historical uncapped path: a fresh buffer per call, then LRU
+    /// eviction down to `max_checkpoints`.
+    fn checkpoint_pos_uncapped(
+        &mut self,
+        pos: i32,
+    ) -> Result<(), snapshot::state_snapshot::StateSnapshotError> {
         let mut buf = vec![0u8; self.state_size()];
         self.state_save(&mut buf)?;
 
@@ -3450,24 +3555,12 @@ impl RsCtx<MetalBackend> {
         // Evict oldest until under cap, skipping pos=0 and the just-
         // inserted position. `pos=0` is kept because it's the natural
         // resume point for a fresh full-prefix reuse; the just-
-        // inserted position is the freshest data we have.
+        // inserted position is the freshest data we have. Only pos=0
+        // and `pos` left (or max_checkpoints < 2): stop — refusing to
+        // evict protected entries beats silently corrupting
+        // future-fast-resume.
         while self.checkpoints.len() > self.max_checkpoints {
-            let mut evicted = false;
-            for i in 0..self.checkpoint_order.len() {
-                let candidate = self.checkpoint_order[i];
-                if candidate == 0 || candidate == pos {
-                    continue;
-                }
-                self.checkpoint_order.remove(i);
-                self.checkpoints.remove(&candidate);
-                evicted = true;
-                break;
-            }
-            if !evicted {
-                // Only pos=0 and `pos` remain (or pathological config
-                // with max_checkpoints < 2). Stop — refusing to evict
-                // protected entries beats silently corrupting
-                // future-fast-resume.
+            if !self.evict_one_checkpoint(pos) {
                 break;
             }
         }
@@ -3485,17 +3578,25 @@ impl RsCtx<MetalBackend> {
     /// at exactly `pos`. drama_llama's `Session` interprets this as a
     /// signal to fall back to full-clear + full reprefill.
     pub fn restore_to(&mut self, pos: i32) -> Result<(), CheckpointError> {
+        // Take the buffer out while loading (no copy — under a cap a
+        // clone would allocate past the plan), then put it back.
         let buf = self
             .checkpoints
-            .get(&pos)
-            .ok_or(CheckpointError::NoCheckpoint { pos })?
-            .clone();
-        self.state_load(&buf).map_err(CheckpointError::Snapshot)?;
+            .remove(&pos)
+            .ok_or(CheckpointError::NoCheckpoint { pos })?;
+        let loaded = self.state_load(&buf);
+        self.checkpoints.insert(pos, buf);
+        loaded.map_err(CheckpointError::Snapshot)?;
 
         // Drop snapshots whose key > pos: the resuming prefill will
         // write fresh content at those positions. Keep `pos` itself
         // (we may restore here again) and any earlier snapshots.
-        self.checkpoints.retain(|&k, _| k <= pos);
+        let later: Vec<i32> = self.checkpoints.keys().copied().filter(|&k| k > pos).collect();
+        for k in later {
+            if let Some(b) = self.checkpoints.remove(&k) {
+                self.release_checkpoint(b);
+            }
+        }
         self.checkpoint_order.retain(|&k| k <= pos);
 
         Ok(())
@@ -3511,10 +3612,11 @@ impl RsCtx<MetalBackend> {
     /// keeping the most-valuable cross-agent anchor (system+tools at
     /// pos-0) alive in the bounded LRU.
     pub fn forget_pos(&mut self, pos: i32) {
-        if self.checkpoints.remove(&pos).is_some() {
+        if let Some(buf) = self.checkpoints.remove(&pos) {
             if let Some(idx) = self.checkpoint_order.iter().position(|&p| p == pos) {
                 self.checkpoint_order.remove(idx);
             }
+            self.release_checkpoint(buf);
         }
     }
 
@@ -3522,8 +3624,15 @@ impl RsCtx<MetalBackend> {
     /// [`DEFAULT_MAX_CHECKPOINTS`] = 4. Lowering past the current
     /// `checkpoints.len()` triggers eviction at the next
     /// `checkpoint_pos`; this method does not retroactively evict.
+    ///
+    /// Under a memory cap the count is clamped to
+    /// [`OpenConfig::max_checkpoints`] — only that many buffers were
+    /// planned and allocated at open.
     pub fn set_max_checkpoints(&mut self, n: usize) {
-        self.max_checkpoints = n;
+        self.max_checkpoints = match self.checkpoint_planned {
+            Some(planned) => n.min(planned),
+            None => n,
+        };
     }
 
     /// Current snapshot count. Useful for tests.

@@ -57,6 +57,9 @@ fn open_with(cap: u64, hot_tier_bytes: Option<u64>, kv_format: KvFormat) -> Resu
         mem_cap: Some(cap),
         hot_tier_bytes,
         kv_format,
+        // These tests take no checkpoints; at the default 4 the plan
+        // would hold 4 × 0.5 GiB of snapshot buffers.
+        max_checkpoints: 0,
         ..OpenConfig::default()
     })
 }
@@ -328,6 +331,7 @@ fn olmoe_attn_threads_are_bit_identical() -> Result<(), Error> {
                 hot_tier_bytes: Some(HOT_TIER_3G),
                 kv_format,
                 attn_threads,
+                max_checkpoints: 0,
                 ..OpenConfig::default()
             };
             greedy(&mut open_cfg(cfg)?, REF_TOKENS.len())
@@ -339,4 +343,67 @@ fn olmoe_attn_threads_are_bit_identical() -> Result<(), Error> {
         eprintln!("[olmoe-attn] {kv_format:?}: 1 vs 4 threads bit-identical over {} steps", l1.len());
     }
     Ok(())
+}
+
+/// Checkpoints under a cap use the buffers planned and touched at
+/// open: save / evict / restore never grow the footprint, and a
+/// restore resumes bit-identically.
+fn checkpoints_stay_inside_the_cap(cap: u64) {
+    let cfg = OpenConfig {
+        n_ctx: 1024,
+        mem_cap: Some(cap),
+        hot_tier_bytes: Some(HOT_TIER_3G),
+        max_checkpoints: 2,
+        ..OpenConfig::default()
+    };
+    let mut ctx = open_cfg(cfg).expect("open");
+    let at_open = footprint().expect("footprint").current;
+    let mut logits = vec![0.0f32; VOCAB];
+    ctx.eval_prompt(PROMPT, 0, 0, &mut logits).expect("prefill");
+    let p0 = PROMPT.len();
+    ctx.checkpoint_pos(p0 as i32).expect("checkpoint at prompt end");
+    let tok = argmax(&logits);
+    let mut first = vec![0.0f32; VOCAB];
+    ctx.eval_token(tok, p0, 0, &mut first).expect("decode");
+    // A second checkpoint further on (and an overwrite of it): both
+    // planned slots in use.
+    let mut pos = p0 + 1;
+    let mut l = first.clone();
+    for _ in 0..8 {
+        ctx.eval_token(argmax(&l), pos, 0, &mut l).expect("decode");
+        pos += 1;
+    }
+    ctx.checkpoint_pos(pos as i32).expect("checkpoint 2");
+    ctx.checkpoint_pos(pos as i32).expect("overwrite checkpoint 2");
+    assert_eq!(ctx.checkpoint_count(), 2);
+    // Raising past the planned count is clamped under a cap.
+    ctx.set_max_checkpoints(16);
+    ctx.restore_to(p0 as i32).expect("restore");
+    assert_eq!(ctx.checkpoint_count(), 1, "later checkpoint dropped");
+    let mut again = vec![0.0f32; VOCAB];
+    ctx.eval_token(tok, p0, 0, &mut again).expect("decode after restore");
+    assert!(first == again, "restored decode differs");
+    // Fill past the planned slots: the oldest non-zero one is evicted
+    // into its buffer; nothing is allocated.
+    for k in 0..4 {
+        ctx.checkpoint_pos((p0 + 1 + k) as i32).expect("checkpoint");
+        assert!(ctx.checkpoint_count() <= 2);
+    }
+    ctx.memory_clear();
+    assert_eq!(ctx.checkpoint_count(), 0);
+    let peak = footprint().expect("footprint").peak;
+    eprintln!(
+        "[olmoe-ckpt] cap {cap} B: open footprint {at_open} B, lifetime peak {peak} B ({:.1} %)",
+        100.0 * at_open as f64 / peak as f64
+    );
+    assert!(peak <= cap, "lifetime peak {peak} B over cap {cap} B");
+    assert!(at_open * 100 >= peak * 99, "open footprint {at_open} B < 99 % of peak {peak} B");
+}
+
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_checkpoints_stay_inside_the_cap() {
+    run_in_child("olmoe_checkpoints_stay_inside_the_cap", || {
+        checkpoints_stay_inside_the_cap(3 << 30)
+    });
 }

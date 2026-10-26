@@ -135,6 +135,8 @@ fn request_pool_counted_against_the_cap() {
         runtime_overhead: 0,
         hot_tier_bytes: Some(0),
         max_requests,
+        // Request state only; checkpoint buffers are their own account.
+        max_checkpoints: 0,
         ..OpenConfig::default()
     };
     match fake.open(&capped(8)).err().expect("eight must fail") {
@@ -143,6 +145,13 @@ fn request_pool_counted_against_the_cap() {
     }
     if let Err(Error::OverBudget { detail }) = fake.open(&capped(1)) {
         panic!("one request over budget: {detail}");
+    }
+    // Checkpoint buffers are planned too: 64 full-context snapshots
+    // (each ≥ one request's KV) can't fit in what one request leaves.
+    let with_checkpoints = OpenConfig { max_checkpoints: 64, ..capped(1) };
+    match fake.open(&with_checkpoints).err().expect("checkpoints must count") {
+        Error::OverBudget { detail } => assert!(detail.contains("checkpoints="), "{detail}"),
+        other => panic!("checkpoints: expected OverBudget, got {other:?}"),
     }
 }
 

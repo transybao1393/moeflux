@@ -287,7 +287,8 @@ mod model {
         let cap = 10 * GIB;
         let mut ctx = open(
             Some(0..14),
-            OpenConfig { mem_cap: Some(cap), ..OpenConfig::default() },
+            // A stage takes no checkpoints (like `moeflux-node`).
+            OpenConfig { mem_cap: Some(cap), max_checkpoints: 0, ..OpenConfig::default() },
         );
         let before = ctx.expert_io_stats();
         let hot = before.hot.expect("hot tier attached");

@@ -10,11 +10,8 @@ Older engine history (graph mode, prefill, kernels) is in
 
 | Issue | Impact | Plan |
 | --- | --- | --- |
-| **Checkpoints are outside the memory budget.** `checkpoint_pos` allocates a `state_size()` buffer per checkpoint (up to `max_checkpoints`) at runtime, and `restore_to` clones one more. | Under `mem_cap` this grows after open; only the after-eval footprint check catches it, once the memory is already used. A full F32 state is ~1 GiB on OLMoE at n_ctx 4096. | `Account::Checkpoints` = `max_checkpoints × state_size(n_ctx)` + 1, allocated and touched at open, reused as a ring; drama_llama's API unchanged. A quantized `kv_format` shrinks each checkpoint too. |
-| **Whole-model weights counted at raw length**, while the owned copy is rounded up to a 16 KiB page. | Under-counts by < 16 KiB. | Round like `filtered_bytes` (the range path) already does. |
-| **Parked request slots' host `LinearAttnState`** is planned but not touched at open. | The open-time footprint check doesn't see it (the cap still holds; it is reserved). | Touch it at open with the rest. |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
-| a3b / a17b model-level tests have not run on this host (no a3b weights). | Phases 1–6 and `kv_format` are verified on OLMoE-1B-7B only, plus unit / kernel tests on all four variants. | Run the `--include-ignored` gate on a host with the a3b model. |
+| a3b / a17b model-level tests have not run on this host (no a3b weights). | Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are verified on OLMoE-1B-7B only, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
 | GPU time is not measured directly. | metal-rs exposes no GPU timestamps (`CmdbufStat::gpu_ns` stays 0); only wall time and I/O wait. | — |
 
 ## Fixed
@@ -42,6 +39,20 @@ Older engine history (graph mode, prefill, kernels) is in
 - **`kv_format` scratch** (`ff6619d`): a quantized KV cache needs an f32
   prefill scratch; it has its own account (`kv_scratch`) and is touched
   at open.
+- **Checkpoints outside the plan** (uncommitted). `checkpoint_pos`
+  allocated a `state_size()` buffer per checkpoint after open (~1 GiB
+  each on OLMoE at n_ctx 4096 F32) and `restore_to` cloned one more.
+  Now `Account::Checkpoints` = `max_checkpoints` × the largest state at
+  `n_ctx`; under a cap the buffers are allocated and touched at open
+  and reused (overwrite, LRU victim, spare); `restore_to` loads in
+  place without a copy. Open footprint 99.8% of the lifetime peak
+  through save / evict / restore / clear
+  (`olmoe_checkpoints_stay_inside_the_cap`).
+- **Whole-model weights counted at raw length** (uncommitted): now
+  rounded to whole 16 KiB pages like the allocation.
+- **Parked request slots' host `LinearAttnState` untouched at open**
+  (uncommitted): every slot's linear state is committed at a capped
+  open.
 
 ### Correctness
 
@@ -51,6 +62,9 @@ Older engine history (graph mode, prefill, kernels) is in
 - **Metal kernel signature** (`ff6619d`, caught by the CPU-vs-Metal
   test): mixing `uint2` and `uint` thread-position inputs fails to
   compile at runtime. Use the same vector type for both.
+- **Flaky `footprint_is_readable_and_nonzero`** (uncommitted): asserted
+  `peak >= current`, but the kernel updates the lifetime max lazily,
+  so with other test threads allocating it failed intermittently.
 
 ### Speed
 
@@ -59,7 +73,7 @@ Older engine history (graph mode, prefill, kernels) is in
 - **F16 KV decode was slower than F32** (`ff6619d`): the f16 → f32
   conversion did not vectorize (19 ms vs 4.5 ms per layer). It now uses
   the hardware `fcvtl`; bit-exact over all 65,536 halves.
-- **Decode attention ran on one core** (uncommitted): at 2.7k context it
+- **Decode attention ran on one core** (`3eb7f13`): at 2.7k context it
   was ~half of decode time. `OpenConfig::attn_threads` (default 4)
   splits heads across a pool, bit-identical: needle decode
   303.6 → 192.6 ms/tok (F32), 205.8 → 132.8 (Turbo4).
@@ -84,6 +98,16 @@ Older engine history (graph mode, prefill, kernels) is in
 - `expert_io = Mmap` is rejected with `mem_cap` (file-backed pages
   escape the cap); a hot tier needs `Pread`.
 - `prefetch_lookahead` needs `prefetch_guess = PrevToken`.
+- **Checkpoints cost cap memory up front.** Under `mem_cap`,
+  `max_checkpoints` (default 4) full-context snapshots are planned
+  whether or not they are used: on OLMoE at n_ctx 2048 F32 that is
+  4 × 0.5 GiB, enough to fail a 3 GiB cap. Set `max_checkpoints: 0`
+  when nothing calls `checkpoint_pos` (pipeline stages: `moeflux-node`
+  does), lower it, or use a quantized `kv_format` (Turbo4 snapshots are
+  ~5× smaller). Under a cap `set_max_checkpoints` cannot raise it past
+  the opened value, and `checkpoint_pos` returns
+  `CheckpointsFull` instead of allocating when only protected
+  positions (0 and the one being saved) remain.
 - `kv_format`: MLA (Cogito) accepts only F32; Turbo needs a
   power-of-two `head_dim`. Non-F32 formats always use the CPU decode
   attention (the GPU SDPA fast path is F32-only).

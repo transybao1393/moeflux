@@ -130,6 +130,12 @@ pub enum StateSnapshotError {
     /// DeepSeek-V3 builds returns this error.
     #[error("snapshot v{SNAPSHOT_VERSION} doesn't support MLA layers (layer {layer})")]
     MlaUnsupported { layer: usize },
+    /// Under a memory cap every checkpoint slot is in use by a
+    /// protected position (0 or the one being overwritten), so there
+    /// is no buffer to save into without growing past the plan.
+    /// Raise `OpenConfig::max_checkpoints` or `forget_pos` one.
+    #[error("all {max} planned checkpoint buffers are in use by protected positions")]
+    CheckpointsFull { max: usize },
 }
 
 /// Bytes per stored KV row (one side) in `fmt`.
@@ -221,6 +227,17 @@ fn header_words_for(layer_states: &LayerStates) -> usize {
 }
 
 pub fn state_size(layer_states: &LayerStates) -> usize {
+    state_size_at(layer_states, false)
+}
+
+/// [`state_size`] with every full-attn layer at its capacity
+/// (`n_ctx`): the largest snapshot this context can produce. Sizes the
+/// preallocated checkpoint buffers under a memory cap.
+pub fn state_size_full(layer_states: &LayerStates) -> usize {
+    state_size_at(layer_states, true)
+}
+
+fn state_size_at(layer_states: &LayerStates, full: bool) -> usize {
     let v = VARIANT;
     let mut n = header_words_for(layer_states) * std::mem::size_of::<u32>();
     let fa_stride = full_attn_stride_bytes(&v, kv_format_of(layer_states));
@@ -231,6 +248,7 @@ pub fn state_size(layer_states: &LayerStates) -> usize {
             LayerKind::FullAttn => {
                 n += std::mem::size_of::<i32>();
                 let len = match layer {
+                    _ if full => layer.kv_capacity().unwrap_or(0),
                     LayerState::FullAttn(kv) => kv.len.max(0) as usize,
                     LayerState::Mla(c) => c.len.max(0) as usize,
                     LayerState::LinearAttn(_) => 0,
