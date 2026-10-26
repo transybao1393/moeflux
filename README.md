@@ -136,7 +136,7 @@ Details — memory accounts, the per-token data path, phases — are in
 
 ## Status
 
-**Pre-alpha**, based on moeflux `0.1.0-pre.4`.
+**Alpha** — `0.2.0-alpha.1`, the first release of the revamp, based on moeflux `0.1.0-pre.4`. APIs may still change; changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
 | Area | State |
 | --- | --- |
