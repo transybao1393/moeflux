@@ -180,7 +180,8 @@ let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, 
 `open_with` fails with `Error::OverBudget` if the plan does not fit the cap.
 
 Tests: run `scripts/check_test_host.sh` first; it says which tier
-(unit/kernel or model) this host can run.
+(unit/kernel or model) this host can run. Fixed bugs, open issues and
+traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
 
 ## Provenance
 
