@@ -305,8 +305,24 @@ lists/stories, different phrasing). Relative MSE per head matches
 Lloyd–Max (4-bit 0.0083 vs 0.0095 theory, 3-bit 0.030 vs 0.0345);
 Metal matches the CPU reference to ~1e-13. Per-layer decode SDPA at
 2,700 positions: F32 4.45 ms, F16 4.40, Turbo4 4.56, Turbo3 5.76 (CPU,
-single-threaded — at long context this is ~half of decode time for
-every format; parallelizing it over heads is open).
+single-threaded at the time).
+
+**Decode attention threads** (`OpenConfig::attn_threads`, default 4):
+the CPU SDPA splits its heads across a small pool, same arithmetic per
+head, so logits are bit-identical for any thread count
+(`olmoe_attn_threads_are_bit_identical`). Per layer at 2,700
+positions: 4.0 ms serial → 2.4 / 1.1 / 1.0 ms on 2 / 4 / 6 threads.
+End to end (same matrix, one batch):
+
+| Format | Threads | Needle ms/tok | 256-token prompts ms/tok |
+| --- | --- | --- | --- |
+| F32 | 1 | 303.6 | 108.1 |
+| F32 | 4 | 192.6 (+58% tok/s) | 106.7 |
+| Turbo4 | 1 | 205.8 | 77.7 |
+| Turbo4 | 4 | 132.8 (+55%) | 74.2 |
+
+Short prompts (~300 positions) gain little; long context gains most.
+Thread stacks sit in `runtime_overhead` (both cap peak tests pass).
 
 | # | Phase | Work | Exit criteria |
 | --- | --- | --- | --- |

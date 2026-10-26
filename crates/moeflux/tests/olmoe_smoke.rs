@@ -52,15 +52,18 @@ fn open_capped(cap: u64, hot_tier_bytes: Option<u64>) -> Result<Ctx, Error> {
 }
 
 fn open_with(cap: u64, hot_tier_bytes: Option<u64>, kv_format: KvFormat) -> Result<Ctx, Error> {
-    let dir = model_dir();
-    let art = dir.join("artifacts");
-    let cfg = OpenConfig {
+    open_cfg(OpenConfig {
         n_ctx: 2048,
         mem_cap: Some(cap),
         hot_tier_bytes,
         kv_format,
         ..OpenConfig::default()
-    };
+    })
+}
+
+fn open_cfg(cfg: OpenConfig) -> Result<Ctx, Error> {
+    let dir = model_dir();
+    let art = dir.join("artifacts");
     Ctx::open_with(
         &art.join("model_weights.bin"),
         &art.join("model_weights.json"),
@@ -309,5 +312,31 @@ fn olmoe_kv_quant_snapshot_round_trips() -> Result<(), Error> {
     f.memory_clear();
     let err = f.state_load(&snap).expect_err("f32 context must refuse a Turbo4 snapshot");
     eprintln!("[olmoe-kv] f32 load of a Turbo4 snapshot: {err}");
+    Ok(())
+}
+
+/// Splitting decode attention across threads changes nothing: every
+/// step's logits are bit-identical to the serial path.
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_attn_threads_are_bit_identical() -> Result<(), Error> {
+    for kv_format in [KvFormat::F32, KvFormat::Turbo4] {
+        let run = |attn_threads| {
+            let cfg = OpenConfig {
+                n_ctx: 2048,
+                mem_cap: Some(3 << 30),
+                hot_tier_bytes: Some(HOT_TIER_3G),
+                kv_format,
+                attn_threads,
+                ..OpenConfig::default()
+            };
+            greedy(&mut open_cfg(cfg)?, REF_TOKENS.len())
+        };
+        let (t1, l1) = run(1)?;
+        let (t4, l4) = run(4)?;
+        assert_eq!(t1, t4, "{kv_format:?}");
+        assert!(l1 == l4, "{kv_format:?}: logits differ between 1 and 4 attention threads");
+        eprintln!("[olmoe-attn] {kv_format:?}: 1 vs 4 threads bit-identical over {} steps", l1.len());
+    }
     Ok(())
 }

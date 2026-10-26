@@ -45,4 +45,7 @@ pub struct GpuLayerCtx<'a> {
     /// working set fits RAM) the GPU SDPA fast path is kept: faster, with
     /// no eviction pressure.
     pub expert_io_mode: ExpertIoMode,
+    /// Decode attention threads for the CPU SDPA
+    /// ([`crate::riir::OpenConfig::attn_threads`]); `None` = serial.
+    pub attn_pool: Option<&'a rayon::ThreadPool>,
 }

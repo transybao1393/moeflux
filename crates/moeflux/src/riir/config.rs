@@ -24,6 +24,12 @@ pub const DEFAULT_IO_THREADS: usize = 8;
 /// prompts run as several chunks.
 pub const CAPPED_PREFILL_CHUNK: usize = 512;
 
+/// Default [`OpenConfig::attn_threads`]. On an M3 Pro (OLMoE shape,
+/// 2,700 positions) decode SDPA per layer took 4.0 ms serial, 2.4 /
+/// 1.1 / 1.0 ms on 2 / 4 / 6 threads: 4 gets most of it while leaving
+/// cores to other work on the machine.
+pub const DEFAULT_ATTN_THREADS: usize = 4;
+
 /// Default [`OpenConfig::prefetch_experts`] under a `mem_cap`: the
 /// strongest 4 guesses per layer (see that field for the numbers).
 pub const DEFAULT_CAPPED_PREFETCH_EXPERTS: usize = 4;
@@ -168,6 +174,14 @@ pub struct OpenConfig {
     /// Non-F32 formats run decode attention on the CPU path. MLA
     /// variants accept only `F32`.
     pub kv_format: KvFormat,
+    /// Threads the CPU decode attention (SDPA) splits its heads
+    /// across; `0` / `1` run it on the calling thread. Default
+    /// [`DEFAULT_ATTN_THREADS`]. Output is bit-identical for any
+    /// value. This path runs whenever the GPU SDPA fast path does not
+    /// (pread / capped runs, any non-F32 `kv_format`, kv_len < 32);
+    /// at long context it is a large share of decode time. Thread
+    /// stacks are inside `runtime_overhead`.
+    pub attn_threads: usize,
 }
 
 impl Default for OpenConfig {
@@ -191,6 +205,7 @@ impl Default for OpenConfig {
             host_buffers: 0,
             prefill_chunk: None,
             kv_format: KvFormat::F32,
+            attn_threads: DEFAULT_ATTN_THREADS,
         }
     }
 }

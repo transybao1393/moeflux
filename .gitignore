@@ -61,6 +61,8 @@ results/
 # KV-format measurement runs (harness outputs, generated needle prompt)
 runs/
 p_needle.json
+# attn_threads measurement runs
+kv/attn/
 
 # Rust
 target/

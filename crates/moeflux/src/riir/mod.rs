@@ -337,6 +337,9 @@ pub struct RsCtx<B: Backend = MetalBackend> {
     /// `g_io_pool` (4 pthreads); we use 8 since M2 Max has 8 P-cores
     /// and there's no contention with other moeflux work.
     io_pool: rayon::ThreadPool,
+    /// Decode attention threads ([`OpenConfig::attn_threads`]); `None`
+    /// runs the CPU SDPA serially.
+    attn_pool: Option<rayon::ThreadPool>,
     /// Slice 5d-6b — speculative-prefetch state machine. One entry
     /// per layer of last-token K indices (used as next-token same-
     /// layer prediction) plus an in-flight async pread handle.
@@ -686,6 +689,16 @@ impl RsCtx<MetalBackend> {
             .thread_name(|i| format!("moeflux-io-{}", i))
             .build()
             .map_err(|_| RsError::InitFailed)?;
+        let attn_pool = match config.attn_threads {
+            0 | 1 => None,
+            n => Some(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .thread_name(|i| format!("moeflux-attn-{}", i))
+                    .build()
+                    .map_err(|_| RsError::InitFailed)?,
+            ),
+        };
         let mut prefetch = PrefetchState::new(VARIANT.num_layers, expert_io_mode);
         // Cross-layer guesses (plan phase 6): only the GQA decode path
         // prefetches, and only in pread mode.
@@ -715,6 +728,7 @@ impl RsCtx<MetalBackend> {
             deferred: DeferredRing::new(),
             lm_head_gpu: None,
             io_pool,
+            attn_pool,
             prefetch,
             checkpoints: HashMap::new(),
             checkpoint_order: VecDeque::new(),
@@ -1517,6 +1531,7 @@ impl RsCtx<MetalBackend> {
             linear_buffers,
             deferred,
             io_pool,
+            attn_pool,
             prefetch,
             ..
         } = self;
@@ -1568,6 +1583,7 @@ impl RsCtx<MetalBackend> {
                 buffers: linear_buffers,
                 buffer_pool,
                 expert_io_mode,
+                attn_pool: attn_pool.as_ref(),
             };
             full_attn_layer_forward(
                 metal,
@@ -1601,6 +1617,7 @@ impl RsCtx<MetalBackend> {
                 buffers: linear_buffers,
                 buffer_pool,
                 expert_io_mode,
+                attn_pool: attn_pool.as_ref(),
             };
             linear_attn_layer_forward(
                 metal,
@@ -3064,6 +3081,7 @@ impl RsCtx<MetalBackend> {
             deferred,
             lm_head_gpu,
             io_pool,
+            attn_pool,
             prefetch,
             ..
         } = self;
@@ -3203,6 +3221,7 @@ impl RsCtx<MetalBackend> {
                     buffers: linear_buffers,
                     buffer_pool,
                     expert_io_mode,
+                    attn_pool: attn_pool.as_ref(),
                 };
                 full_attn_layer_forward(
                     metal,
@@ -3236,6 +3255,7 @@ impl RsCtx<MetalBackend> {
                     buffers: linear_buffers,
                     buffer_pool,
                     expert_io_mode,
+                    attn_pool: attn_pool.as_ref(),
                 };
                 linear_attn_layer_forward(
                     metal,

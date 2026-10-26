@@ -51,8 +51,8 @@ use crate::riir::attn::linear_attn_forward::{
 };
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
 use crate::riir::attn::rope::apply_rotary_emb;
-use crate::riir::attn::kv_quant::{KvFormat, quantize_row, sdpa_cpu_quant};
-use crate::riir::attn::sdpa::sdpa_cpu_with;
+use crate::riir::attn::kv_quant::{KvFormat, quantize_row, sdpa_cpu_quant_pool};
+use crate::riir::attn::sdpa::sdpa_cpu_pool;
 use crate::riir::backend::buftype::{
     AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf,
     RopeInvFreqBuf, RouterLogitsBuf, VProjOutBuf,
@@ -517,7 +517,8 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
                     &*kv_state.v_rows_mut(buffer_pool, 0, kv_len as usize),
                 )
             };
-            sdpa_cpu_quant(
+            sdpa_cpu_quant_pool(
+                gpu.attn_pool,
                 &v,
                 kv_state.fmt,
                 kv_len as usize,
@@ -537,7 +538,8 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
                 kv_state.v_slice(buffer_pool, kv_len as usize),
             )
         };
-        sdpa_cpu_with(
+        sdpa_cpu_pool(
+            gpu.attn_pool,
             kv_len,
             &q_host,
             q_gate_host.as_deref(),

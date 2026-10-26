@@ -76,6 +76,36 @@ flowchart LR
     end
 ```
 
+### Decode attention across cores
+
+When the GPU attention fast path is not used — streaming or capped
+runs, or a quantized `kv_format` — each decode step's attention runs
+on the CPU. Its query heads are independent, so they are split across
+a small thread pool (`attn_threads`, default 4). Every thread reads
+the same KV cache (read-only, shared with the GPU) and writes only its
+own heads' slice of the output, so no locks are needed and the result
+is bit-identical to one thread.
+
+```mermaid
+flowchart LR
+    Q["<b>Query</b><br/>one token<br/>16 heads"] --> SPLIT{"split by head"}
+    SPLIT --> T1["<b>Thread 1</b><br/>heads 0, 4, …"]
+    SPLIT --> T2["<b>Thread 2</b><br/>heads 1, 5, …"]
+    SPLIT --> T3["<b>Thread 3</b><br/>heads 2, 6, …"]
+    SPLIT --> T4["<b>Thread 4</b><br/>heads 3, 7, …"]
+    KV[("<b>KV cache</b><br/>F32 / F16 / Turbo<br/>read-only")] -.-> T1 & T2 & T3 & T4
+    T1 & T2 & T3 & T4 --> OUT["<b>Output</b><br/>each head's slice"]
+    OUT --> GPU["<b>GPU</b><br/>o_proj → experts"]
+```
+
+Per head, a thread scores the query against every cached key,
+takes the softmax, and sums the weighted values. Turbo formats work
+on the stored 4/3-bit codes directly, without decompressing the cache.
+The pool picks up heads dynamically (work stealing), so the head
+assignment above is illustrative. On OLMoE at 2.7k context this made
+decode 55–58% faster; short contexts gain little, since attention is
+then a small part of each step.
+
 Details — memory accounts, the per-token data path, phases — are in
 [`docs/fork-upgrade-plan.md`](docs/fork-upgrade-plan.md).
 
@@ -121,6 +151,7 @@ Details — memory accounts, the per-token data path, phases — are in
 | `moeflux-net`: frames, `moeflux-node`, `moeflux-coord`, planner (TCP loopback) | Implemented — Phase 5; model-level tests pending |
 | Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier, `prefetch_experts` (prefetch width) | Implemented — Phase 6; knobs default off except `prefetch_experts` = 4 under a cap (measured on OLMoE-1B-7B, +4–15% tok/s); a3b/a17b model tests pending |
 | KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit; snapshot v4) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB (incl. prefill scratch) and decode +29% / +44% faster (the freed memory goes to the hot tier); answers correct in every format. MLA (Cogito) stays F32 |
+| Decode attention threads (`attn_threads`, default 4) | Implemented — bit-identical output; on OLMoE at 2.7k context decode +55–58% tok/s (F32 and Turbo4) |
 | Router policy, 2-bit | Planned — Phases 7–8 |
 
 Build with exactly one model feature (`model-qwen3-6-35b-a3b`,

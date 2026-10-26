@@ -82,6 +82,21 @@ pub fn sdpa_cpu_with(
     v_cache: &[f32],
     out: &mut [f32],
 ) -> Result<(), SdpaError> {
+    sdpa_cpu_pool(None, kv_len, q, q_gate, k_cache, v_cache, out)
+}
+
+/// [`sdpa_cpu_with`] with the heads split across `pool` (decode
+/// attention threads, [`crate::riir::OpenConfig::attn_threads`]).
+/// Bit-identical to the serial path.
+pub fn sdpa_cpu_pool(
+    pool: Option<&rayon::ThreadPool>,
+    kv_len: i32,
+    q: &[f32],
+    q_gate: Option<&[f32]>,
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+) -> Result<(), SdpaError> {
     if kv_len <= 0 {
         return Err(SdpaError::EmptyCache { kv_len });
     }
@@ -130,12 +145,10 @@ pub fn sdpa_cpu_with(
     let heads_per_kv = num_attn_heads / num_kv_heads;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-    for o in out.iter_mut() {
-        *o = 0.0;
-    }
-
-    let mut scores = vec![0.0f32; kv_len_u];
-    for h in 0..num_attn_heads {
+    // One head, scores in `scores[..kv_len]`; the same arithmetic in
+    // the same order whether heads run serially or on `pool`, so the
+    // output is bit-identical either way.
+    let head = |h: usize, oh: &mut [f32], scores: &mut [f32]| {
         let kv_h = h / heads_per_kv;
         let qh = &q[h * head_dim..(h + 1) * head_dim];
 
@@ -167,13 +180,27 @@ pub fn sdpa_cpu_with(
             *s *= inv_sum;
         }
 
-        let oh = &mut out[h * head_dim..(h + 1) * head_dim];
+        oh.fill(0.0);
         for p in 0..kv_len_u {
             let vp_start = p * kv_dim + kv_h * head_dim;
             let vp = &v_cache[vp_start..vp_start + head_dim];
             let w = scores[p];
             for d in 0..head_dim {
                 oh[d] += w * vp[d];
+            }
+        }
+    };
+    match pool {
+        Some(pool) => pool.install(|| {
+            use rayon::prelude::*;
+            out.par_chunks_mut(head_dim)
+                .enumerate()
+                .for_each_init(|| vec![0.0f32; kv_len_u], |scores, (h, oh)| head(h, oh, scores));
+        }),
+        None => {
+            let mut scores = vec![0.0f32; kv_len_u];
+            for (h, oh) in out.chunks_mut(head_dim).enumerate() {
+                head(h, oh, &mut scores);
             }
         }
     }

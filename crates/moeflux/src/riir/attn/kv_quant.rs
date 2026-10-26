@@ -443,6 +443,23 @@ pub fn sdpa_cpu_quant(
     v_rows: &[u8],
     out: &mut [f32],
 ) {
+    sdpa_cpu_quant_pool(None, v, fmt, kv_len, q, q_gate, k_rows, v_rows, out)
+}
+
+/// [`sdpa_cpu_quant`] with the heads split across `pool`; bit-identical
+/// to the serial path.
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_cpu_quant_pool(
+    pool: Option<&rayon::ThreadPool>,
+    v: &Variant,
+    fmt: KvFormat,
+    kv_len: usize,
+    q: &[f32],
+    q_gate: Option<&[f32]>,
+    k_rows: &[u8],
+    v_rows: &[u8],
+    out: &mut [f32],
+) {
     let hd = v.head_dim;
     let hb = fmt.head_bytes(hd);
     let rb = fmt.row_bytes(v);
@@ -458,15 +475,24 @@ pub fn sdpa_cpu_quant(
             *l = level(levels, c as u32);
         }
     }
-    let mut scores = vec![0.0f32; kv_len];
-    let mut qr = vec![0.0f32; hd];
-    let mut row = vec![0.0f32; hd];
-    let mut acc = vec![0.0f32; hd];
-    for h in 0..v.num_attn_heads {
+    struct Scratch {
+        scores: Vec<f32>,
+        qr: Vec<f32>,
+        row: Vec<f32>,
+        acc: Vec<f32>,
+    }
+    let scratch = || Scratch {
+        scores: vec![0.0; kv_len],
+        qr: vec![0.0; hd],
+        row: vec![0.0; hd],
+        acc: vec![0.0; hd],
+    };
+    let head = |h: usize, o: &mut [f32], sc: &mut Scratch| {
+        let Scratch { scores, qr, row, acc } = sc;
         let kvh = h / heads_per_kv;
         let qh = &q[h * hd..(h + 1) * hd];
         if bits.is_some() {
-            rotate(qh, &mut qr);
+            rotate(qh, qr);
         } else {
             qr.copy_from_slice(qh);
         }
@@ -475,11 +501,11 @@ pub fn sdpa_cpu_quant(
             let dot = match bits {
                 Some(b) => {
                     let sc = f32::from_le_bytes(rec[..4].try_into().unwrap());
-                    sc * turbo_dot(b, &rec[4..], &lut, &qr)
+                    sc * turbo_dot(b, &rec[4..], &lut, qr)
                 }
                 None => {
-                    f16_head(rec, &mut row);
-                    qr.iter().zip(&row).map(|(a, b)| a * b).sum::<f32>()
+                    f16_head(rec, row);
+                    qr.iter().zip(row.iter()).map(|(a, b)| a * b).sum::<f32>()
                 }
             };
             *s = dot * scale;
@@ -497,27 +523,39 @@ pub fn sdpa_cpu_quant(
             match bits {
                 Some(b) => {
                     let sc = f32::from_le_bytes(rec[..4].try_into().unwrap());
-                    turbo_axpy(b, &rec[4..], &lut, w * sc, &mut acc);
+                    turbo_axpy(b, &rec[4..], &lut, w * sc, acc);
                 }
                 None => {
-                    f16_head(rec, &mut row);
-                    for (a, &r) in acc.iter_mut().zip(&row) {
+                    f16_head(rec, row);
+                    for (a, &r) in acc.iter_mut().zip(row.iter()) {
                         *a += w * r;
                     }
                 }
             }
         }
         if bits.is_some() {
-            unrotate(&mut acc);
+            unrotate(acc);
         }
-        let o = &mut out[h * hd..(h + 1) * hd];
         match q_gate {
             Some(g) => {
                 for (j, oj) in o.iter_mut().enumerate() {
                     *oj = acc[j] / (1.0 + (-g[h * hd + j]).exp());
                 }
             }
-            None => o.copy_from_slice(&acc),
+            None => o.copy_from_slice(acc),
+        }
+    };
+    let out = &mut out[..v.num_attn_heads * hd];
+    match pool {
+        Some(pool) => pool.install(|| {
+            use rayon::prelude::*;
+            out.par_chunks_mut(hd).enumerate().for_each_init(scratch, |sc, (h, o)| head(h, o, sc));
+        }),
+        None => {
+            let mut sc = scratch();
+            for (h, o) in out.chunks_mut(hd).enumerate() {
+                head(h, o, &mut sc);
+            }
         }
     }
 }
@@ -722,24 +760,38 @@ mod bench {
         let q_dim = v.num_attn_heads * v.head_dim;
         let x: Vec<f32> = (0..n * kv_dim).map(|i| ((i * 7919 % 1000) as f32 - 500.0) / 300.0).collect();
         let q: Vec<f32> = (0..q_dim).map(|i| ((i * 31 % 100) as f32 - 50.0) / 50.0).collect();
-        let mut out = vec![0.0f32; q_dim];
-        let reps = 20;
-        let t = std::time::Instant::now();
-        for _ in 0..reps {
-            super::super::sdpa::sdpa_cpu_with(n as i32, &q, None, &x, &x, &mut out).unwrap();
-        }
-        eprintln!("F32    {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+        let reps = 40;
+        let mut stores = vec![];
         for fmt in [KvFormat::F16, KvFormat::Turbo4, KvFormat::Turbo3] {
             let rb = fmt.row_bytes(&v);
             let mut st = vec![0u8; n * rb];
             for p in 0..n {
                 quantize_row(fmt, &v, &x[p * kv_dim..(p + 1) * kv_dim], &mut st[p * rb..(p + 1) * rb]);
             }
+            stores.push((fmt, st));
+        }
+        let mut serial = vec![vec![0.0f32; q_dim]; 4];
+        for threads in [0usize, 1, 2, 4, 6, 8] {
+            let pool = (threads > 0)
+                .then(|| rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap());
+            let p = pool.as_ref();
+            let mut line = format!("threads {threads}:");
+            let mut out = vec![0.0f32; q_dim];
             let t = std::time::Instant::now();
             for _ in 0..reps {
-                sdpa_cpu_quant(&v, fmt, n, &q, None, &st, &st, &mut out);
+                super::super::sdpa::sdpa_cpu_pool(p, n as i32, &q, None, &x, &x, &mut out).unwrap();
             }
-            eprintln!("{fmt:?} {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+            line += &format!(" F32 {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+            if threads == 0 { serial[0] = out.clone() } else { assert_eq!(out, serial[0], "F32 differs") }
+            for (k, (fmt, st)) in stores.iter().enumerate() {
+                let t = std::time::Instant::now();
+                for _ in 0..reps {
+                    sdpa_cpu_quant_pool(p, &v, *fmt, n, &q, None, st, st, &mut out);
+                }
+                line += &format!(" {fmt:?} {:.2} ms", t.elapsed().as_secs_f64() * 1e3 / reps as f64);
+                if threads == 0 { serial[k + 1] = out.clone() } else { assert_eq!(out, serial[k + 1], "{fmt:?} differs") }
+            }
+            eprintln!("{line}");
         }
     }
 }
