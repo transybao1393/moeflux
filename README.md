@@ -26,6 +26,9 @@ user-set memory cap, on one Mac or across a small cluster of Macs.
 - **Streaming experts, designed for a hard cap.** Experts stream from
   SSD with `F_NOCACHE` reads into a fixed hot tier and slot ring, with
   profile-seeded, frequency-based caching and speculative prefetch.
+- **Compact KV cache.** The attention cache can be stored as F16 or
+  TurboQuant 4/3-bit instead of f32; under a cap the memory it frees
+  goes to the expert hot tier.
 - **Router hook.** After routing, the engine hands each layer's
   picked experts and gate weights to a policy, which decides per
   expert whether to run it at 4-bit, run it at 2-bit, or skip it.
@@ -86,13 +89,19 @@ Details — memory accounts, the per-token data path, phases — are in
   and compiled at runtime.
 - `crates/moeflux-metal/` — MLX-derived quantized GEMM and gather
   kernels.
-- *Planned:* `moeflux-net` (pipeline frames) and a coordinator
-  binary; budget, expert-source and policy start as feature-gated
-  modules inside `moeflux`.
+- `crates/moeflux-net/` — mode B pipeline: frames, the
+  `moeflux-node` and `moeflux-coord` binaries, and the range planner.
 - `scripts/` — model-prep pipeline (`extract_weights.py`,
-  `export_vocab.py`, `export_tokenizer.py`).
-- `tools/mlx_reference/` — MLX reference diff harness;
-  `crates/moeflux/tests/mlx_regression.rs` regenerates its goldens.
+  `export_vocab.py`, `export_tokenizer.py`), the test-host check
+  (`check_test_host.sh`, run before any test phase), profiling
+  (`profile_smoke.sh`, `profile_aggregate.py`) and `watch_run.sh`
+  (samples a run's memory and CPU).
+- `tools/` — model converters (`convert_olmoe.py`,
+  `convert_cogito_v2.py`), a NumPy reference forward for OLMoE
+  (`olmoe_ref.py`), an expert-cache simulator that replays routing
+  traces (`sim_expert_cache.py`), `gen_expert_index.py`, and
+  `mlx_reference/` — the MLX reference diff harness
+  (`crates/moeflux/tests/mlx_regression.rs` regenerates its goldens).
 - `docs/` — design notes and the upgrade plan.
 
 ## Status
@@ -102,6 +111,7 @@ Details — memory accounts, the per-token data path, phases — are in
 | Area | State |
 | --- | --- |
 | Engine, Metal kernels, Qwen3.5-A17B / Qwen3.6-35B-A3B / Cogito-V2 variants | Exists |
+| OLMoE-1B-7B variant (small test model: converter, NumPy reference, model tests under a cap) | Implemented — the model-level test bed on hosts without a3b weights |
 | Expert streaming: mmap mode, pread + speculative prefetch, slot ring | Exists |
 | Differential oracles (CPU vs Metal, batched vs per-token, MLX) | Exists |
 | `OpenConfig`, `n_ctx`-sized KV, memory cap (plan, reserve at open, footprint checks) | Implemented — Phase 1; model-level tests pending |
@@ -110,16 +120,36 @@ Details — memory accounts, the per-token data path, phases — are in
 | Per-request state (`max_requests` pool, `admit_request` / `drop_request` / `eval_request`) | Implemented — Phase 4; model-level tests pending |
 | `moeflux-net`: frames, `moeflux-node`, `moeflux-coord`, planner (TCP loopback) | Implemented — Phase 5; model-level tests pending |
 | Streaming improvements: telemetry (`ExpertIoStats`, CSV), bounded I/O (`io_queue_depth`, `io_bytes_per_sec`), in-place coalesced prefill reads, cross-layer guesses, lookahead prefetch, `fast_experts_dir` disk tier, `prefetch_experts` (prefetch width) | Implemented — Phase 6; knobs default off except `prefetch_experts` = 4 under a cap (measured on OLMoE-1B-7B, +4–15% tok/s); a3b/a17b model tests pending |
-| KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB and decode +29% / +44% faster (the freed memory goes to the hot tier) |
+| KV cache formats (`kv_format`: F32, F16, TurboQuant 4/3-bit; snapshot v4) | Implemented — F32 default; on OLMoE-1B-7B at a 3 GiB cap and n_ctx 4096, F16 / Turbo4 shrink KV 1.00 → 0.56 / 0.19 GiB (incl. prefill scratch) and decode +29% / +44% faster (the freed memory goes to the hot tier); answers correct in every format. MLA (Cogito) stays F32 |
 | Router policy, 2-bit | Planned — Phases 7–8 |
 
-Build with exactly one model feature:
+Build with exactly one model feature (`model-qwen3-6-35b-a3b`,
+`model-qwen3-5-a17b`, `model-cogito-v2-671b`, `model-olmoe-1b-7b`):
 
 ```bash
 cargo build --features model-qwen3-6-35b-a3b
 # the whole workspace, moeflux-net included
 cargo build --workspace --features model-qwen3-6-35b-a3b
 ```
+
+Opening under a cap, with a compact KV cache:
+
+```rust
+use moeflux::{Ctx, KvFormat, OpenConfig};
+
+let cfg = OpenConfig {
+    n_ctx: 4096,
+    mem_cap: Some(10 << 30),        // hard cap, bytes
+    kv_format: KvFormat::Turbo4,    // F32 (default) | F16 | Turbo4 | Turbo3
+    ..OpenConfig::default()         // hot tier takes what the plan leaves
+};
+let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, &cfg)?;
+```
+
+`open_with` fails with `Error::OverBudget` if the plan does not fit the cap.
+
+Tests: run `scripts/check_test_host.sh` first; it says which tier
+(unit/kernel or model) this host can run.
 
 ## Provenance
 
