@@ -70,3 +70,5 @@ Cargo.lock
 
 # Generated per-variant index (rebuild via tools/gen_expert_index.py)
 expert_index_*.json
+# Expert index written by the README setup steps
+expert_index.json

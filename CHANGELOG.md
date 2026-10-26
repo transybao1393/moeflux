@@ -6,6 +6,9 @@
 
 - `OpenConfig::max_checkpoints` (default 4): checkpoint buffers planned
   under a cap (`Account::Checkpoints`).
+- `tools/chat`: a local chat page for Qwen3.6-35B-A3B under a cap.
+- README guide for running Qwen3.6-35B-A3B on a small Mac, with measured
+  memory and speed (≈ 5 tok/s at a 4 GiB cap on an M3 Pro).
 
 ### Fixed
 

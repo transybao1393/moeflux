@@ -129,7 +129,8 @@ Details — memory accounts, the per-token data path, phases — are in
 - `tools/` — model converters (`convert_olmoe.py`,
   `convert_cogito_v2.py`), a NumPy reference forward for OLMoE
   (`olmoe_ref.py`), an expert-cache simulator that replays routing
-  traces (`sim_expert_cache.py`), `gen_expert_index.py`, and
+  traces (`sim_expert_cache.py`), `gen_expert_index.py`, `chat/` (a
+  local chat page for Qwen3.6-35B-A3B under a cap), and
   `mlx_reference/` — the MLX reference diff harness
   (`crates/moeflux/tests/mlx_regression.rs` regenerates its goldens).
 - `docs/` — design notes and the upgrade plan.
@@ -182,6 +183,105 @@ let mut ctx = Ctx::open_with(&weights, &manifest, &vocab, &experts_root, false, 
 Tests: run `scripts/check_test_host.sh` first; it says which tier
 (unit/kernel or model) this host can run. Fixed bugs, open issues and
 traps are listed in [`docs/known-issues.md`](docs/known-issues.md).
+
+## Running Qwen3.6-35B-A3B on a small Mac
+
+Measured on an M3 Pro (11 cores, 18 GB RAM, internal SSD) shared with
+other services, with 5–7 GiB of RAM reclaimable. The model is 19.4 GB
+at 4-bit; under a cap it streams experts from the SSD and keeps only
+the hot ones in RAM, so it runs in 3–5 GiB.
+
+### What it costs
+
+| Resource | Cost |
+| --- | --- |
+| Disk | 20.4 GB download (`mlx-community/Qwen3.6-35B-A3B-4bit`) + 18.3 GB converted (1.3 GB non-expert weights, 16.9 GB packed experts) ≈ 39 GB. The MLX download can be deleted after conversion if you don't need `engine_op_diff` |
+| RAM | Whatever you cap it at: a 3 GiB cap peaks at 2.65 GiB, 4 GiB at 3.65 GiB, 5 GiB at 4.65 GiB. Below ~3 GiB the fixed parts don't fit and `open_with` fails with `OverBudget` |
+| Page cache | None from expert reads: under a cap they use `F_NOCACHE`, so the file cache other processes rely on is not evicted |
+| CPU | 4 threads for decode attention (`attn_threads`), plus the I/O threads; the GPU does the rest |
+| SSD | 380–600 MiB read per token (fewer with a bigger hot tier) |
+
+Fixed parts of a 4 GiB plan (n_ctx 4096): weights 1.29 GiB, prefill
+staging 0.42, runtime overhead 0.50, prefill scratch 0.23, linear-attention
+state 0.12, expert slots 0.09, KV 0.02–0.15 (Turbo4 / F32). The hot tier
+gets the rest: 1.2–1.3 GiB. Measured footprint stays 0.08 GiB within
+the plan.
+
+### Speed
+
+Greedy decode, n_ctx 4096, 64 tokens, one batch of runs:
+
+| Cap | Hot tier | Hot-tier hits | Decode, short prompt | Decode at 3.3k context | Prefill |
+| --- | --- | --- | --- | --- | --- |
+| 3 GiB | 0.30 GiB | 11% | 216 ms/tok (4.6 tok/s) | 246 ms/tok | 137 tok/s |
+| 4 GiB | 1.31 GiB | 33% | 200 ms/tok (5.0 tok/s) | 225 ms/tok | 135 tok/s |
+| 5 GiB | 2.31 GiB | 48% | 186 ms/tok (5.4 tok/s) | 224 ms/tok | 140 tok/s |
+
+`attn_threads: 1` instead of 4 makes long-context decode 321 instead of
+225 ms/tok. At 465 MiB/tok in 200 ms decode reads ~2.3 GB/s, below what
+the SSD sustains (~6.7 GB/s), so more speed has to come from the engine
+side, not the disk. Answers are identical across caps, and match MLX:
+argmax equal, top-20 overlap 20/20 with F32 KV and 19/20 with Turbo4
+(the gate in `mlx_regression.rs` is 19). On a3b the KV cache is small
+(10 full-attention layers, 2 KV heads), so F32 KV costs little and
+Turbo4 gains nothing measurable.
+
+### Setup
+
+```bash
+scripts/check_test_host.sh               # CPU, RAM, headroom, disk
+
+M=~/models/qwen3-6-35b-a3b
+hf download mlx-community/Qwen3.6-35B-A3B-4bit --local-dir $M/mlx-4bit
+
+python3 -I scripts/extract_weights.py --model $M/mlx-4bit --output $M/artifacts
+python3 -I scripts/export_vocab.py $M/mlx-4bit/tokenizer.json $M/artifacts/vocab.bin
+python3 -I tools/gen_expert_index.py --mlx-path $M/mlx-4bit --out $M/expert_index.json
+python3 -I repack_experts.py --index $M/expert_index.json --output-dir $M/root/packed_experts
+```
+
+Conversion needs Python with NumPy, peaks under 0.3 GiB of RAM and
+takes about 20 s once downloaded.
+
+Then open it under a cap — `OpenConfig { mem_cap: Some(4 << 30),
+n_ctx: 4096, max_checkpoints: 0, .. }` — or point the tests at it:
+
+```bash
+export MOEFLUX_SMOKE_ARTIFACTS=$M/artifacts MOEFLUX_SMOKE_ROOT=$M/root MOEFLUX_SMOKE_MLX=$M/mlx-4bit
+```
+
+The a3b oracle suites (`--include-ignored`) open the model *without* a
+cap and need ≥ 8 GiB reclaimable; `check_test_host.sh` says whether this
+host qualifies. On a smaller host, run the model only under a cap.
+
+### Chat page
+
+`tools/chat` is a local chat page for trying the model yourself
+(standalone crate; the engine gains no dependencies):
+
+```bash
+cd tools/chat
+cargo run --release -- --cap-gib 4 --n-ctx 8192   # --kv f32|f16|turbo4, --attn-threads N
+# open http://127.0.0.1:8077
+```
+
+It listens on 127.0.0.1 only and keeps one conversation in the KV
+cache, so each message prefills only the new text. The header shows
+memory against the cap and the context used; each answer shows tok/s,
+prefill speed, hot-tier hits and disk MiB per token. Thinking can be
+toggled. Stop the server (Ctrl-C) to give the memory back.
+
+### Qwen3-30B-A3B
+
+Qwen3-30B-A3B (the `qwen3_moe` architecture: 48 full-attention layers,
+128 experts, top-8, no linear attention) is **not supported yet**: it
+needs its own variant, likely closer to the OLMoE path than to the
+Qwen3.6 one. Estimated from its shape, not measured: ~16 GB of 4-bit
+experts at ~2.65 MB each, ~1 GB read per token with a cold hot tier —
+about twice Qwen3.6-35B-A3B — and 192 KiB of F32 KV per token
+(0.75 GiB at n_ctx 4096, ~0.1 GiB with Turbo4), so it would decode
+slower than Qwen3.6-35B-A3B at the same cap and gain more from a
+quantized `kv_format`.
 
 ## Provenance
 

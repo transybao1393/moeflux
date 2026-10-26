@@ -11,7 +11,7 @@ Older engine history (graph mode, prefill, kernels) is in
 | Issue | Impact | Plan |
 | --- | --- | --- |
 | `resuming_prefill_after_seq_rm_matches_full_prefill` fails. | Known: linear-attn recurrence state is not position-truncatable (a partial truncate resets the layer). | `--skip` it; see the fn-level comment and `snapshot/state.rs`. |
-| a3b / a17b model-level tests have not run on this host (no a3b weights). | Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are verified on OLMoE-1B-7B only, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
+| The uncapped a3b oracle suites and all a17b model tests have not run (this host has 5–7 GiB reclaimable; they need ≥ 8 GiB). | a3b runs under a 3–5 GiB cap: answers correct, argmax matches the MLX golden, top-20 overlap 20/20 (F32 KV) / 19/20 (Turbo4), peak within the cap (README, *Running Qwen3.6-35B-A3B on a small Mac*). Phases 1–6, `kv_format`, `attn_threads` and capped checkpoints are otherwise verified on OLMoE-1B-7B, plus unit / kernel tests on all four variants. Checkpoint buffers now come out of the cap, so a3b capped tests have less hot tier than before (≈ 0.9 GiB at n_ctx 4096, default 4); `checkpoint_restore.rs` (uncapped) exercises the rewritten store but has not run. | Run the `--include-ignored` gate on a host with the a3b model. |
 | GPU time is not measured directly. | metal-rs exposes no GPU timestamps (`CmdbufStat::gpu_ns` stays 0); only wall time and I/O wait. | — |
 
 ## Fixed
