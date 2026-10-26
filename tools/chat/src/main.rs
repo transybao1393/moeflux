@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use moeflux::{Ctx, KvFormat, OpenConfig};
+use moeflux::{Ctx, KvFormat, OpenConfig, PrefetchGuess};
 use serde_json::{Value, json};
 use tokenizers::Tokenizer;
 
@@ -255,6 +255,15 @@ fn main() {
     if let Some(n) = arg(&args, "--attn-threads") {
         cfg.attn_threads = n.parse().unwrap();
     }
+    // Guessing the next layer's experts from the current hidden state
+    // and reading 6 of them ahead: on a3b at a 3 GiB cap, decode 217 →
+    // 179 ms/tok with identical output (prefetch hits 63 → 180 per token).
+    cfg.prefetch_guess = match arg(&args, "--guess").as_deref() {
+        None | Some("cross") => PrefetchGuess::CrossLayer,
+        Some("prev") => PrefetchGuess::PrevToken,
+        Some(o) => panic!("--guess {o}: expected cross|prev"),
+    };
+    cfg.prefetch_experts = Some(arg(&args, "--prefetch").map_or(6, |v| v.parse().unwrap()));
 
     let art = base.join("artifacts");
     let tok = Tokenizer::from_file(base.join("mlx-4bit/tokenizer.json")).expect("tokenizer.json");
@@ -279,6 +288,8 @@ fn main() {
         "n_ctx": n_ctx,
         "kv_format": format!("{kv:?}"),
         "attn_threads": cfg.attn_threads,
+        "prefetch_guess": format!("{:?}", cfg.prefetch_guess),
+        "prefetch_experts": cfg.prefetch_experts,
         "open_secs": t.elapsed().as_secs_f64(),
     });
     let mut chat = Chat {

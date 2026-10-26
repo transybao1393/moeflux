@@ -226,6 +226,24 @@ argmax equal, top-20 overlap 20/20 with F32 KV and 19/20 with Turbo4
 (10 full-attention layers, 2 KV heads), so F32 KV costs little and
 Turbo4 gains nothing measurable.
 
+The table uses the default prefetch (previous token's experts, 4 per
+layer). On a3b, `prefetch_guess: PrefetchGuess::CrossLayer` — guess the
+next layer's experts from the current hidden state, so their reads start
+while the GPU is still busy — is faster with identical output (3 GiB cap,
+repeated runs):
+
+| Prefetch | Decode, short prompt | Decode at 3.3k context | I/O wait | Prefetch hits |
+| --- | --- | --- | --- | --- |
+| previous token, 4 (default) | 214–227 ms/tok (4.5 tok/s) | 267–295 ms/tok | 92–103 ms/tok | 63 / tok |
+| cross-layer, 4 | 187–189 ms/tok (5.3 tok/s) | 229–243 ms/tok | 70 ms/tok | 127 / tok |
+| cross-layer, 6 | **179 ms/tok (5.6 tok/s)** | 229 ms/tok | 68 ms/tok | 180 / tok |
+| cross-layer, 8 | 192 ms/tok | 245 ms/tok | 75 ms/tok | 218 / tok |
+
+More CPU threads do not help: `io_threads` 16 and `attn_threads` 8 match
+the defaults. The rest of a token (~105 ms) is the CPU waiting on the
+GPU's per-layer post-attention command buffer. On OLMoE-1B-7B the
+cross-layer guess did not help.
+
 ### Setup
 
 ```bash
@@ -261,7 +279,8 @@ host qualifies. On a smaller host, run the model only under a cap.
 
 ```bash
 cd tools/chat
-cargo run --release -- --cap-gib 4 --n-ctx 8192   # --kv f32|f16|turbo4, --attn-threads N
+cargo run --release -- --cap-gib 4 --n-ctx 8192
+# options: --kv f32|f16|turbo4, --attn-threads N, --guess cross|prev, --prefetch N
 # open http://127.0.0.1:8077
 ```
 
@@ -269,7 +288,9 @@ It listens on 127.0.0.1 only and keeps one conversation in the KV
 cache, so each message prefills only the new text. The header shows
 memory against the cap and the context used; each answer shows tok/s,
 prefill speed, hot-tier hits and disk MiB per token. Thinking can be
-toggled. Stop the server (Ctrl-C) to give the memory back.
+toggled. It defaults to the cross-layer guess with 6 experts prefetched
+(≈ 7 tok/s on a 115-token answer at a 4 GiB cap). Stop the server
+(Ctrl-C) to give the memory back.
 
 ### Qwen3-30B-A3B
 
