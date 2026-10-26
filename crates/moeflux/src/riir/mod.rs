@@ -81,7 +81,7 @@ pub use snapshot::state::{
 };
 pub use range::RangeVec;
 pub use requests::{ReqId, RequestTable, SeqState};
-pub use config::OpenConfig;
+pub use config::{KvFormat, OpenConfig};
 pub use io::expert_io_mode::ExpertIoMode;
 pub use variants::{VARIANT, Variant};
 
@@ -601,6 +601,15 @@ impl RsCtx<MetalBackend> {
             if config.host_buffers > 0 {
                 plan.set(budget::Account::HostBuffers, config.host_buffers);
             }
+            if config.kv_format != KvFormat::F32 {
+                let reqs = config.max_requests.max(1) as u64;
+                let kv = budget::kv_bytes_per_token_fmt(VARIANT, &layer_range, config.kv_format);
+                plan.set(budget::Account::Kv, reqs * kv * n_ctx as u64);
+                plan.set(
+                    budget::Account::KvScratch,
+                    budget::kv_scratch_bytes(VARIANT, &layer_range, n_ctx, config.kv_format),
+                );
+            }
             plan.check(cap).map_err(|detail| RsError::OverBudget { detail })?;
             // `None` → the hot tier takes whatever the plan leaves, up
             // to every expert of the range (mode B: all resident).
@@ -648,7 +657,7 @@ impl RsCtx<MetalBackend> {
             config.io_queue_depth,
             config.io_bytes_per_sec,
         ));
-        let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone());
+        let layer_states = alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format);
         // The request pool: slot 0 (the default request) is live; the
         // others' host state is allocated now, their GPU buffers with
         // the rest of the GPU resources (at open under a cap).
@@ -658,7 +667,7 @@ impl RsCtx<MetalBackend> {
                     requests::SeqState::default()
                 } else {
                     requests::SeqState {
-                        layer_states: alloc_layer_states_range(n_ctx, layer_range.clone()),
+                        layer_states: alloc_layer_states_range(n_ctx, layer_range.clone(), config.kv_format),
                         predictions: vec![None; VARIANT.num_layers],
                         ..requests::SeqState::default()
                     }
@@ -867,10 +876,17 @@ impl RsCtx<MetalBackend> {
             // lazily committed; commit it now like everything else.
             pool.touch_aligned();
             let parked = self.parked.iter().map(|s| &s.layer_states);
+            let mut scratch_touched = false;
             for states in std::iter::once(&self.layer_states).chain(parked) {
                 for layer in states.iter() {
                     match layer {
-                        LayerState::FullAttn(kv) => kv.touch(pool),
+                        LayerState::FullAttn(kv) => {
+                            kv.touch(pool);
+                            if !scratch_touched && kv.f32_scratch.is_some() {
+                                kv.touch_f32_scratch(pool);
+                                scratch_touched = true;
+                            }
+                        }
                         LayerState::Mla(mla) => mla.touch(),
                         LayerState::LinearAttn(_) => {}
                     }
@@ -1836,10 +1852,19 @@ impl RsCtx<MetalBackend> {
             } = self;
             let pool = backend.as_mut().expect("just-set").pool_mut();
             let parked = parked.iter_mut().map(|s| &mut s.layer_states);
+            // Non-F32 KV: one f32 prefill scratch shared by every layer
+            // and request slot (see `KvCache::f32_scratch`).
+            let mut f32_scratch = None;
             for states in std::iter::once(layer_states).chain(parked) {
                 for layer in states.iter_mut() {
                     if let LayerState::FullAttn(kv) = layer {
                         kv.ensure_buffers(pool);
+                        if kv.fmt != KvFormat::F32 && kv.f32_scratch.is_none() {
+                            let s = *f32_scratch.get_or_insert_with(|| {
+                                KvCache::alloc_f32_scratch(pool, kv.capacity)
+                            });
+                            kv.f32_scratch = Some(s);
+                        }
                     }
                 }
             }

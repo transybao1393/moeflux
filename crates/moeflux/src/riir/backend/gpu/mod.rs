@@ -551,6 +551,8 @@ pub struct MetalBackend {
     split_q_gate_pso: ComputePipelineState,
     rms_norm_per_head_pso: ComputePipelineState,
     kv_cache_append_pso: ComputePipelineState,
+    kv_quant_rows_pso: ComputePipelineState,
+    kv_dequant_rows_pso: ComputePipelineState,
     moe_combine_residual_n_pso: ComputePipelineState,
     moe_combine_residual_noshared_n_pso: ComputePipelineState,
     moe_bucket_accumulate_pso: ComputePipelineState,
@@ -605,6 +607,8 @@ impl MetalBackend {
         let split_q_gate_pso = metal.pipeline("split_q_gate")?.clone();
         let rms_norm_per_head_pso = metal.pipeline("rms_norm_per_head_n_tokens")?.clone();
         let kv_cache_append_pso = metal.pipeline("kv_cache_append_n_tokens")?.clone();
+        let kv_quant_rows_pso = metal.pipeline("kv_quant_rows")?.clone();
+        let kv_dequant_rows_pso = metal.pipeline("kv_dequant_rows")?.clone();
         let moe_combine_residual_n_pso = metal.pipeline("moe_combine_residual_n_tokens")?.clone();
         let moe_combine_residual_noshared_n_pso = metal
             .pipeline("moe_combine_residual_n_tokens_noshared")?
@@ -631,6 +635,8 @@ impl MetalBackend {
             split_q_gate_pso,
             rms_norm_per_head_pso,
             kv_cache_append_pso,
+            kv_quant_rows_pso,
+            kv_dequant_rows_pso,
             moe_combine_residual_n_pso,
             moe_combine_residual_noshared_n_pso,
             moe_bucket_accumulate_pso,
@@ -1000,6 +1006,52 @@ impl Backend for MetalBackend {
                     MTLSize::new(256, 1, 1),
                 );
                 enc.end_encoding();
+            }
+            Op::KvConvertRows {
+                quantize,
+                fmt,
+                k_f32,
+                v_f32,
+                k_store,
+                v_store,
+                row_start,
+                n_rows,
+                ..
+            } => {
+                let v = crate::riir::variants::VARIANT;
+                let d = v.head_dim as u32;
+                let heads = v.num_kv_heads as u32;
+                let code = fmt.code();
+                let inv_sqrt_d = 1.0f32 / (d as f32).sqrt();
+                let sqrt_d = (d as f32).sqrt();
+                let rs = *row_start;
+                let pso = if *quantize {
+                    &self.kv_quant_rows_pso
+                } else {
+                    &self.kv_dequant_rows_pso
+                };
+                for (f, st) in [
+                    (self.pool.handle(*k_f32), self.pool.handle(*k_store)),
+                    (self.pool.handle(*v_f32), self.pool.handle(*v_store)),
+                ] {
+                    let enc = cmd.new_compute_command_encoder();
+                    enc.set_compute_pipeline_state(pso);
+                    enc.set_buffer(0, Some(f), 0);
+                    enc.set_buffer(1, Some(st), 0);
+                    enc.set_bytes(2, 4, (&d as *const u32).cast());
+                    enc.set_bytes(3, 4, (&heads as *const u32).cast());
+                    enc.set_bytes(4, 4, (&rs as *const u32).cast());
+                    enc.set_bytes(5, 4, (&code as *const u32).cast());
+                    enc.set_bytes(6, 4, (&inv_sqrt_d as *const f32).cast());
+                    if *quantize {
+                        enc.set_bytes(7, 4, (&sqrt_d as *const f32).cast());
+                    }
+                    enc.dispatch_thread_groups(
+                        MTLSize::new(*n_rows as NSUInteger, heads as NSUInteger, 1),
+                        MTLSize::new(d as NSUInteger, 1, 1),
+                    );
+                    enc.end_encoding();
+                }
             }
             Op::MoeSoftmaxTopK {
                 logits,

@@ -48,6 +48,7 @@
 
 use metal::{Buffer, Device};
 
+use crate::riir::attn::kv_quant::KvFormat;
 use crate::riir::attn::linear_attn_forward::{LayerForwardBuffers, linear_layer_idx_for};
 use crate::riir::moe::deferred;
 use crate::riir::snapshot::state::{LayerState, LayerStates, MlaKvCacheGpu};
@@ -72,6 +73,14 @@ pub const SNAPSHOT_VERSION: u32 = 2;
 pub const SNAPSHOT_VERSION_RANGE: u32 = 3;
 /// v3 header size: v2 plus `layer_start`, `layer_end`.
 pub const SNAPSHOT_HEADER_V3_U32: usize = 12;
+/// Format version written when the GQA KV cache is not f32
+/// ([`crate::riir::KvFormat`]): the v3 header (range words always
+/// present) plus a `kv_format` code word; KV bodies are the stored
+/// rows, `len × fmt.row_bytes` per side. F32 contexts keep writing
+/// v2 / v3, byte-identical to before.
+pub const SNAPSHOT_VERSION_KV_FORMAT: u32 = 4;
+/// v4 header size: v3 plus `kv_format`.
+pub const SNAPSHOT_HEADER_V4_U32: usize = 13;
 /// Header is exactly this many `u32` fields. Mirrors C
 /// `MF_SNAPSHOT_HEADER_U32`. **v2 adds two trailing words**:
 /// `kv_lora_rank` and `qk_rope_head_dim`.
@@ -123,9 +132,21 @@ pub enum StateSnapshotError {
     MlaUnsupported { layer: usize },
 }
 
+/// Bytes per stored KV row (one side) in `fmt`.
 #[inline]
-fn full_attn_stride_bytes(v: &Variant) -> usize {
-    v.num_kv_heads * v.head_dim * std::mem::size_of::<f32>()
+fn full_attn_stride_bytes(v: &Variant, fmt: KvFormat) -> usize {
+    fmt.row_bytes(v)
+}
+
+/// The GQA KV format of `layer_states` (F32 when it has no GQA layer).
+fn kv_format_of(layer_states: &LayerStates) -> KvFormat {
+    layer_states
+        .iter_global()
+        .find_map(|(_, l)| match l {
+            LayerState::FullAttn(kv) => Some(kv.fmt),
+            _ => None,
+        })
+        .unwrap_or(KvFormat::F32)
 }
 
 #[inline]
@@ -190,7 +211,9 @@ fn ensure_mla_buffers(cache: &mut MlaKvCacheGpu, device: &Device) {
 /// Header words for a snapshot of `layer_states`: v2 for the whole
 /// model, v3 for a layer range.
 fn header_words_for(layer_states: &LayerStates) -> usize {
-    if crate::riir::range::is_full(&layer_states.span()) {
+    if kv_format_of(layer_states) != KvFormat::F32 {
+        SNAPSHOT_HEADER_V4_U32
+    } else if crate::riir::range::is_full(&layer_states.span()) {
         SNAPSHOT_HEADER_U32
     } else {
         SNAPSHOT_HEADER_V3_U32
@@ -200,7 +223,7 @@ fn header_words_for(layer_states: &LayerStates) -> usize {
 pub fn state_size(layer_states: &LayerStates) -> usize {
     let v = VARIANT;
     let mut n = header_words_for(layer_states) * std::mem::size_of::<u32>();
-    let fa_stride = full_attn_stride_bytes(&v);
+    let fa_stride = full_attn_stride_bytes(&v, kv_format_of(layer_states));
     let la_conv = linear_conv_bytes(&v);
     let la_ssm = linear_ssm_bytes(&v);
     for (i, layer) in layer_states.iter_global() {
@@ -253,7 +276,8 @@ pub fn state_save(
         });
     }
 
-    let fa_stride = full_attn_stride_bytes(&v);
+    let fmt = kv_format_of(layer_states);
+    let fa_stride = full_attn_stride_bytes(&v, fmt);
     let la_conv = linear_conv_bytes(&v);
     let la_ssm = linear_ssm_bytes(&v);
 
@@ -262,12 +286,12 @@ pub fn state_save(
     // Header (v2 — 10 u32 fields; v3 adds the layer range).
     let span = layer_states.span();
     let words = header_words_for(layer_states);
-    let header: [u32; SNAPSHOT_HEADER_V3_U32] = [
+    let header: [u32; SNAPSHOT_HEADER_V4_U32] = [
         SNAPSHOT_MAGIC,
-        if words == SNAPSHOT_HEADER_U32 {
-            SNAPSHOT_VERSION
-        } else {
-            SNAPSHOT_VERSION_RANGE
+        match words {
+            SNAPSHOT_HEADER_U32 => SNAPSHOT_VERSION,
+            SNAPSHOT_HEADER_V3_U32 => SNAPSHOT_VERSION_RANGE,
+            _ => SNAPSHOT_VERSION_KV_FORMAT,
         },
         v.num_layers as u32,
         v.full_attn_interval as u32,
@@ -279,6 +303,7 @@ pub fn state_save(
         v.qk_rope_head_dim as u32,
         span.start as u32,
         span.end as u32,
+        fmt.code(),
     ];
     for &word in header[..words].iter() {
         buf[off..off + 4].copy_from_slice(&word.to_le_bytes());
@@ -295,17 +320,17 @@ pub fn state_save(
                     off += 4;
                     if len > 0 {
                         let bytes = (len as usize) * fa_stride;
-                        let n = bytes / std::mem::size_of::<f32>();
                         // Phase 0b (prefill arc): KV is GPU-resident
                         // in the pool — resolve the BufId to its
                         // shared-storage buffer and read straight from
-                        // it (mirrors the MLA branch below).
+                        // it (mirrors the MLA branch below). Raw
+                        // stored rows, whatever the format.
                         let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
                         let k_buf = p.handle(kv.k_id.ok_or(StateSnapshotError::BuffersNotReady)?);
-                        read_buffer_bytes_n_f32(k_buf, &mut buf[off..off + bytes], n);
+                        read_buffer_bytes(k_buf, &mut buf[off..off + bytes]);
                         off += bytes;
                         let v_buf = p.handle(kv.v_id.ok_or(StateSnapshotError::BuffersNotReady)?);
-                        read_buffer_bytes_n_f32(v_buf, &mut buf[off..off + bytes], n);
+                        read_buffer_bytes(v_buf, &mut buf[off..off + bytes]);
                         off += bytes;
                     }
                 }
@@ -399,6 +424,7 @@ pub fn state_load(
         1 => SNAPSHOT_HEADER_V1_U32,
         2 => SNAPSHOT_HEADER_U32,
         3 => SNAPSHOT_HEADER_V3_U32,
+        4 => SNAPSHOT_HEADER_V4_U32,
         _ => {
             return Err(StateSnapshotError::BadVersion {
                 got: version,
@@ -446,7 +472,7 @@ pub fn state_load(
     // Layer range: v1/v2 snapshots cover the whole model; v3 names its
     // range, which must be exactly this context's.
     let span = layer_states.span();
-    let (snap_start, snap_end) = if version == 3 {
+    let (snap_start, snap_end) = if version >= 3 {
         (read_u32(40), read_u32(44))
     } else {
         (0, v.num_layers as u32)
@@ -466,7 +492,19 @@ pub fn state_load(
         });
     }
 
-    let fa_stride = full_attn_stride_bytes(&v);
+    // KV format: v4 names it, older versions are f32. It must be
+    // this context's (`OpenConfig::kv_format`) — rows are not
+    // converted on load.
+    let fmt = kv_format_of(layer_states);
+    let snap_fmt = if version >= 4 { read_u32(48) } else { KvFormat::F32.code() };
+    if snap_fmt != fmt.code() {
+        return Err(StateSnapshotError::ShapeMismatch {
+            field: "kv_format",
+            got: snap_fmt,
+            want: fmt.code(),
+        });
+    }
+    let fa_stride = full_attn_stride_bytes(&v, fmt);
 
     // Preflight: walk the body without mutating state. Any size
     // mismatch is caught here so a partial load doesn't leave the
@@ -592,12 +630,11 @@ pub fn state_load(
                 if len > 0 {
                     let p = pool.ok_or(StateSnapshotError::BuffersNotReady)?;
                     let bytes = (len as usize) * fa_stride;
-                    let n = bytes / std::mem::size_of::<f32>();
                     let k_buf = p.handle(kv.k_id.ok_or(StateSnapshotError::BuffersNotReady)?);
-                    write_buffer_bytes_n_f32(k_buf, &buf[off..off + bytes], n);
+                    write_buffer_bytes(k_buf, &buf[off..off + bytes]);
                     off += bytes;
                     let v_buf = p.handle(kv.v_id.ok_or(StateSnapshotError::BuffersNotReady)?);
-                    write_buffer_bytes_n_f32(v_buf, &buf[off..off + bytes], n);
+                    write_buffer_bytes(v_buf, &buf[off..off + bytes]);
                     off += bytes;
                 }
                 kv.len = len;

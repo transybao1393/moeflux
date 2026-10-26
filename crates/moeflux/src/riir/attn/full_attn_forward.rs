@@ -51,6 +51,7 @@ use crate::riir::attn::linear_attn_forward::{
 };
 use crate::riir::attn::rms_norm::rms_norm_per_head_cpu;
 use crate::riir::attn::rope::apply_rotary_emb;
+use crate::riir::attn::kv_quant::{KvFormat, quantize_row, sdpa_cpu_quant};
 use crate::riir::attn::sdpa::sdpa_cpu_with;
 use crate::riir::backend::buftype::{
     AttnInputBuf, AttnOutBuf, HiddenBuf, KProjOutBuf, OProjOutBuf, QBuf, QGateBuf, QProjOutBuf,
@@ -436,12 +437,18 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // any GPU dispatch reads the cache this layer (CMD1 above
     // committed and waited; CMD2 is built below).
     unsafe {
-        kv_state
-            .k_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
-            .copy_from_slice(&k_host);
-        kv_state
-            .v_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
-            .copy_from_slice(&v_host);
+        if kv_state.fmt == KvFormat::F32 {
+            kv_state
+                .k_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
+                .copy_from_slice(&k_host);
+            kv_state
+                .v_slice_mut(buffer_pool, cache_pos, cache_pos + 1)
+                .copy_from_slice(&v_host);
+        } else {
+            let fmt = kv_state.fmt;
+            quantize_row(fmt, &v, &k_host, kv_state.k_rows_mut(buffer_pool, cache_pos, cache_pos + 1));
+            quantize_row(fmt, &v, &v_host, kv_state.v_rows_mut(buffer_pool, cache_pos, cache_pos + 1));
+        }
     }
     kv_state.len += 1;
 
@@ -471,7 +478,10 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
     // mode (a3b — fits RAM, no streaming pressure) keep GPU SDPA: ~17%
     // faster full-attn with no eviction.
     let kv_len = kv_state.len;
+    // A quantized cache (`kv_format` ≠ F32) always takes the CPU
+    // path, which reads the stored rows directly.
     let gpu_attn_ready = fa_idx.is_some()
+        && kv_state.fmt == KvFormat::F32
         && kv_len >= 32
         && (kv_len as usize) < crate::riir::variants::GPU_KV_SEQ
         && !gpu.expert_io_mode.is_pread();
@@ -499,6 +509,25 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
         // CPU SDPA fallback. Slice the caches to the occupied prefix
         // and stage the result into batch_out[6] for o_proj.
         let mut attn_out = vec![0.0f32; q_dim];
+        if kv_state.fmt != KvFormat::F32 {
+            // SAFETY: as below — no GPU work in flight on the cache.
+            let (k_rows, v_rows) = unsafe {
+                (
+                    &*kv_state.k_rows_mut(buffer_pool, 0, kv_len as usize),
+                    &*kv_state.v_rows_mut(buffer_pool, 0, kv_len as usize),
+                )
+            };
+            sdpa_cpu_quant(
+                &v,
+                kv_state.fmt,
+                kv_len as usize,
+                &q_host,
+                q_gate_host.as_deref(),
+                k_rows,
+                v_rows,
+                &mut attn_out,
+            );
+        } else {
         // SAFETY: shared-storage KV buffers; CPU SDPA fallback runs
         // with no GPU work in flight on the cache (CMD1 committed and
         // waited above; CMD2 not yet built).
@@ -516,6 +545,7 @@ pub(in crate::riir) fn full_attn_pre_moe_layer_forward(
             v_prefix,
             &mut attn_out,
         )?;
+        }
 
         let dst = buffer_pool.handle(buffers.o_proj_stack).contents() as *mut f32;
         // SAFETY: shared-storage; no GPU work in flight (CMD1
@@ -913,21 +943,47 @@ where
             rotary_dim,
             start_pos,
         });
+        // A quantized cache: append the new f32 rows to the shared f32
+        // scratch, quantize them into the store, then dequantize the
+        // whole attended prefix back into the scratch — so prefill
+        // attends the same rounded K/V decode will.
+        let (sdpa_k, sdpa_v) = match kv_state.f32_scratch {
+            Some(f) if kv_state.fmt != KvFormat::F32 => f,
+            _ => (k_cache_id, v_cache_id),
+        };
         g.push(Op::KvCacheAppendNTokens {
             label: "full_attn.kv_append",
             k_src: scratch.k_proj_stack,
             v_src: scratch.v_proj_stack,
-            k_cache: k_cache_id,
-            v_cache: v_cache_id,
+            k_cache: sdpa_k,
+            v_cache: sdpa_v,
             kv_dim: kv_dim as u32,
             n_tokens: n,
             kv_start: kv_start as u32,
         });
+        if sdpa_k != k_cache_id {
+            for (label, quantize, row_start, n_rows) in [
+                ("full_attn.kv_quant", true, kv_start as u32, n),
+                ("full_attn.kv_dequant", false, 0, kv_start as u32 + n),
+            ] {
+                g.push(Op::KvConvertRows {
+                    label,
+                    quantize,
+                    fmt: kv_state.fmt,
+                    k_f32: sdpa_k,
+                    v_f32: sdpa_v,
+                    k_store: k_cache_id,
+                    v_store: v_cache_id,
+                    row_start,
+                    n_rows,
+                });
+            }
+        }
         g.push(Op::SdpaCausalTiled {
             label: "full_attn.sdpa",
             q: scratch.q_stack,
-            k: k_cache_id,
-            v: v_cache_id,
+            k: sdpa_k,
+            v: sdpa_v,
             attn_out: scratch.attn_out_stack,
             n_tokens: n,
             num_heads: num_attn_heads,

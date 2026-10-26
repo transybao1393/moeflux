@@ -25,6 +25,7 @@
 
 use metal::{Buffer, Device, MTLResourceOptions, NSUInteger};
 
+use crate::riir::attn::kv_quant::KvFormat;
 use crate::riir::backend::buftype::{KvCacheKBuf, KvCacheVBuf};
 use crate::riir::backend::gpu::MetalBufferPool;
 use crate::riir::backend::{BufId, BufferPool};
@@ -73,24 +74,75 @@ pub struct KvCache {
     /// Maximum number of positions the buffers hold (the context's
     /// `n_ctx`). Appends past it fail with a cache-overflow error.
     pub capacity: usize,
+    /// Row format of `k_id` / `v_id` ([`crate::riir::OpenConfig::kv_format`]).
+    /// Non-F32 rows are `fmt.row_bytes` each; the f32 slice accessors
+    /// are F32-only.
+    pub fmt: KvFormat,
+    /// Non-F32 only: the f32 `[capacity, kv_dim]` attention scratch
+    /// batched prefill dequantizes the prefix into for
+    /// `SdpaCausalTiled`. One pair shared by every full-attn layer
+    /// (layers run in order), set by `ensure_linear_resources`.
+    pub f32_scratch: Option<(BufId<KvCacheKBuf>, BufId<KvCacheVBuf>)>,
 }
 
 impl KvCache {
     /// Construct an empty cache without GPU buffers. Buffers are
     /// allocated lazily by [`Self::ensure_buffers`] once the pool
     /// exists.
-    pub fn new(capacity: usize) -> Self {
+    pub fn new(capacity: usize, fmt: KvFormat) -> Self {
         Self {
             k_id: None,
             v_id: None,
             len: 0,
             capacity: clamp_n_ctx(capacity),
+            fmt,
+            f32_scratch: None,
         }
     }
 
     /// Bytes per side (K or V) at this cache's capacity.
     pub fn bytes_per_side(&self) -> usize {
-        self.capacity * VARIANT.num_kv_heads * VARIANT.head_dim * std::mem::size_of::<f32>()
+        self.capacity * self.fmt.row_bytes(&VARIANT)
+    }
+
+    /// Stored bytes of K rows `[start_row, end_row)` (any format).
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::k_slice`].
+    pub unsafe fn k_rows_mut<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+        start_row: usize,
+        end_row: usize,
+    ) -> &'p mut [u8] {
+        let buf = pool.handle(self.k_id.expect("k_rows_mut called before ensure_buffers"));
+        let rb = self.fmt.row_bytes(&VARIANT);
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            let p = (buf.contents() as *mut u8).add(start_row * rb);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * rb)
+        }
+    }
+
+    /// V counterpart of [`Self::k_rows_mut`].
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::k_slice`].
+    pub unsafe fn v_rows_mut<'p>(
+        &self,
+        pool: &'p MetalBufferPool,
+        start_row: usize,
+        end_row: usize,
+    ) -> &'p mut [u8] {
+        let buf = pool.handle(self.v_id.expect("v_rows_mut called before ensure_buffers"));
+        let rb = self.fmt.row_bytes(&VARIANT);
+        // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
+        unsafe {
+            let p = (buf.contents() as *mut u8).add(start_row * rb);
+            std::slice::from_raw_parts_mut(p, (end_row - start_row) * rb)
+        }
     }
 
     /// Register the shared-storage K/V buffers into `pool` if not
@@ -127,6 +179,35 @@ impl KvCache {
                 "kv.v_cache allocation failed: {bytes} bytes (out of device memory?)"
             );
             self.v_id = Some(pool.register_borrowed(buf, bytes, "kv.v_cache", true));
+        }
+    }
+
+    /// Register the shared f32 prefill scratch for a non-F32 cache of
+    /// `capacity` rows ([`Self::f32_scratch`]): `capacity * kv_dim`
+    /// f32 per side, lazily committed like the cache itself.
+    pub fn alloc_f32_scratch(
+        pool: &mut MetalBufferPool,
+        capacity: usize,
+    ) -> (BufId<KvCacheKBuf>, BufId<KvCacheVBuf>) {
+        let bytes = capacity * VARIANT.num_kv_heads * VARIANT.head_dim * 4;
+        let device = pool.device().clone();
+        let new = |label| {
+            let buf = device.new_buffer(bytes as NSUInteger, MTLResourceOptions::StorageModeShared);
+            assert!(!buf.contents().is_null(), "{label} allocation failed: {bytes} bytes");
+            (buf, label)
+        };
+        let (k, kl) = new("kv.k_f32_scratch");
+        let (v, vl) = new("kv.v_f32_scratch");
+        (pool.register_borrowed(k, bytes, kl, true), pool.register_borrowed(v, bytes, vl, true))
+    }
+
+    /// Commit the f32 prefill scratch ([`Self::touch`] for it).
+    pub fn touch_f32_scratch(&self, pool: &MetalBufferPool) {
+        let Some((k, v)) = self.f32_scratch else { return };
+        for b in [pool.handle(k), pool.handle(v)] {
+            // SAFETY: shared-storage buffer of `length()` bytes; caller
+            // guarantees no in-flight GPU use.
+            unsafe { std::ptr::write_bytes(b.contents() as *mut u8, 0, b.length() as usize) };
         }
     }
 
@@ -172,6 +253,7 @@ impl KvCache {
     /// Caller must guarantee no GPU work is reading or writing the
     /// underlying buffer concurrently.
     pub unsafe fn k_slice<'p>(&self, pool: &'p MetalBufferPool, len: usize) -> &'p [f32] {
+        debug_assert_eq!(self.fmt, KvFormat::F32, "f32 KV accessor on a quantized cache");
         let buf = pool.handle(self.k_id.expect("k_slice called before ensure_buffers"));
         let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
@@ -193,6 +275,7 @@ impl KvCache {
         start_row: usize,
         end_row: usize,
     ) -> &'p mut [f32] {
+        debug_assert_eq!(self.fmt, KvFormat::F32, "f32 KV accessor on a quantized cache");
         let buf = pool.handle(self.k_id.expect("k_slice_mut called before ensure_buffers"));
         let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
@@ -208,6 +291,7 @@ impl KvCache {
     ///
     /// See [`Self::k_slice`].
     pub unsafe fn v_slice<'p>(&self, pool: &'p MetalBufferPool, len: usize) -> &'p [f32] {
+        debug_assert_eq!(self.fmt, KvFormat::F32, "f32 KV accessor on a quantized cache");
         let buf = pool.handle(self.v_id.expect("v_slice called before ensure_buffers"));
         let n = len * VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
@@ -225,6 +309,7 @@ impl KvCache {
         start_row: usize,
         end_row: usize,
     ) -> &'p mut [f32] {
+        debug_assert_eq!(self.fmt, KvFormat::F32, "f32 KV accessor on a quantized cache");
         let buf = pool.handle(self.v_id.expect("v_slice_mut called before ensure_buffers"));
         let stride = VARIANT.num_kv_heads * VARIANT.head_dim;
         // SAFETY: caller upholds the no-concurrent-GPU-work invariant.
@@ -547,23 +632,28 @@ impl LayerState {
 ///
 /// `n_ctx` sizes every KV cache (clamped to `[1, MAX_SEQ_LEN]`).
 pub fn alloc_layer_states(n_ctx: usize) -> Vec<LayerState> {
-    (0..VARIANT.num_layers).map(|i| new_layer_state(i, n_ctx)).collect()
+    (0..VARIANT.num_layers).map(|i| new_layer_state(i, n_ctx, KvFormat::F32)).collect()
 }
 
 /// Per-layer state of one sequence, indexed by global layer index and
 /// holding only the context's layer range (plan phase 3).
 pub type LayerStates = RangeVec<LayerState>;
 
-/// [`alloc_layer_states`] for the layers in `range` only.
-pub fn alloc_layer_states_range(n_ctx: usize, range: std::ops::Range<usize>) -> LayerStates {
-    RangeVec::from_fn(range, |i| new_layer_state(i, n_ctx))
+/// [`alloc_layer_states`] for the layers in `range` only, GQA KV
+/// caches stored as `fmt`.
+pub fn alloc_layer_states_range(
+    n_ctx: usize,
+    range: std::ops::Range<usize>,
+    fmt: KvFormat,
+) -> LayerStates {
+    RangeVec::from_fn(range, |i| new_layer_state(i, n_ctx, fmt))
 }
 
-fn new_layer_state(i: usize, n_ctx: usize) -> LayerState {
+fn new_layer_state(i: usize, n_ctx: usize, fmt: KvFormat) -> LayerState {
     use crate::riir::variants::{AttnKind, LayerKind};
     match VARIANT.layer_kind(i) {
         LayerKind::FullAttn => match VARIANT.attn_kind {
-            AttnKind::Gqa => LayerState::FullAttn(KvCache::new(n_ctx)),
+            AttnKind::Gqa => LayerState::FullAttn(KvCache::new(n_ctx, fmt)),
             AttnKind::Mla => LayerState::Mla(MlaKvCacheGpu::new(n_ctx)),
         },
         LayerKind::LinearAttn => LayerState::LinearAttn(LinearAttnState::new()),
@@ -638,7 +728,7 @@ mod tests {
     fn range_states_match_full_allocation() {
         let n = VARIANT.num_layers;
         let full = alloc_layer_states(64);
-        let part = alloc_layer_states_range(64, n / 2..n);
+        let part = alloc_layer_states_range(64, n / 2..n, KvFormat::F32);
         assert_eq!(part.len(), n - n / 2);
         for (i, s) in part.iter_global() {
             assert_eq!(s.is_full(), full[i].is_full(), "layer {i}");
@@ -663,13 +753,13 @@ mod tests {
     /// byte size scales with it (no `MAX_SEQ_LEN` reservation).
     #[test]
     fn kv_capacity_clamped_and_bytes_scale() {
-        assert_eq!(KvCache::new(0).capacity, 1);
-        assert_eq!(KvCache::new(MAX_SEQ_LEN + 7).capacity, MAX_SEQ_LEN);
+        assert_eq!(KvCache::new(0, KvFormat::F32).capacity, 1);
+        assert_eq!(KvCache::new(MAX_SEQ_LEN + 7, KvFormat::F32).capacity, MAX_SEQ_LEN);
         assert_eq!(MlaKvCacheGpu::new(0).capacity, 1);
-        let small = KvCache::new(1024);
+        let small = KvCache::new(1024, KvFormat::F32);
         let row = VARIANT.num_kv_heads * VARIANT.head_dim * std::mem::size_of::<f32>();
         assert_eq!(small.bytes_per_side(), 1024 * row);
-        assert_eq!(KvCache::new(2048).bytes_per_side(), 2 * small.bytes_per_side());
+        assert_eq!(KvCache::new(2048, KvFormat::F32).bytes_per_side(), 2 * small.bytes_per_side());
     }
 
     /// Empty state on a fresh allocation: pos_max returns 0 (the

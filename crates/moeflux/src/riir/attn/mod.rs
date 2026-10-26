@@ -1,5 +1,6 @@
 pub mod full_attn_forward;
 pub mod gpu_attn;
+pub mod kv_quant;
 pub mod gpu_linear_attn;
 pub mod gpu_mla;
 pub mod gpu_rope;

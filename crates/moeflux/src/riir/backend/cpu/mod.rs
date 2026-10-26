@@ -26,7 +26,7 @@ use crate::riir::io::weight_file::WeightFile;
 use crate::riir::moe::moe_cpu::moe_permute_fuse_cpu;
 use crate::riir::variants::{GROUP_SIZE, VARIANT};
 
-use super::buftype::Buf;
+use super::buftype::{Buf, KvCacheKBuf};
 use super::{Backend, BufId, BufferPool, Graph, GraphError, Op};
 
 /// CPU buffer pool: physical storage is `Vec<RefCell<Vec<u8>>>`,
@@ -884,6 +884,40 @@ impl Backend for CpuBackend {
                     let v_src_buf = self.read_f32(*v_src);
                     let mut v_cache_buf = self.write_f32(*v_cache);
                     v_cache_buf[start..start + len].copy_from_slice(&v_src_buf[..len]);
+                }
+            }
+            Op::KvConvertRows {
+                quantize,
+                fmt,
+                k_f32,
+                v_f32,
+                k_store,
+                v_store,
+                row_start,
+                n_rows,
+                ..
+            } => {
+                use crate::riir::attn::kv_quant::{dequantize_row, quantize_row};
+                let v = crate::riir::variants::VARIANT;
+                let kv_dim = v.num_kv_heads * v.head_dim;
+                let rb = fmt.row_bytes(&v);
+                let rows = *row_start as usize..(*row_start + *n_rows) as usize;
+                for (f, st) in [(k_f32.raw(), k_store.raw()), (v_f32.raw(), v_store.raw())] {
+                    let f = BufId::<KvCacheKBuf>::from_raw(f);
+                    let st = BufId::<KvCacheKBuf>::from_raw(st);
+                    if *quantize {
+                        let src = self.read_f32(f);
+                        let mut dst = self.write_bytes(st);
+                        for r in rows.clone() {
+                            quantize_row(*fmt, &v, &src[r * kv_dim..(r + 1) * kv_dim], &mut dst[r * rb..(r + 1) * rb]);
+                        }
+                    } else {
+                        let src = self.read_bytes(st);
+                        let mut dst = self.write_f32(f);
+                        for r in rows.clone() {
+                            dequantize_row(*fmt, &v, &src[r * rb..(r + 1) * rb], &mut dst[r * kv_dim..(r + 1) * kv_dim]);
+                        }
+                    }
                 }
             }
             Op::RopeNTokens {

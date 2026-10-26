@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 
 use moeflux::riir::budget::footprint;
-use moeflux::{Ctx, Error, OpenConfig};
+use moeflux::{Ctx, Error, KvFormat, OpenConfig};
 
 const VOCAB: usize = 50_304;
 const EOS: i32 = 50_279;
@@ -48,12 +48,17 @@ fn open() -> Result<Ctx, Error> {
 }
 
 fn open_capped(cap: u64, hot_tier_bytes: Option<u64>) -> Result<Ctx, Error> {
+    open_with(cap, hot_tier_bytes, KvFormat::F32)
+}
+
+fn open_with(cap: u64, hot_tier_bytes: Option<u64>, kv_format: KvFormat) -> Result<Ctx, Error> {
     let dir = model_dir();
     let art = dir.join("artifacts");
     let cfg = OpenConfig {
         n_ctx: 2048,
         mem_cap: Some(cap),
         hot_tier_bytes,
+        kv_format,
         ..OpenConfig::default()
     };
     Ctx::open_with(
@@ -203,4 +208,106 @@ fn olmoe_cap_3gib_peak_is_planned_at_open() {
     run_in_child("olmoe_cap_3gib_peak_is_planned_at_open", || {
         peak_stays_at_open(3 << 30, Some(HOT_TIER_3G))
     });
+}
+
+/// Prefill + greedy decode of `steps` tokens; returns the tokens and
+/// every step's logits.
+fn greedy(ctx: &mut Ctx, steps: usize) -> Result<(Vec<i32>, Vec<Vec<f32>>), Error> {
+    let mut logits = vec![0.0f32; VOCAB];
+    ctx.eval_prompt(PROMPT, 0, 0, &mut logits)?;
+    let (mut toks, mut all) = (Vec::new(), Vec::new());
+    let mut pos = PROMPT.len();
+    for _ in 0..steps {
+        let tok = argmax(&logits);
+        toks.push(tok);
+        all.push(logits.clone());
+        ctx.eval_token(tok, pos, 0, &mut logits)?;
+        pos += 1;
+    }
+    Ok((toks, all))
+}
+
+/// Each quantized KV format decodes the MLX reference answer and
+/// keeps its logits close to the f32 cache's.
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_kv_formats_track_f32() -> Result<(), Error> {
+    let (ref_toks, ref_logits) = greedy(&mut open()?, REF_TOKENS.len())?;
+    assert_eq!(ref_toks, REF_TOKENS);
+    for fmt in [KvFormat::F16, KvFormat::Turbo4, KvFormat::Turbo3] {
+        let (toks, logits) = greedy(&mut open_with(3 << 30, Some(HOT_TIER_3G), fmt)?, REF_TOKENS.len())?;
+        let cos: Vec<f64> = logits.iter().zip(&ref_logits).map(|(a, b)| cosine(a, b)).collect();
+        let min = cos.iter().copied().fold(1.0, f64::min);
+        eprintln!(
+            "[olmoe-kv] {fmt:?}: tokens {toks:?}, logits cos vs f32: prefill {:.6}, min {min:.6}",
+            cos[0]
+        );
+        assert_eq!(toks, REF_TOKENS, "{fmt:?} diverges from the reference answer");
+        // Measured (2026-10-26): F16 0.999999, Turbo4 0.9928.
+        let bound = match fmt {
+            KvFormat::F16 => 0.9999,
+            KvFormat::Turbo4 => 0.98,
+            _ => 0.95,
+        };
+        assert!(min > bound, "{fmt:?}: logits cos {min} ≤ {bound}");
+    }
+    Ok(())
+}
+
+/// Batched prefill (GPU quantize) and per-token decode (CPU
+/// quantize) agree for a quantized cache.
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_kv_quant_batched_matches_per_token() -> Result<(), Error> {
+    for fmt in [KvFormat::F16, KvFormat::Turbo4, KvFormat::Turbo3] {
+        let mut batched = vec![0.0f32; VOCAB];
+        open_with(3 << 30, Some(HOT_TIER_3G), fmt)?.eval_prompt(PROMPT, 0, 0, &mut batched)?;
+        let mut per_token = vec![0.0f32; VOCAB];
+        let mut ctx = open_with(3 << 30, Some(HOT_TIER_3G), fmt)?;
+        for (pos, &tok) in PROMPT.iter().enumerate() {
+            ctx.eval_token(tok, pos, 0, &mut per_token)?;
+        }
+        let cos = cosine(&batched, &per_token);
+        eprintln!("[olmoe-kv] {fmt:?} batched vs per-token: cos={cos:.6}");
+        assert_eq!(argmax(&batched), argmax(&per_token), "{fmt:?}");
+        // The two paths quantize K/V that differ in the last bits, so
+        // a few codes land on the other side of a level boundary.
+        // Measured (2026-10-26): F16 1.000000, Turbo4 0.9975.
+        let bound = if fmt == KvFormat::F16 { 0.999 } else { 0.99 };
+        assert!(cos > bound, "{fmt:?}: cosine {cos}");
+    }
+    Ok(())
+}
+
+/// A quantized cache snapshots its stored rows (v4) and restores to
+/// bit-identical decode; an f32 context refuses the snapshot.
+#[test]
+#[ignore = "needs the OLMoE-1B-7B model on disk"]
+fn olmoe_kv_quant_snapshot_round_trips() -> Result<(), Error> {
+    let fmt = KvFormat::Turbo4;
+    let mut a = open_with(3 << 30, Some(HOT_TIER_3G), fmt)?;
+    let mut logits = vec![0.0f32; VOCAB];
+    a.eval_prompt(PROMPT, 0, 0, &mut logits)?;
+    let mut snap = vec![0u8; a.state_size()];
+    let n = a.state_save(&mut snap).expect("save");
+    assert_eq!(n, snap.len());
+    assert_eq!(u32::from_le_bytes(snap[4..8].try_into().unwrap()), 4, "v4 header");
+    let tok = argmax(&logits);
+    let mut after_a = vec![0.0f32; VOCAB];
+    a.eval_token(tok, PROMPT.len(), 0, &mut after_a)?;
+    drop(a);
+
+    let mut b = open_with(3 << 30, Some(HOT_TIER_3G), fmt)?;
+    b.memory_clear();
+    b.state_load(&snap).expect("load");
+    let mut after_b = vec![0.0f32; VOCAB];
+    b.eval_token(tok, PROMPT.len(), 0, &mut after_b)?;
+    assert_eq!(after_a, after_b, "restored decode differs");
+    drop(b);
+
+    let mut f = open()?;
+    f.memory_clear();
+    let err = f.state_load(&snap).expect_err("f32 context must refuse a Turbo4 snapshot");
+    eprintln!("[olmoe-kv] f32 load of a Turbo4 snapshot: {err}");
+    Ok(())
 }

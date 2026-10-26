@@ -23,6 +23,7 @@
 
 use std::ops::Range;
 
+use crate::riir::attn::kv_quant::KvFormat;
 use crate::riir::io::expert_io_mode::ExpertIoMode;
 use crate::riir::moe::expert_forward::MAX_K;
 use crate::riir::variants::{AttnKind, LayerKind, VARIANT, Variant};
@@ -47,8 +48,12 @@ pub const DEFAULT_RUNTIME_OVERHEAD: u64 = GIB / 2;
 pub enum Account {
     /// Non-expert weights (`model_weights.bin`).
     Weights,
-    /// Full-attention KV caches at `n_ctx`, for every request slot.
+    /// Full-attention KV caches at `n_ctx`, for every request slot,
+    /// in the context's [`KvFormat`].
     Kv,
+    /// The f32 attention scratch a non-F32 KV cache dequantizes into
+    /// during batched prefill ([`kv_scratch_bytes`]); one, shared.
+    KvScratch,
     /// Linear-attention conv + recurrence state (host + GPU copies),
     /// for every request slot.
     LinearState,
@@ -74,6 +79,7 @@ impl Account {
         match self {
             Account::Weights => "weights",
             Account::Kv => "kv",
+            Account::KvScratch => "kv_scratch",
             Account::LinearState => "linear_state",
             Account::ExpertSlots => "expert_slots",
             Account::PrefillStaging => "prefill_staging",
@@ -103,16 +109,34 @@ pub fn kv_bytes_per_token(v: Variant) -> u64 {
 
 /// [`kv_bytes_per_token`] over the full-attn layers in `range` only.
 pub fn kv_bytes_per_token_in(v: Variant, range: &Range<usize>) -> u64 {
+    kv_bytes_per_token_fmt(v, range, KvFormat::F32)
+}
+
+/// [`kv_bytes_per_token_in`] with GQA rows stored as `fmt`.
+pub fn kv_bytes_per_token_fmt(v: Variant, range: &Range<usize>, fmt: KvFormat) -> u64 {
     let f32b = std::mem::size_of::<f32>() as u64;
-    let full_layers = range
-        .clone()
-        .filter(|&i| v.layer_kind(i) == LayerKind::FullAttn)
-        .count() as u64;
     let per_layer = match v.attn_kind {
-        AttnKind::Gqa => 2 * (v.num_kv_heads * v.head_dim) as u64 * f32b,
+        AttnKind::Gqa => 2 * fmt.row_bytes(&v) as u64,
         AttnKind::Mla => (v.kv_lora_rank + v.qk_rope_head_dim) as u64 * f32b,
     };
-    full_layers * per_layer
+    full_attn_layers_in(v, range) * per_layer
+}
+
+fn full_attn_layers_in(v: Variant, range: &Range<usize>) -> u64 {
+    range
+        .clone()
+        .filter(|&i| v.layer_kind(i) == LayerKind::FullAttn)
+        .count() as u64
+}
+
+/// [`Account::KvScratch`]: the f32 K + V prefill scratch at `n_ctx`
+/// a non-F32 cache needs (`KvCache::f32_scratch`); 0 for F32 or a
+/// range without GQA layers.
+pub fn kv_scratch_bytes(v: Variant, range: &Range<usize>, n_ctx: usize, fmt: KvFormat) -> u64 {
+    if fmt == KvFormat::F32 || v.attn_kind != AttnKind::Gqa || full_attn_layers_in(v, range) == 0 {
+        return 0;
+    }
+    2 * n_ctx as u64 * (v.num_kv_heads * v.head_dim) as u64 * 4
 }
 
 /// Linear-attn state bytes (host `LinearAttnState` + GPU mirror).

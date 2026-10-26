@@ -265,6 +265,49 @@ which print the stats CSV; flip a default only after it wins there.
   `runtime_overhead`; the decode additions are atomics and fixed
   arrays (hot-tier lookups still take the tier's existing mutex).
 
+### KV cache formats (`OpenConfig::kv_format`)
+
+The GQA KV cache can be stored as `F32` (default, byte-identical to
+before), `F16`, or TurboQuant MSE (`Turbo4` / `Turbo3`: a fixed random
+rotation `H·D/√d`, then each coordinate rounded to the Lloyd–Max
+levels of N(0,1), plus one f32 scale per head; `attn/kv_quant.rs`).
+MLA (Cogito) stays F32; Turbo needs a power-of-two `head_dim`.
+
+- **Decode** quantizes the new row on the CPU and reads stored rows
+  directly (`sdpa_cpu_quant`; Turbo works in the rotated space, F16
+  converts with `fcvtl`). The GPU SDPA fast path is F32-only.
+- **Prefill** writes new f32 rows into one shared f32 scratch,
+  quantizes them into the store and dequantizes the attended prefix
+  back (`Op::KvConvertRows`, Metal `kv_quant_rows` /
+  `kv_dequant_rows`), so the flash SDPA kernel is unchanged and prefill
+  attends the same rounded K/V decode will.
+- **Budget:** `Account::Kv` per format, plus `Account::KvScratch`
+  (2 × n_ctx × kv_dim × 4, one shared), touched at open.
+- **Snapshots:** non-F32 writes v4 (v3 header + `kv_format` word, raw
+  stored rows); loading into a context of another format is refused
+  (`ShapeMismatch { field: "kv_format" }`).
+
+Measured on OLMoE-1B-7B, 3 GiB cap, auto hot tier, n_ctx 4096 (one
+process per run; needle = 2,651-token record list, answer 7780;
+4 prompts × 256 tokens):
+
+| Format | KV + scratch | Hot tier | Needle | Greedy = F32 until token (story/code/explain/list) | Decode ms/tok (needle) |
+| --- | --- | --- | --- | --- | --- |
+| F32 | 1.00 GiB | 0.69 GiB | ✓ | — | 148.5 (309.5) |
+| F16 | 0.50 + 0.06 GiB | 1.13 GiB | ✓ | 183 / all / all / all | 114.7 (215.9) |
+| Turbo4 | 0.13 + 0.06 GiB | 1.49 GiB | ✓ | 19 / 19 / 9 / 3 | 102.9 (202.7) |
+| Turbo3 | 0.10 + 0.06 GiB | 1.53 GiB | ✓ | 11 / 6 / 9 / 3 | 106.5 (223.9) |
+
+Logits cosine vs F32 on the short smoke prompt: F16 0.999999, Turbo4
+0.9928, Turbo3 0.9780; all three give the MLX reference answer. Turbo
+outputs drift from F32's wording early but stay coherent (same
+lists/stories, different phrasing). Relative MSE per head matches
+Lloyd–Max (4-bit 0.0083 vs 0.0095 theory, 3-bit 0.030 vs 0.0345);
+Metal matches the CPU reference to ~1e-13. Per-layer decode SDPA at
+2,700 positions: F32 4.45 ms, F16 4.40, Turbo4 4.56, Turbo3 5.76 (CPU,
+single-threaded — at long context this is ~half of decode time for
+every format; parallelizing it over heads is open).
+
 | # | Phase | Work | Exit criteria |
 | --- | --- | --- | --- |
 | 0 | Baseline + telemetry | Run a3b on M4 (mmap and pread, with/without `purge`) and one M1. Add streaming counters: bytes read per token/tier, hits per layer, I/O wait vs GPU time, guess accuracy; CSV output from `profile_smoke.sh`. Routing profile pass. Measure runtime overhead, SSD bandwidth (internal and external), 4 KB / 8 KB frame round-trip M4↔M1 | Baseline CSV; overhead number; expert popularity curve |

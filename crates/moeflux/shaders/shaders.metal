@@ -3583,6 +3583,154 @@ kernel void kv_cache_append_n_tokens(
 
 
 // ============================================================================
+// Kernels: quantized KV cache rows (`attn::kv_quant`, `Op::KvConvertRows`)
+// ============================================================================
+// One threadgroup per (row, kv head), `head_dim` threads (a power of
+// two ≤ 1024). `fmt`: 1 = f16, 2 = TurboQuant 4-bit, 3 = TurboQuant
+// 3-bit. A Turbo head record is `[f32 scale][codes]`, codes packed
+// little-endian at `bits * j`. The rotation `R = H·D / √d` and the
+// Lloyd–Max levels match `kv_quant.rs` exactly; only the reductions
+// (norm, scale) differ in summation order from the CPU reference.
+
+constant float KV_LEVELS3[4] = {0.2450942f, 0.7560053f, 1.3439093f, 2.1519457f};
+constant float KV_LEVELS4[8] = {0.1283950f, 0.3880483f, 0.6567591f, 0.9423405f,
+                                1.2562312f, 1.6180464f, 2.0690172f, 2.7325896f};
+
+static inline float kv_sign(uint i) {
+    uint h = i * 0x9E3779B1u;
+    h ^= h >> 16;
+    h *= 0x85EBCA6Bu;
+    h ^= h >> 13;
+    return (h & 1u) == 0u ? 1.0f : -1.0f;
+}
+
+static inline uint kv_head_bytes(uint fmt, uint d) {
+    return fmt == 1u ? d * 2u : (fmt == 2u ? 4u + d / 2u : 4u + d * 3u / 8u);
+}
+
+// In-place unnormalized FWHT over `y[0..d)`; same butterflies as `fwht`.
+static inline void kv_fwht(threadgroup float* y, uint d, uint j) {
+    for (uint h = 1; h < d; h <<= 1) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if ((j & h) == 0u) {
+            float a = y[j], b = y[j + h];
+            y[j] = a + b;
+            y[j + h] = a - b;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+static inline float kv_tg_sum(float v, threadgroup float* part, uint j, uint d) {
+    float s = simd_sum(v);
+    uint lane = j % 32u, sg = j / 32u, nsg = (d + 31u) / 32u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane == 0u) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float t = 0.0f;
+    for (uint k = 0; k < nsg; k++) t += part[k];
+    return t;
+}
+
+kernel void kv_quant_rows(
+    device const float* src      [[buffer(0)]],  // [n_ctx, kv_heads * d] f32
+    device uchar*       store    [[buffer(1)]],  // [n_ctx, row_bytes]
+    constant uint&      d        [[buffer(2)]],
+    constant uint&      kv_heads [[buffer(3)]],
+    constant uint&      row_start[[buffer(4)]],
+    constant uint&      fmt      [[buffer(5)]],
+    constant float&     inv_sqrt_d [[buffer(6)]],
+    constant float&     sqrt_d   [[buffer(7)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tj [[thread_position_in_threadgroup]]
+) {
+    uint j = tj.x;
+    threadgroup float y[1024];
+    threadgroup uchar codes[1024];
+    threadgroup float part[32];
+    uint row = row_start + tg.x, head = tg.y;
+    uint hb = kv_head_bytes(fmt, d);
+    float x = src[(row * kv_heads + head) * d + j];
+    device uchar* rec = store + (row * kv_heads + head) * hb;
+    if (fmt == 1u) {
+        ((device half*)rec)[j] = half(x);
+        return;
+    }
+    y[j] = x * kv_sign(j);
+    kv_fwht(y, d, j);
+    float yj = y[j] * inv_sqrt_d;
+    float norm = sqrt(kv_tg_sum(yj * yj, part, j, d));
+    uint n = fmt == 2u ? 8u : 4u;
+    constant float* lv = fmt == 2u ? KV_LEVELS4 : KV_LEVELS3;
+    uint c = 0u;
+    float l = 0.0f;
+    if (norm > 0.0f) {
+        float u = yj * (sqrt_d / norm);
+        float a = fabs(u);
+        uint k = 0u;
+        while (k + 1u < n && a > 0.5f * (lv[k] + lv[k + 1u])) k++;
+        c = u < 0.0f ? n - 1u - k : n + k;
+        l = u < 0.0f ? -lv[k] : lv[k];
+    }
+    codes[j] = uchar(c);
+    float yc = kv_tg_sum(yj * l, part, j, d);
+    float cc = kv_tg_sum(l * l, part, j, d);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device uchar* out = rec + 4;
+    if (fmt == 2u) {
+        if (j < d / 2u) out[j] = codes[2u * j] | (codes[2u * j + 1u] << 4);
+    } else if (j < d / 8u) {
+        uint v = 0u;
+        for (uint k = 0; k < 8u; k++) v |= uint(codes[8u * j + k]) << (3u * k);
+        out[3u * j] = uchar(v & 0xffu);
+        out[3u * j + 1u] = uchar((v >> 8) & 0xffu);
+        out[3u * j + 2u] = uchar(v >> 16);
+    }
+    if (j == 0u) *((device float*)rec) = cc > 0.0f ? yc / cc : 0.0f;
+}
+
+kernel void kv_dequant_rows(
+    device float*       dst      [[buffer(0)]],  // [n_ctx, kv_heads * d] f32
+    device const uchar* store    [[buffer(1)]],
+    constant uint&      d        [[buffer(2)]],
+    constant uint&      kv_heads [[buffer(3)]],
+    constant uint&      row_start[[buffer(4)]],
+    constant uint&      fmt      [[buffer(5)]],
+    constant float&     inv_sqrt_d [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tj [[thread_position_in_threadgroup]]
+) {
+    uint j = tj.x;
+    threadgroup float y[1024];
+    uint row = row_start + tg.x, head = tg.y;
+    uint hb = kv_head_bytes(fmt, d);
+    device const uchar* rec = store + (row * kv_heads + head) * hb;
+    device float* out = dst + (row * kv_heads + head) * d;
+    if (fmt == 1u) {
+        out[j] = float(((device const half*)rec)[j]);
+        return;
+    }
+    float scale = *((device const float*)rec);
+    device const uchar* cb = rec + 4;
+    uint c, n;
+    if (fmt == 2u) {
+        n = 8u;
+        c = (cb[j / 2u] >> ((j % 2u) * 4u)) & 0xfu;
+    } else {
+        n = 4u;
+        uint bit = j * 3u, w = bit / 8u, s = bit % 8u;
+        uint v = uint(cb[w]) >> s;
+        if (s > 5u) v |= uint(cb[w + 1u]) << (8u - s);
+        c = v & 7u;
+    }
+    constant float* lv = fmt == 2u ? KV_LEVELS4 : KV_LEVELS3;
+    y[j] = scale * (c < n ? -lv[n - 1u - c] : lv[c - n]);
+    kv_fwht(y, d, j);
+    out[j] = y[j] * (inv_sqrt_d * kv_sign(j));
+}
+
+
+// ============================================================================
 // Kernel: 4-bit token-embedding gather
 // ============================================================================
 // GPU port of `io::embedding::embed_lookup`. For each token `t`, reads

@@ -518,6 +518,27 @@ pub enum Op {
         kv_start: u32,
     },
 
+    /// Convert KV rows `[row_start, row_start + n_rows)` between the
+    /// f32 attention scratch (`k_f32` / `v_f32`, `[n_ctx, kv_dim]`
+    /// f32) and the quantized cache store (`k_store` / `v_store`,
+    /// `fmt.row_bytes` per row) — the prefill side of a non-F32
+    /// [`crate::riir::KvFormat`]. `quantize`: f32 → store (after
+    /// `KvCacheAppendNTokens` wrote the new rows to the scratch);
+    /// otherwise store → f32 (before `SdpaCausalTiled` reads the
+    /// prefix). Both backends follow `attn::kv_quant` bit for bit up
+    /// to f32 summation order.
+    KvConvertRows {
+        label: &'static str,
+        quantize: bool,
+        fmt: crate::riir::KvFormat,
+        k_f32: BufId<KvCacheKBuf>,
+        v_f32: BufId<KvCacheVBuf>,
+        k_store: BufId<KvCacheKBuf>,
+        v_store: BufId<KvCacheVBuf>,
+        row_start: u32,
+        n_rows: u32,
+    },
+
     /// MoE softmax + top-K selection. Reads `[n_tokens, n_experts]`
     /// logits, writes `[n_tokens, k]` indices and `[n_tokens, k]`
     /// weights.
@@ -783,6 +804,7 @@ impl Op {
             Op::SplitQGate { label, .. } => label,
             Op::RmsNormPerHeadNTokens { label, .. } => label,
             Op::KvCacheAppendNTokens { label, .. } => label,
+            Op::KvConvertRows { label, .. } => label,
             Op::MoeSoftmaxTopK { label, .. } => label,
             Op::MoeNormalizeWeights { label, .. } => label,
             Op::MoeBatchedPermuteFuse { label, .. } => label,
@@ -814,6 +836,7 @@ impl Op {
             Op::SplitQGate { .. } => "SplitQGate",
             Op::RmsNormPerHeadNTokens { .. } => "RmsNormPerHeadNTokens",
             Op::KvCacheAppendNTokens { .. } => "KvCacheAppendNTokens",
+            Op::KvConvertRows { .. } => "KvConvertRows",
             Op::MoeSoftmaxTopK { .. } => "MoeSoftmaxTopK",
             Op::MoeNormalizeWeights { .. } => "MoeNormalizeWeights",
             Op::MoeBatchedPermuteFuse { .. } => "MoeBatchedPermuteFuse",
@@ -860,6 +883,12 @@ impl Op {
             Op::RmsNormPerHeadNTokens { x, .. } => vec![x.raw()],
             Op::KvCacheAppendNTokens { k_src, v_src, .. } => {
                 vec![k_src.raw(), v_src.raw()]
+            }
+            Op::KvConvertRows { quantize: true, k_f32, v_f32, .. } => {
+                vec![k_f32.raw(), v_f32.raw()]
+            }
+            Op::KvConvertRows { k_store, v_store, .. } => {
+                vec![k_store.raw(), v_store.raw()]
             }
             Op::MoeSoftmaxTopK { logits, .. } => vec![logits.raw()],
             Op::MoeNormalizeWeights { weights, .. } => vec![weights.raw()],
@@ -952,6 +981,10 @@ impl Op {
             Op::KvCacheAppendNTokens {
                 k_cache, v_cache, ..
             } => vec![k_cache.raw(), v_cache.raw()],
+            Op::KvConvertRows { quantize: true, k_store, v_store, .. } => {
+                vec![k_store.raw(), v_store.raw()]
+            }
+            Op::KvConvertRows { k_f32, v_f32, .. } => vec![k_f32.raw(), v_f32.raw()],
             Op::MoeSoftmaxTopK {
                 indices_out,
                 weights_out,

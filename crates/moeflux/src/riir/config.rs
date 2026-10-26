@@ -7,6 +7,7 @@
 //! [`crate::riir::RsCtx::open_with`] with [`OpenConfig::default`],
 //! so existing callers see no behavior change.
 
+pub use crate::riir::attn::kv_quant::KvFormat;
 use crate::riir::budget::DEFAULT_RUNTIME_OVERHEAD;
 use crate::riir::io::expert_io_mode::ExpertIoMode;
 pub use crate::riir::io::prefetch::PrefetchGuess;
@@ -160,6 +161,13 @@ pub struct OpenConfig {
     /// Always clamped to `n_ctx`. Must be ≥ 1. Counted in the budget
     /// plan as `prefill_scratch`.
     pub prefill_chunk: Option<usize>,
+    /// Storage format of the GQA KV cache ([`KvFormat`]). `F32`
+    /// (default) is the historical layout; `F16` halves the cache,
+    /// `Turbo4` / `Turbo3` (TurboQuant) shrink it ~7.5× / ~9.8× at a
+    /// small accuracy cost. Counted per format in the budget plan.
+    /// Non-F32 formats run decode attention on the CPU path. MLA
+    /// variants accept only `F32`.
+    pub kv_format: KvFormat,
 }
 
 impl Default for OpenConfig {
@@ -182,6 +190,7 @@ impl Default for OpenConfig {
             prefetch_experts: None,
             host_buffers: 0,
             prefill_chunk: None,
+            kv_format: KvFormat::F32,
         }
     }
 }
@@ -231,6 +240,7 @@ impl OpenConfig {
         if let Some(r) = &self.layer_range {
             crate::riir::range::validate(r)?;
         }
+        self.kv_format.validate(&crate::riir::variants::VARIANT)?;
         Ok(())
     }
 

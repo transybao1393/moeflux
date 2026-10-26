@@ -2720,3 +2720,132 @@ fn graph_metal_matches_cpu_embed_gather() {
         max_abs
     );
 }
+
+// ============================================================================
+// Test: KvConvertRows (quantized KV cache) through both backends
+// ============================================================================
+
+#[test]
+#[ignore = "long-running GPU test"]
+fn graph_metal_matches_cpu_kv_convert_rows() {
+    use moeflux::riir::KvFormat;
+    use moeflux::riir::backend::buftype::{KvCacheKBuf, KvCacheVBuf};
+    use moeflux::riir::variants::{AttnKind, VARIANT};
+    let v = VARIANT;
+    if v.attn_kind != AttnKind::Gqa {
+        return;
+    }
+    let rows: u32 = 7;
+    let kv_dim = v.num_kv_heads * v.head_dim;
+    let total = rows as usize * kv_dim;
+    let mut rng = Rng::new(0x7_0_4B0);
+    // Gaussian-ish data with a couple of outlier channels per head.
+    let k_data: Vec<f32> = (0..total)
+        .map(|i| {
+            let x = rng.next_f32_unit() * 2.0;
+            if i % v.head_dim == 3 { x * 20.0 } else { x }
+        })
+        .collect();
+    let v_data: Vec<f32> = (0..total).map(|_| rng.next_f32_unit()).collect();
+
+    for fmt in [KvFormat::F16, KvFormat::Turbo4, KvFormat::Turbo3] {
+        if fmt.validate(&v).is_err() {
+            continue;
+        }
+        let store = rows as usize * fmt.row_bytes(&v);
+        // Quantize rows [2, 7) then [0, 2) (exercises row_start), then
+        // dequantize all of them.
+        let ops = |kf, vf, ks, vs| {
+            [(true, 2, rows - 2), (true, 0, 2), (false, 0, rows)].map(|(quantize, row_start, n_rows)| {
+                Op::KvConvertRows {
+                    label: "test_kv_convert",
+                    quantize,
+                    fmt,
+                    k_f32: kf,
+                    v_f32: vf,
+                    k_store: ks,
+                    v_store: vs,
+                    row_start,
+                    n_rows,
+                }
+            })
+        };
+        let run = |be: &mut dyn FnMut() -> (Vec<f32>, Vec<f32>, Vec<u8>)| be();
+
+        let mut cpu_wf = dummy_weight_file("kv_convert_cpu");
+        let mut cpu = CpuBackend::new(cpu_wf.take());
+        let (ck, cv, cs) = run(&mut || {
+            let kf: BufId<KvCacheKBuf> = cpu.pool_mut().alloc(total * 4, "kf", false).unwrap();
+            let vf: BufId<KvCacheVBuf> = cpu.pool_mut().alloc(total * 4, "vf", false).unwrap();
+            let ks: BufId<KvCacheKBuf> = cpu.pool_mut().alloc(store, "ks", false).unwrap();
+            let vs: BufId<KvCacheVBuf> = cpu.pool_mut().alloc(store, "vs", false).unwrap();
+            cpu.pool_mut().upload(kf, bytes_of_f32(&k_data)).unwrap();
+            cpu.pool_mut().upload(vf, bytes_of_f32(&v_data)).unwrap();
+            let mut g = Graph::new();
+            for op in ops(kf, vf, ks, vs) {
+                g.push(op);
+            }
+            cpu.execute(&g, "diff_oracle").unwrap();
+            let (mut a, mut b, mut c) = (vec![0u8; total * 4], vec![0u8; total * 4], vec![0u8; store]);
+            cpu.pool().download(kf, &mut a).unwrap();
+            cpu.pool().download(vf, &mut b).unwrap();
+            cpu.pool().download(ks, &mut c).unwrap();
+            (f32_of_bytes(&a), f32_of_bytes(&b), c)
+        });
+
+        let mut gpu_wf = dummy_weight_file("kv_convert_gpu");
+        let metal_ctx = MetalContext::new().expect("MetalContext::new");
+        let wf_buf = MtlWeightBuf::wrap(gpu_wf.wf.as_ref().unwrap(), metal_ctx.device());
+        let _ = gpu_wf.take();
+        let mut gpu = MetalBackend::new(metal_ctx, wf_buf).expect("MetalBackend::new");
+        let (gk, gv, gs) = run(&mut || {
+            let kf: BufId<KvCacheKBuf> = gpu.pool_mut().alloc(total * 4, "kf", false).unwrap();
+            let vf: BufId<KvCacheVBuf> = gpu.pool_mut().alloc(total * 4, "vf", false).unwrap();
+            let ks: BufId<KvCacheKBuf> = gpu.pool_mut().alloc(store, "ks", false).unwrap();
+            let vs: BufId<KvCacheVBuf> = gpu.pool_mut().alloc(store, "vs", false).unwrap();
+            gpu.pool_mut().upload(kf, bytes_of_f32(&k_data)).unwrap();
+            gpu.pool_mut().upload(vf, bytes_of_f32(&v_data)).unwrap();
+            let mut g = Graph::new();
+            for op in ops(kf, vf, ks, vs) {
+                g.push(op);
+            }
+            gpu.execute(&g, "diff_oracle").unwrap();
+            let (mut a, mut b, mut c) = (vec![0u8; total * 4], vec![0u8; total * 4], vec![0u8; store]);
+            gpu.pool().download(kf, &mut a).unwrap();
+            gpu.pool().download(vf, &mut b).unwrap();
+            gpu.pool().download(ks, &mut c).unwrap();
+            (f32_of_bytes(&a), f32_of_bytes(&b), c)
+        });
+
+        let rel = |a: &[f32], b: &[f32]| {
+            let e: f64 = a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum();
+            let t: f64 = b.iter().map(|y| (*y as f64).powi(2)).sum();
+            e / t
+        };
+        if fmt == KvFormat::F16 {
+            // Elementwise round-to-nearest-even both sides: bit-exact.
+            assert_eq!(cs, gs, "{fmt:?}: store differs CPU vs GPU");
+            assert_eq!(ck, gk, "{fmt:?}: k differs CPU vs GPU");
+        } else {
+            // Reductions differ in order, so a code at a level boundary
+            // can flip; the reconstructions must still agree closely.
+            let same = cs.iter().zip(&gs).filter(|(a, b)| a == b).count();
+            assert!(same as f64 / store as f64 > 0.97, "{fmt:?}: {same}/{store} store bytes agree");
+            assert!(rel(&gk, &ck) < 1e-4, "{fmt:?}: k CPU vs GPU rel {}", rel(&gk, &ck));
+            assert!(rel(&gv, &cv) < 1e-4, "{fmt:?}: v CPU vs GPU rel {}", rel(&gv, &cv));
+        }
+        let bound = match fmt {
+            KvFormat::F16 => 1e-6,
+            KvFormat::Turbo4 => 0.015,
+            _ => 0.045,
+        };
+        assert!(rel(&gk, &k_data) < bound, "{fmt:?}: k error {}", rel(&gk, &k_data));
+        assert!(rel(&gv, &v_data) < bound, "{fmt:?}: v error {}", rel(&gv, &v_data));
+        eprintln!(
+            "{fmt:?}: rel MSE k {:.5} v {:.5} (CPU vs GPU k {:.2e})",
+            rel(&gk, &k_data),
+            rel(&gv, &v_data),
+            rel(&gk, &ck)
+        );
+    }
+}
